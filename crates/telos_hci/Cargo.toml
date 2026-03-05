@@ -1,0 +1,11 @@
+[package]
+name = "telos_hci"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+telos_core = { path = "../telos_core" }
+async-trait.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+lru.workspace = true

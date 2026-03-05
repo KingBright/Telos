@@ -15,16 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "app"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "lru",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -74,6 +64,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "fixedbitset"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 
 [[package]]
 name = "foldhash"
@@ -243,6 +239,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "petgraph"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4c5cc86750666a3ed20bdaf5ca2a0344f9c67674cae0515bec2da16fbaa47db"
+dependencies = [
+ "fixedbitset",
+ "indexmap",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -386,6 +392,84 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "telos_context"
+version = "0.1.0"
+dependencies = [
+ "telos_core",
+]
+
+[[package]]
+name = "telos_core"
+version = "0.1.0"
+
+[[package]]
+name = "telos_dag"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "petgraph",
+ "telos_context",
+ "telos_core",
+ "telos_hci",
+]
+
+[[package]]
+name = "telos_evolution"
+version = "0.1.0"
+dependencies = [
+ "telos_core",
+]
+
+[[package]]
+name = "telos_hci"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lru",
+ "telos_core",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "telos_memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "telos_core",
+]
+
+[[package]]
+name = "telos_model_gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+]
+
+[[package]]
+name = "telos_security"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "telos_telemetry"
+version = "0.1.0"
+dependencies = [
+ "telos_evolution",
+]
+
+[[package]]
+name = "telos_tooling"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "telos_core",
 ]
 
 [[package]]

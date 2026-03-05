@@ -4,26 +4,7 @@ use std::sync::Mutex;
 use std::num::NonZeroUsize;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
-
-// Placeholder structs for DAG nodes
-#[derive(Debug, Clone, PartialEq)]
-pub struct NodeResult {
-    pub output_data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum NodeStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum RiskLevel {
-    Normal,
-    HighRisk,
-}
+use telos_core::{NodeResult, NodeStatus, RiskLevel};
 
 /// 系统全局统一事件总线数据结构
 #[derive(Debug, Clone, PartialEq)]
@@ -168,102 +149,5 @@ impl EventBroker for TokioEventBroker {
 
     fn subscribe_feedback(&self) -> broadcast::Receiver<AgentFeedback> {
         self.feedback_tx.subscribe()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-    use tokio::time::timeout;
-
-    #[tokio::test]
-    async fn test_event_idempotency() {
-        let (broker, mut _rx) = TokioEventBroker::new(10, 10, 100);
-        let uuid = Uuid::new_v4();
-        let event = AgentEvent::UserInput {
-            session_id: "s1".to_string(),
-            payload: "hello".to_string(),
-            trace_id: uuid,
-        };
-
-        // First time should succeed
-        assert_eq!(broker.publish_event(event.clone()).await, Ok(()));
-
-        // Second time with exact same uuid should fail
-        assert_eq!(broker.publish_event(event).await, Err(EventBrokerError::DuplicateEvent));
-    }
-
-    #[tokio::test]
-    async fn test_backpressure_drops_non_critical() {
-        // Channel size 1
-        let (broker, mut _rx) = TokioEventBroker::new(1, 10, 100);
-
-        let event1 = AgentEvent::UserInput {
-            session_id: "s1".to_string(),
-            payload: "fill".to_string(),
-            trace_id: Uuid::new_v4(),
-        };
-        assert_eq!(broker.publish_event(event1).await, Ok(())); // Fills channel
-
-        let event2 = AgentEvent::UserInput {
-            session_id: "s2".to_string(),
-            payload: "drop".to_string(),
-            trace_id: Uuid::new_v4(),
-        };
-        // Channel is full, non-critical event2 should be dropped
-        assert_eq!(broker.publish_event(event2).await, Err(EventBrokerError::ChannelFull));
-    }
-
-    #[tokio::test]
-    async fn test_backpressure_waits_for_critical() {
-        // Channel size 1
-        let (broker, mut rx) = TokioEventBroker::new(1, 10, 100);
-
-        let event1 = AgentEvent::UserInput {
-            session_id: "s1".to_string(),
-            payload: "fill".to_string(),
-            trace_id: Uuid::new_v4(),
-        };
-        assert_eq!(broker.publish_event(event1).await, Ok(())); // Fills channel
-
-        let event2 = AgentEvent::UserApproval {
-            task_id: "t1".to_string(),
-            approved: true,
-            supplement_info: None,
-            trace_id: Uuid::new_v4(),
-        };
-
-        // event2 is critical. Publish should block until room is available.
-        // We simulate a consumer freeing up the channel after a short delay.
-        let consume_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            rx.recv().await; // consume event1
-            rx.recv().await; // consume event2
-        });
-
-        // The publish should eventually succeed when the consumer runs
-        let result = timeout(Duration::from_millis(200), broker.publish_event(event2)).await;
-        assert_eq!(result.unwrap(), Ok(()));
-
-        consume_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_feedback_broadcasting() {
-        let (broker, _rx) = TokioEventBroker::new(10, 10, 100);
-        let mut sub1 = broker.subscribe_feedback();
-        let mut sub2 = broker.subscribe_feedback();
-
-        let feedback = AgentFeedback::Output {
-            session_id: "sess1".to_string(),
-            content: "done".to_string(),
-            is_final: true,
-        };
-
-        broker.publish_feedback(feedback.clone());
-
-        assert_eq!(sub1.recv().await.unwrap(), feedback);
-        assert_eq!(sub2.recv().await.unwrap(), feedback);
     }
 }

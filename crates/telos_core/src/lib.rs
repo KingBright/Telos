@@ -1,0 +1,38 @@
+// --- Core Primitives shared across Telos modules ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Knowledge {
+    pub key_insights: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeResult {
+    pub output_data: Vec<u8>,
+    pub extracted_knowledge: Option<Knowledge>,
+    pub next_routing_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RiskLevel {
+    Normal,
+    HighRisk,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeError {
+    ExecutionFailed(String),
+    Timeout,
+    DependencyConflict,
+}
+
+pub trait SystemRegistry: Send + Sync {
+    // Defines standard registry lookup mechanisms across the system
+}

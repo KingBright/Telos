@@ -1,10 +1,13 @@
-[package]
-name = "app"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = [
+    "crates/*"
+]
 
-[dependencies]
+[workspace.dependencies]
 async-trait = "0.1.89"
-lru = "0.16.3"
 tokio = { version = "1.50.0", features = ["full"] }
 uuid = { version = "1.21.0", features = ["v4"] }
+lru = "0.16.3"
+serde_json = "1.0"
+petgraph = "0.6"

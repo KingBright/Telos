@@ -1,0 +1,8 @@
+[package]
+name = "telos_memory"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+telos_core = { path = "../telos_core" }
+async-trait.workspace = true
