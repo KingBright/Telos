@@ -39,9 +39,10 @@ We meticulously track the implementation progress of every module inside the `ta
 
 ### Your workflow for every new task:
 1. **Locate the Task File:** Look inside the `tasks/` directory for the module you are working on (e.g., `tasks/02_dag_engine_tasks.md`).
-2. **Review Status:** Read the file to understand what has been completed (`- [x]`) and what is pending (`- [ ]`).
-3. **Execute Work:** Write the Rust code, adhering strictly to the architecture philosophies mentioned above. Use modern libraries.
-4. **Write Tests:** **Every module must have detailed test cases.** Do not mark a feature as complete until tests are written and passing (`cargo test`).
-5. **Update Task File:** Check off the completed sub-tasks in the Markdown file and write a brief summary of the changes, issues encountered, or architectural decisions made under the `## Notes/Issues` section.
+2. **Review Integration File:** Always read and update the dedicated integration tracking file (`tasks/10_integration_tasks.md`). Every module must consider how it connects and interacts with other modules, and document this integration explicitly.
+3. **Review Status:** Read the module's task file to understand what has been completed (`- [x]`) and what is pending (`- [ ]`).
+4. **Execute Work:** Write the Rust code, adhering strictly to the architecture philosophies mentioned above. Use modern libraries.
+5. **Write Tests:** **Every module must have detailed test cases.** Do not mark a feature as complete until tests are written and passing (`cargo test`).
+6. **Update Task Files:** Check off the completed sub-tasks in the module's Markdown file and `tasks/10_integration_tasks.md`. Write a brief summary of the changes, issues encountered, or architectural decisions made under the `## Notes/Issues` section.
 
 *Before submitting your final code, ensure `cargo check` and `cargo test --workspace` run cleanly without major regressions.*

@@ -1,0 +1,16 @@
+# Module 10 Tasks: System Integration
+
+This file tracks the integration points between different modules to ensure the entire Telos architecture works cohesively.
+
+## 03 Context Compression (telos_context) Integration
+
+- [x] **DAG Engine (Module 2) -> Context Compression (Module 3)**:
+  - DAG engine nodes (`ExecutableNode`) must be able to request compressed context based on token budgets (`ScopedContext`).
+  - Upon node completion, `NodeResult` output data and extracted knowledge must be ingested into the `ContextManager` to update the global/session context (`ingest_new_info`).
+
+- [ ] **Memory OS (Module 4) -> Context Compression (Module 3)**:
+  - (Future) Context manager needs to flush aged context into the Memory OS, or retrieve facts from Semantic Memory to supplement `ScopedContext`.
+
+## Notes/Issues
+- *Added as part of Module 3 planning to track inter-module dependencies.*
+- Context Compression API implemented. DAG nodes can now inject NodeRequirement (tokens and query string) and receive ScopedContext arrays via the RAPTOR manager.

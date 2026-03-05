@@ -4,4 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-trait.workspace = true
+fastembed = "5.12.0"
+reqwest = { version = "0.13.2", features = ["json"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json.workspace = true
 telos_core = { path = "../telos_core" }
+tokio = { workspace = true, features = ["sync"] }
