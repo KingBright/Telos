@@ -1,0 +1,11 @@
+[package]
+name = "telos_dag"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+telos_core = { path = "../telos_core" }
+telos_hci = { path = "../telos_hci" }
+telos_context = { path = "../telos_context" }
+async-trait.workspace = true
+petgraph.workspace = true
