@@ -65,3 +65,158 @@ impl LlmProvider for MockApiProvider {
         Ok(format!("{}... [Summarized by Mock API]", summary))
     }
 }
+
+/// A real Provider that uses standard OpenAI-compatible HTTP APIs.
+/// This fulfills the requirement for a truly "working" compression engine.
+#[derive(Clone)]
+pub struct OpenAiProvider {
+    client: reqwest::Client,
+    api_key: String,
+    base_url: String,
+    embedding_model: String,
+    llm_model: String,
+}
+
+impl OpenAiProvider {
+    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key,
+            base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            embedding_model: "text-embedding-3-small".to_string(),
+            llm_model: "gpt-4o-mini".to_string(), // Fast and cheap for summaries
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for OpenAiProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, ProviderError> {
+        let url = format!("{}/embeddings", self.base_url);
+
+        let payload = serde_json::json!({
+            "model": self.embedding_model,
+            "input": text,
+        });
+
+        let response = self.client.post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| ProviderError(format!("HTTP Error: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError(format!("API Error {}: {}", status, body)));
+        }
+
+        let json: serde_json::Value = response.json()
+            .await
+            .map_err(|e| ProviderError(format!("JSON Parse Error: {}", e)))?;
+
+        let embedding = json["data"][0]["embedding"]
+            .as_array()
+            .ok_or_else(|| ProviderError("Invalid embedding format from API".to_string()))?
+            .iter()
+            .map(|v: &serde_json::Value| v.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+
+        Ok(embedding)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiProvider {
+    async fn summarize(&self, text: &str) -> Result<String, ProviderError> {
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let payload = serde_json::json!({
+            "model": self.llm_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a context compressor. Summarize the following text cluster into a single, concise paragraph that captures all key facts and relationships. Do not add conversational filler."
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ],
+            "temperature": 0.3
+        });
+
+        let response = self.client.post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| ProviderError(format!("HTTP Error: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError(format!("API Error {}: {}", status, body)));
+        }
+
+        let json: serde_json::Value = response.json()
+            .await
+            .map_err(|e| ProviderError(format!("JSON Parse Error: {}", e)))?;
+
+        let summary = json["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| ProviderError("Invalid summary format from API".to_string()))?
+            .to_string();
+
+        Ok(summary)
+    }
+}
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// A Local Provider that uses ONNX Runtime (`fastembed`) for high-performance,
+/// in-process embeddings with zero network overhead.
+#[derive(Clone)]
+pub struct LocalEmbeddingProvider {
+    model: Arc<Mutex<fastembed::TextEmbedding>>,
+}
+
+impl LocalEmbeddingProvider {
+    pub fn new() -> Result<Self, ProviderError> {
+        // InitTextEmbedding defaults to BGE-small-en-v1.5 or similar highly efficient models
+        let model = fastembed::TextEmbedding::try_new(Default::default())
+            .map_err(|e| ProviderError(format!("Failed to initialize local embedding model: {}", e)))?;
+
+        Ok(Self { model: Arc::new(Mutex::new(model)) })
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for LocalEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, ProviderError> {
+        // fastembed requires a Vec<String> or slice of strings
+        let documents = vec![text.to_string()];
+
+        let model = self.model.clone();
+
+        let mut model_lock = model.lock().await;
+
+        let mut embeddings = tokio::task::block_in_place(|| {
+             model_lock.embed(documents, None::<usize>)
+        }).map_err(|e| ProviderError(format!("Local embedding failed: {}", e)))?;
+
+        if embeddings.is_empty() {
+            return Err(ProviderError("Model returned empty embedding array".to_string()));
+        }
+
+        // Return the first (and only) embedding
+        Ok(embeddings.remove(0))
+    }
+}
+
+// We can optionally create a Mock/Fallback Local LLM Provider here if desired using Candle,
+// but fastembed is primarily focused on embeddings. For a pure local LLM, integrating `candle-core`
+// would be the next step, though `OpenAiProvider` targeting a local `vLLM` instance
+// is generally preferred for production "local" LLM setups due to continuous batching.
