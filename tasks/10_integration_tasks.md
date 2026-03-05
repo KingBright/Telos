@@ -14,6 +14,18 @@ This file tracks the integration points between different modules to ensure the 
 - [x] **DAG Engine (Module 2) -> Memory OS (Module 4)**:
   - Task results and execution steps (`NodeResult`) are automatically archived into the Episodic Memory using vector embeddings to enable future retrieval and semantic promotion.
 
+- [ ] **Evolution Evaluator (Module 6) -> Memory OS (Module 4)**:
+  - (Future) The Actor-Critic system evaluates completed sub-tasks and extracts successful trajectory patterns. It promotes relevant `Episodic` and `Semantic` facts into highly structured `Procedural` (skill) memories.
+
+- [ ] **Tooling & Wasm Sandbox (Module 5) -> Memory OS (Module 4)**:
+  - (Future) Wasm execution engine queries Memory OS for relevant `Procedural` skill templates before granting execution fuel.
+
+- [ ] **HCI Event Bus (Module 1) -> Memory OS (Module 4)**:
+  - (Future) Direct, high-priority user feedback triggers immediate write operations to Semantic Memory with maximum strength, ensuring user preferences override default behaviors.
+
+- [ ] **Model Gateway (Module 7) -> Memory OS (Module 4)**:
+  - (Future) Memory OS background workers (reconsolidation) utilize the Model Gateway API for summarization, applying exponential backoff and rate limiting during background compression.
+
 ## Notes/Issues
 - *Added as part of Module 3 planning to track inter-module dependencies.*
 - Context Compression API implemented. DAG nodes can now inject NodeRequirement (tokens and query string) and receive ScopedContext arrays via the RAPTOR manager.
