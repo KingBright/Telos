@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 telos_core = { path = "../telos_core" }
 async-trait.workspace = true
+redb.workspace = true
+tokio.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json.workspace = true
