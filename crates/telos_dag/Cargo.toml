@@ -9,3 +9,7 @@ telos_hci = { path = "../telos_hci" }
 telos_context = { path = "../telos_context" }
 async-trait.workspace = true
 petgraph.workspace = true
+redb.workspace = true
+tokio.workspace = true
+futures.workspace = true
+uuid.workspace = true

@@ -77,6 +77,8 @@ pub enum AgentFeedback {
 pub trait EventBroker: Send + Sync {
     /// 发布一个事件。如果遇到背压，可能导致非核心事件被丢弃。
     async fn publish_event(&self, event: AgentEvent) -> Result<(), EventBrokerError>;
+    /// 发布内部系统反馈
+    fn publish_feedback(&self, feedback: AgentFeedback);
     /// 订阅反馈事件总线。
     fn subscribe_feedback(&self) -> broadcast::Receiver<AgentFeedback>;
 }
@@ -110,14 +112,14 @@ impl TokioEventBroker {
         (broker, event_rx)
     }
 
-    /// Provide internal system access to broadcast feedback out
-    pub fn publish_feedback(&self, feedback: AgentFeedback) {
-        let _ = self.feedback_tx.send(feedback);
-    }
 }
 
 #[async_trait]
 impl EventBroker for TokioEventBroker {
+    fn publish_feedback(&self, feedback: AgentFeedback) {
+        let _ = self.feedback_tx.send(feedback);
+    }
+
     async fn publish_event(&self, event: AgentEvent) -> Result<(), EventBrokerError> {
         let trace_id = event.trace_id();
 
