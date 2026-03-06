@@ -3267,6 +3267,8 @@ name = "telos_model_gateway"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rand 0.8.5",
+ "tokio",
 ]
 
 [[package]]

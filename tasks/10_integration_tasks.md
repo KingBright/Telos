@@ -29,6 +29,14 @@ This file tracks the integration points between different modules to ensure the 
 - [ ] **Model Gateway (Module 7) -> Memory OS (Module 4)**:
   - (Future) Memory OS background workers (reconsolidation) utilize the Model Gateway API for summarization, applying exponential backoff and rate limiting during background compression.
 
+## 07 Model Gateway & Resource Governor (telos_model_gateway) Integration
+
+- [ ] **DAG Engine (Module 2) -> Model Gateway (Module 7)**:
+  - DAG engine nodes (`ExecutableNode`) invoke the LLM via the Model Gateway, passing specific prompt messages and capability requirements, while obeying session-level budget constraints.
+
+- [ ] **Context Compression (Module 3) -> Model Gateway (Module 7)**:
+  - Context manager's RAPTOR clustering and summarizing routines invoke the LLM via the Model Gateway to construct tree-based hierarchical summaries, with requests properly handled by backoff mechanisms on 429/503 errors.
+
 ## Notes/Issues
 - *Added as part of Module 3 planning to track inter-module dependencies.*
 - Context Compression API implemented. DAG nodes can now inject NodeRequirement (tokens and query string) and receive ScopedContext arrays via the RAPTOR manager.
