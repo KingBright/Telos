@@ -17,8 +17,8 @@ This file tracks the integration points between different modules to ensure the 
 - [ ] **Evolution Evaluator (Module 6) -> Memory OS (Module 4)**:
   - (Future) The Actor-Critic system evaluates completed sub-tasks and extracts successful trajectory patterns. It promotes relevant `Episodic` and `Semantic` facts into highly structured `Procedural` (skill) memories.
 
-- [ ] **Tooling & Wasm Sandbox (Module 5) -> Memory OS (Module 4)**:
-  - (Future) Wasm execution engine queries Memory OS for relevant `Procedural` skill templates before granting execution fuel.
+- [x] **Tooling & Wasm Sandbox (Module 5) -> Memory OS (Module 4)**:
+  - Tool retrieval API implemented via `VectorToolRegistry`. Wasm Sandbox execution API implemented (`ToolExecutor`). The Wasm engine can now run procedural tools extracted from memory templates with tight fuel bounds.
 
 - [ ] **HCI Event Bus (Module 1) -> Memory OS (Module 4)**:
   - (Future) Direct, high-priority user feedback triggers immediate write operations to Semantic Memory with maximum strength, ensuring user preferences override default behaviors.
