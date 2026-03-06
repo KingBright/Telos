@@ -129,3 +129,9 @@ impl ExecutionEngine for TokioExecutionEngine {
         Ok(())
     }
 }
+
+impl Default for TokioExecutionEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}

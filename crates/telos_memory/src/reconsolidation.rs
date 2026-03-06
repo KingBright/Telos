@@ -4,7 +4,7 @@ use crate::types::{MemoryEntry, MemoryType};
 /// episodic experiences into long-term semantic facts or procedural skills.
 /// In this system, we take highly accessed episodic memories and
 /// optionally merge them or promote their type.
-pub fn consolidate_memories(memories: &mut Vec<MemoryEntry>, threshold_strength: f32) -> Vec<MemoryEntry> {
+pub fn consolidate_memories(memories: &mut [MemoryEntry], threshold_strength: f32) -> Vec<MemoryEntry> {
     let mut newly_consolidated = Vec::new();
 
     for entry in memories.iter_mut() {

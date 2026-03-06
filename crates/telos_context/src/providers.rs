@@ -39,8 +39,8 @@ impl EmbeddingProvider for MockApiProvider {
         let len = text.len() as f32;
         let char_sum: u32 = text.chars().map(|c| c as u32).sum();
 
-        for i in 0..32 {
-            vec[i] = ((char_sum + i as u32) % 100) as f32 / 100.0 * (len / 100.0).sin();
+        for (i, v) in vec.iter_mut().enumerate().take(32) {
+             *v = ((char_sum + i as u32) % 100) as f32 / 100.0 * (len / 100.0).sin();
         }
 
         // Normalize the mock vector
@@ -220,3 +220,9 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
 // but fastembed is primarily focused on embeddings. For a pure local LLM, integrating `candle-core`
 // would be the next step, though `OpenAiProvider` targeting a local `vLLM` instance
 // is generally preferred for production "local" LLM setups due to continuous batching.
+
+impl Default for MockApiProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}

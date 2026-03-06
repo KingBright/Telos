@@ -46,10 +46,7 @@ impl AgentEvent {
     // Checks if the event is considered non-critical.
     // In our case, ReplanRequested and UserApproval are critical. UserInput and AutoTrigger can be dropped on heavy backpressure.
     pub fn is_critical(&self) -> bool {
-        match self {
-            AgentEvent::ReplanRequested { .. } | AgentEvent::UserApproval { .. } => true,
-            _ => false,
-        }
+        matches!(self, AgentEvent::ReplanRequested { .. } | AgentEvent::UserApproval { .. })
     }
 }
 
