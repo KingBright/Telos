@@ -14,8 +14,11 @@ This file tracks the integration points between different modules to ensure the 
 - [x] **DAG Engine (Module 2) -> Memory OS (Module 4)**:
   - Task results and execution steps (`NodeResult`) are automatically archived into the Episodic Memory using vector embeddings to enable future retrieval and semantic promotion.
 
-- [ ] **Evolution Evaluator (Module 6) -> Memory OS (Module 4)**:
+- [x] **Evolution Evaluator (Module 6) -> Memory OS (Module 4)**:
   - (Future) The Actor-Critic system evaluates completed sub-tasks and extracts successful trajectory patterns. It promotes relevant `Episodic` and `Semantic` facts into highly structured `Procedural` (skill) memories.
+
+- [x] **DAG Engine (Module 2) -> Evolution Evaluator (Module 6)**:
+  - The DAG engine provides `ExecutionTrace` to the Evolution Evaluator.
 
 - [x] **Tooling & Wasm Sandbox (Module 5) -> Memory OS (Module 4)**:
   - Tool retrieval API implemented via `VectorToolRegistry`. Wasm Sandbox execution API implemented (`ToolExecutor`). The Wasm engine can now run procedural tools extracted from memory templates with tight fuel bounds.
