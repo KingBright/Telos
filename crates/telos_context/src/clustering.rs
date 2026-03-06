@@ -18,7 +18,7 @@ pub fn parse_into_edus(document_content: &str, base_id: &str) -> Vec<Edu> {
     for (p_idx, para) in paragraphs.iter().enumerate() {
         // Simplified sentence splitting based on punctuation.
         // For a more robust solution, we'd use something like the `unicode-segmentation` crate.
-        let sentences: Vec<&str> = para.split(|c| c == '.' || c == '!' || c == '?')
+        let sentences: Vec<&str> = para.split(['.', '!', '?'])
             .filter(|s| !s.trim().is_empty())
             .collect();
 
@@ -95,7 +95,7 @@ pub fn kmeans_cluster(edus: &[Edu], k: usize, max_iterations: usize) -> HashMap<
                     best_cluster = i;
                 }
             }
-            new_clusters.entry(best_cluster).or_insert_with(Vec::new).push(edu.id.clone());
+            new_clusters.entry(best_cluster).or_default().push(edu.id.clone());
         }
 
         // 3. Update centroids
@@ -114,15 +114,15 @@ pub fn kmeans_cluster(edus: &[Edu], k: usize, max_iterations: usize) -> HashMap<
             // Average and normalize the new centroid
             let count = edu_ids.len() as f32;
             let mut norm = 0.0;
-            for i in 0..dim {
-                new_centroid[i] /= count;
-                norm += new_centroid[i] * new_centroid[i];
+            for val in new_centroid.iter_mut().take(dim) {
+                *val /= count;
+                norm += *val * *val;
             }
             norm = norm.sqrt();
             if norm > 0.0 {
-                for i in 0..dim {
-                    new_centroid[i] /= norm;
-                }
+                for val in new_centroid.iter_mut().take(dim) {
+                *val /= norm;
+            }
             }
 
             // Check if centroid moved significantly (simple delta check)

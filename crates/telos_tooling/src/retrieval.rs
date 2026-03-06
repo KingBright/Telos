@@ -105,3 +105,8 @@ impl ToolRegistry for VectorToolRegistry {
         None
     }
 }
+impl Default for VectorToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}

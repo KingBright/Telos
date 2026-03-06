@@ -151,3 +151,9 @@ impl RaptorTree {
         Ok(retrieved_nodes)
     }
 }
+
+impl Default for RaptorTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}

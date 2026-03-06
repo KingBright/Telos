@@ -46,3 +46,11 @@ This file tracks the integration points between different modules to ensure the 
 - [x] **Tooling & Wasm Sandbox (Module 5) -> Security Vault (Module 8)**:
   - Wasm ToolExecutor must validate the tool call against the Vault's ABAC policy (`validate_tool_call`).
   - Wasm Sandbox needs to temporarily lease credentials (`lease_temporary_credential`) with tight TTL before spawning tools.
+
+## 09 Observability & Telemetry (telos_telemetry) Integration
+
+- [ ] **DAG Engine (Module 2) -> Telemetry (Module 9)**:
+  - (Future) Ensure `tracing` spans properly encapsulate `ExecutionEngine::run_graph` passing trace IDs through the state machine correctly.
+
+- [ ] **Evolution Evaluator (Module 6) -> Telemetry (Module 9)**:
+  - (Future) Telemetry system stores outputs that can be fed natively into the Evolution system avoiding circular dependencies.
