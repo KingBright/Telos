@@ -1,1 +1,3 @@
 /target
+.fastembed_cache/
+crates/telos_tooling/.fastembed_cache/
