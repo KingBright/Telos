@@ -65,6 +65,12 @@ impl TelemetryProvider for OtlpTelemetryProvider {
     }
 }
 
+impl telos_evolution::TraceExport for OtlpTelemetryProvider {
+    fn export_trace(&self, trace_id: &str) -> Option<ExecutionTrace> {
+        self.export_trace_log(trace_id).ok()
+    }
+}
+
 pub fn init_telemetry(log_dir: &str, file_prefix: &str) -> tracing_appender::non_blocking::WorkerGuard {
     let file_appender = tracing_appender::rolling::hourly(log_dir, file_prefix);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -119,6 +125,39 @@ mod tests {
         provider.store_trace(trace.clone());
         let result = provider.export_trace_log("test-task");
         assert!(matches!(result, Ok(t) if t == trace));
+    }
+
+    #[tokio::test]
+    async fn test_evaluator_with_telemetry() {
+        use telos_evolution::evaluator::ActorCriticEvaluator;
+        use telos_evolution::TraceStep;
+
+        let provider = OtlpTelemetryProvider::new();
+
+        // Mock a successful trace
+        let step1 = TraceStep {
+            node_id: "search_db".to_string(),
+            input_data: "find user".to_string(),
+            output_data: Some("user found".to_string()),
+            error: None,
+        };
+
+        let trace = ExecutionTrace {
+            task_id: "task_eval".to_string(),
+            steps: vec![step1],
+            errors_encountered: vec![],
+            success: true,
+        };
+
+        provider.store_trace(trace);
+
+        let evaluator = ActorCriticEvaluator::new().expect("Failed to initialize embedder");
+
+        let skill = evaluator.evaluate_from_source("task_eval", &provider).await.expect("Should not fail to read trace");
+        assert!(skill.is_some());
+
+        let synthesized = skill.unwrap();
+        assert_eq!(synthesized.executable_code, "Execute sequence: [search_db]");
     }
 
     #[tokio::test]

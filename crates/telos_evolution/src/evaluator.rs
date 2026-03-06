@@ -34,6 +34,14 @@ impl ActorCriticEvaluator {
             dot_product / (norm_v1 * norm_v2)
         }
     }
+
+    pub async fn evaluate_from_source(&self, trace_id: &str, source: &dyn crate::TraceExport) -> Result<Option<crate::SynthesizedSkill>, String> {
+        if let Some(trace) = source.export_trace(trace_id) {
+            Ok(self.distill_experience(&trace).await)
+        } else {
+            Err("Trace not found".to_string())
+        }
+    }
 }
 
 #[cfg(test)]
