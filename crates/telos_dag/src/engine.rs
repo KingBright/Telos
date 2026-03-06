@@ -6,6 +6,7 @@ use telos_core::{NodeStatus, SystemRegistry};
 use telos_hci::{AgentFeedback, EventBroker};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use tracing::{info_span, Instrument};
 
 pub struct TokioExecutionEngine {
     // Standard settings
@@ -50,8 +51,13 @@ impl ExecutionEngine for TokioExecutionEngine {
 
         let mut futures = FuturesUnordered::new();
 
-        while completed_nodes < total_nodes {
-            while let Some(node_id) = ready_queue.pop() {
+        let graph_span = info_span!("run_graph", trace_id = %graph.graph_id);
+
+        // We cannot hold a span enter guard across await points in async Rust.
+        // Instead, we instrument the inner async block that we await.
+        async {
+            while completed_nodes < total_nodes {
+                while let Some(node_id) = ready_queue.pop() {
                 graph.node_statuses.insert(node_id.clone(), NodeStatus::Running);
 
                 broker.publish_feedback(AgentFeedback::StateChanged {
@@ -63,8 +69,10 @@ impl ExecutionEngine for TokioExecutionEngine {
                 if let Some(node) = graph.nodes.remove(&node_id) {
                     let id_clone = node_id.clone();
 
+                    let node_span = info_span!("execute_node", node_id = %id_clone);
+
                     futures.push(async move {
-                        let res = node.execute(ctx, registry).await;
+                        let res = node.execute(ctx, registry).instrument(node_span).await;
                         (id_clone, res, node)
                     });
                     active_tasks += 1;
@@ -121,8 +129,9 @@ impl ExecutionEngine for TokioExecutionEngine {
             }
         }
 
-        graph.current_state.is_running = false;
-        graph.current_state.completed = completed_nodes == total_nodes;
+            graph.current_state.is_running = false;
+            graph.current_state.completed = completed_nodes == total_nodes;
+        }.instrument(graph_span).await;
     }
 
     fn checkpoint(&self, _graph_id: &str) -> Result<(), StorageError> {

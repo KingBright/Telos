@@ -35,4 +35,9 @@ pub enum NodeError {
 
 pub trait SystemRegistry: Send + Sync {
     // Defines standard registry lookup mechanisms across the system
+
+    /// Dynamically retrieves a ModelGateway instance without causing circular dependencies.
+    fn get_model_gateway(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
 }

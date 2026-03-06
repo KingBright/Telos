@@ -26,20 +26,21 @@ This file tracks the integration points between different modules to ensure the 
 - [ ] **HCI Event Bus (Module 1) -> Memory OS (Module 4)**:
   - (Future) Direct, high-priority user feedback triggers immediate write operations to Semantic Memory with maximum strength, ensuring user preferences override default behaviors.
 
-- [ ] **Model Gateway (Module 7) -> Memory OS (Module 4)**:
+- [x] **Model Gateway (Module 7) -> Memory OS (Module 4)**:
   - (Future) Memory OS background workers (reconsolidation) utilize the Model Gateway API for summarization, applying exponential backoff and rate limiting during background compression.
 
 ## 07 Model Gateway & Resource Governor (telos_model_gateway) Integration
 
-- [ ] **DAG Engine (Module 2) -> Model Gateway (Module 7)**:
+- [x] **DAG Engine (Module 2) -> Model Gateway (Module 7)**:
   - DAG engine nodes (`ExecutableNode`) invoke the LLM via the Model Gateway, passing specific prompt messages and capability requirements, while obeying session-level budget constraints.
 
-- [ ] **Context Compression (Module 3) -> Model Gateway (Module 7)**:
+- [x] **Context Compression (Module 3) -> Model Gateway (Module 7)**:
   - Context manager's RAPTOR clustering and summarizing routines invoke the LLM via the Model Gateway to construct tree-based hierarchical summaries, with requests properly handled by backoff mechanisms on 429/503 errors.
 
 ## Notes/Issues
 - *Added as part of Module 3 planning to track inter-module dependencies.*
 - Context Compression API implemented. DAG nodes can now inject NodeRequirement (tokens and query string) and receive ScopedContext arrays via the RAPTOR manager.
+- Integrated `ModelGateway` across `telos_dag`, `telos_context`, and `telos_memory` via generic registry lookups and direct API integrations.
 
 ## 08 Zero-Trust Security & Vault (telos_security) Integration
 
@@ -49,7 +50,7 @@ This file tracks the integration points between different modules to ensure the 
 
 ## 09 Observability & Telemetry (telos_telemetry) Integration
 
-- [ ] **DAG Engine (Module 2) -> Telemetry (Module 9)**:
+- [x] **DAG Engine (Module 2) -> Telemetry (Module 9)**:
   - (Future) Ensure `tracing` spans properly encapsulate `ExecutionEngine::run_graph` passing trace IDs through the state machine correctly.
 
 - [ ] **Evolution Evaluator (Module 6) -> Telemetry (Module 9)**:
