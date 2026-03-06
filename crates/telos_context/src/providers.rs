@@ -226,3 +226,45 @@ impl Default for MockApiProvider {
         Self::new()
     }
 }
+
+/// A Provider that acts as a wrapper for the Model Gateway.
+/// It routes LLM summarization calls through the central rate-limiting and backoff mechanisms.
+#[derive(Clone)]
+pub struct GatewayLlmProvider {
+    gateway: Arc<dyn telos_model_gateway::ModelGateway>,
+}
+
+impl GatewayLlmProvider {
+    pub fn new(gateway: Arc<dyn telos_model_gateway::ModelGateway>) -> Self {
+        Self { gateway }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for GatewayLlmProvider {
+    async fn summarize(&self, text: &str) -> Result<String, ProviderError> {
+        let req = telos_model_gateway::LlmRequest {
+            session_id: "context_compression".to_string(), // In reality, fetch from context
+            messages: vec![
+                telos_model_gateway::Message {
+                    role: "system".to_string(),
+                    content: "You are a context compressor. Summarize the following text cluster into a single, concise paragraph that captures all key facts and relationships. Do not add conversational filler.".to_string(),
+                },
+                telos_model_gateway::Message {
+                    role: "user".to_string(),
+                    content: text.to_string(),
+                }
+            ],
+            required_capabilities: telos_model_gateway::Capability {
+                requires_vision: false,
+                strong_reasoning: false,
+            },
+            budget_limit: 1000,
+        };
+
+        let response = self.gateway.generate(req).await
+            .map_err(|e| ProviderError(format!("Gateway Error: {:?}", e)))?;
+
+        Ok(response.content)
+    }
+}

@@ -13,3 +13,7 @@ redb.workspace = true
 tokio.workspace = true
 futures.workspace = true
 uuid.workspace = true
+telos_model_gateway = { path = "../telos_model_gateway" }
+serde_json.workspace = true
+telos_telemetry = { path = "../telos_telemetry" }
+tracing = "0.1"

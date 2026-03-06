@@ -84,8 +84,8 @@ mod tests {
         assert!(entry.current_strength < 0.5);
     }
 
-    #[test]
-    fn test_memory_reconsolidation() {
+    #[tokio::test]
+    async fn test_memory_reconsolidation() {
         let ts = get_current_timestamp();
         let mut memories = vec![
             MemoryEntry {
@@ -110,7 +110,7 @@ mod tests {
             }
         ];
 
-        let new_semantics = consolidate_memories(&mut memories, 4.0);
+        let new_semantics = consolidate_memories(&mut memories, 4.0, None).await;
 
         assert_eq!(new_semantics.len(), 1);
         assert_eq!(new_semantics[0].memory_type, MemoryType::Semantic);
