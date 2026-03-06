@@ -3232,7 +3232,11 @@ dependencies = [
 name = "telos_evolution"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "fastembed",
  "telos_core",
+ "tokio",
 ]
 
 [[package]]

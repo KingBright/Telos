@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 telos_core = { path = "../telos_core" }
+fastembed = "5.12.0"
+tokio.workspace = true
+async-trait.workspace = true
+anyhow = "1.0"
