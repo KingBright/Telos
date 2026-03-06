@@ -40,3 +40,9 @@ This file tracks the integration points between different modules to ensure the 
 ## Notes/Issues
 - *Added as part of Module 3 planning to track inter-module dependencies.*
 - Context Compression API implemented. DAG nodes can now inject NodeRequirement (tokens and query string) and receive ScopedContext arrays via the RAPTOR manager.
+
+## 08 Zero-Trust Security & Vault (telos_security) Integration
+
+- [x] **Tooling & Wasm Sandbox (Module 5) -> Security Vault (Module 8)**:
+  - Wasm ToolExecutor must validate the tool call against the Vault's ABAC policy (`validate_tool_call`).
+  - Wasm Sandbox needs to temporarily lease credentials (`lease_temporary_credential`) with tight TTL before spawning tools.
