@@ -37,3 +37,7 @@ pub trait Evaluator: Send + Sync {
     async fn detect_drift(&self, trace: &ExecutionTrace) -> Result<(), DriftWarning>;
     async fn distill_experience(&self, trace: &ExecutionTrace) -> Option<SynthesizedSkill>;
 }
+
+pub trait TraceExport: Send + Sync {
+    fn export_trace(&self, trace_id: &str) -> Option<ExecutionTrace>;
+}

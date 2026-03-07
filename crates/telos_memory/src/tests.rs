@@ -116,4 +116,30 @@ mod tests {
         assert_eq!(new_semantics[0].memory_type, MemoryType::Semantic);
         assert_eq!(new_semantics[0].content, "Fire is hot.");
     }
+
+    #[tokio::test]
+    async fn test_ingest_user_feedback() {
+        use crate::integration::MemoryIntegration;
+
+        let db_path = "test_feedback_db.redb";
+        let _ = std::fs::remove_file(db_path); // Ensure clean start
+        let store = RedbGraphStore::new(db_path).unwrap();
+
+        let feedback = "Never delete system files.";
+        let strength = 5.0;
+
+        store.ingest_user_feedback(feedback, strength).await.unwrap();
+
+        // Use a broader query and manually filter to find the specific feedback entry
+        let results = store.retrieve(MemoryQuery::EntityLookup { entity: "Never".to_string() }).await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        let entry = &results[0];
+        assert_eq!(entry.content, feedback);
+        assert_eq!(entry.memory_type, MemoryType::Semantic);
+        assert_eq!(entry.base_strength, strength);
+        assert_eq!(entry.current_strength, strength);
+
+        let _ = std::fs::remove_file(db_path); // Cleanup
+    }
 }

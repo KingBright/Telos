@@ -23,7 +23,7 @@ This file tracks the integration points between different modules to ensure the 
 - [x] **Tooling & Wasm Sandbox (Module 5) -> Memory OS (Module 4)**:
   - Tool retrieval API implemented via `VectorToolRegistry`. Wasm Sandbox execution API implemented (`ToolExecutor`). The Wasm engine can now run procedural tools extracted from memory templates with tight fuel bounds.
 
-- [ ] **HCI Event Bus (Module 1) -> Memory OS (Module 4)**:
+- [x] **HCI Event Bus (Module 1) -> Memory OS (Module 4)**:
   - (Future) Direct, high-priority user feedback triggers immediate write operations to Semantic Memory with maximum strength, ensuring user preferences override default behaviors.
 
 - [x] **Model Gateway (Module 7) -> Memory OS (Module 4)**:
@@ -53,5 +53,5 @@ This file tracks the integration points between different modules to ensure the 
 - [x] **DAG Engine (Module 2) -> Telemetry (Module 9)**:
   - (Future) Ensure `tracing` spans properly encapsulate `ExecutionEngine::run_graph` passing trace IDs through the state machine correctly.
 
-- [ ] **Evolution Evaluator (Module 6) -> Telemetry (Module 9)**:
+- [x] **Evolution Evaluator (Module 6) -> Telemetry (Module 9)**:
   - (Future) Telemetry system stores outputs that can be fed natively into the Evolution system avoiding circular dependencies.
