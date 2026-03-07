@@ -1,0 +1,18 @@
+[package]
+name = "telos_bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = { version = "0.24.0", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3.31"
+teloxide = { version = "0.13.0", features = ["macros"] }
+
+telos_core = { path = "../telos_core" }

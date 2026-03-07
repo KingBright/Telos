@@ -9,6 +9,9 @@ pub struct TelosConfig {
     pub openai_model: String,
     pub openai_embedding_model: String,
     pub db_path: String,
+
+    // Optional chatbot integrations
+    pub telegram_bot_token: Option<String>,
 }
 
 impl TelosConfig {

@@ -17,3 +17,4 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 
 telos_core = { path = "../telos_core" }
 telos_hci = { path = "../telos_hci" }
+telos_bot = { path = "../telos_bot" }

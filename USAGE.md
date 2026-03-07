@@ -148,3 +148,38 @@ Here are 5 carefully designed E2E scenarios, ranked from simplest to most comple
     *   Since the daemon architecture routes standard generation through a stateless `LlmPromptNode` by default for simple tests, this case tests the boundary of the V1 MVP.
     *   In a fully evolved Telos state, the MemoryOS will inject previous outputs into `ScopedContext`.
     *   Currently, the LLM will generate a standalone Rust script attempting to satisfy the prompt, validating that the routing and response structures do not panic on ambiguous contextual references.
+
+---
+
+## 5. Chatbot Integration (Telegram)
+
+Telos includes a robust chatbot abstraction layer that allows you to interact with the daemon directly from messaging platforms like Telegram. The chatbot acts as another client, similar to the CLI, routing your messages to the daemon and streaming the execution feedback back to your chat.
+
+### Configuration
+
+Before starting the bot, you need to configure your Telegram Bot Token.
+1. Create a new bot using [@BotFather](https://t.me/BotFather) on Telegram and obtain your HTTP API Token.
+2. Run the initialization wizard again to update your config, or manually edit `~/.telos_config.toml` to add the token:
+
+```toml
+telegram_bot_token = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+```
+
+*Note: You can re-run the wizard by deleting your existing config file or running `cargo run -p telos_cli -- run ""` and following the prompts.*
+
+### Starting the Bot
+
+Once the `telos_daemon` is running in the background (see Section 3), you can start the Telegram bot adapter in a new terminal window using the CLI:
+
+```bash
+cargo run -p telos_cli -- bot --telegram
+```
+
+### Interacting with the Bot
+
+1. Open your Telegram app and navigate to your bot.
+2. Send the `/start` or `/help` command to see available options.
+3. Send a natural language task, just like you would in the CLI:
+   `Write a short poem about Rust.`
+4. The bot will dispatch the task to the Telos Daemon and stream the state changes and final output directly into the chat!
+   *Note: For tasks requiring human intervention (like `sudo`), the bot will notify you in the chat, but approval currently must be done via the CLI.*
