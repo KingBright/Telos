@@ -88,7 +88,7 @@ async fn handle_telegram_bot() -> Result<(), Box<dyn std::error::Error>> {
     let daemon_url = "http://127.0.0.1:3000".to_string();
     let daemon_ws_url = "ws://127.0.0.1:3000/api/v1/stream".to_string();
 
-    let provider = TelegramBotProvider::new(token, daemon_url, daemon_ws_url);
+    let provider = TelegramBotProvider::new(token, daemon_url, daemon_ws_url, config.bot_send_state_changes);
     provider.start().await.map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
     Ok(())
@@ -165,6 +165,11 @@ fn check_and_init_config(force: bool) -> bool {
         }
     }
 
+    let bot_send_state_changes = Confirm::new("Should the Telegram bot send intermediate state changes (sub-task progress)?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false);
+
     let config = TelosConfig {
         openai_api_key: api_key,
         openai_base_url: base_url,
@@ -172,6 +177,7 @@ fn check_and_init_config(force: bool) -> bool {
         openai_embedding_model: embedding_model,
         db_path,
         telegram_bot_token,
+        bot_send_state_changes,
     };
 
     match config.save() {

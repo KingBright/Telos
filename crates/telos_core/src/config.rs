@@ -12,6 +12,8 @@ pub struct TelosConfig {
 
     // Optional chatbot integrations
     pub telegram_bot_token: Option<String>,
+    #[serde(default)]
+    pub bot_send_state_changes: bool,
 }
 
 impl TelosConfig {

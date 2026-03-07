@@ -25,15 +25,17 @@ pub struct TelegramBotProvider {
     daemon_url: String,
     daemon_ws_url: String,
     active_tasks: Arc<Mutex<HashMap<String, String>>>,
+    send_state_changes: bool,
 }
 
 impl TelegramBotProvider {
-    pub fn new(token: String, daemon_url: String, daemon_ws_url: String) -> Self {
+    pub fn new(token: String, daemon_url: String, daemon_ws_url: String, send_state_changes: bool) -> Self {
         Self {
             bot: Bot::new(token),
             daemon_url,
             daemon_ws_url,
             active_tasks: Arc::new(Mutex::new(HashMap::new())),
+            send_state_changes,
         }
     }
 
@@ -88,7 +90,8 @@ impl TelegramBotProvider {
     async fn listen_to_daemon(
         bot: Bot,
         daemon_ws_url: String,
-        active_tasks: Arc<Mutex<HashMap<String, String>>>
+        active_tasks: Arc<Mutex<HashMap<String, String>>>,
+        send_state_changes: bool,
     ) {
         loop {
             match connect_async(&daemon_ws_url).await {
@@ -126,7 +129,7 @@ impl TelegramBotProvider {
                                                 active_tasks.lock().await.remove(&tid);
                                             }
                                         }
-                                    } else {
+                                    } else if send_state_changes {
                                         let _ = bot.send_message(chat_id, format!("[STATE] {}", text)).await;
                                     }
                                 }
@@ -150,12 +153,13 @@ impl ChatBotProvider for TelegramBotProvider {
         let daemon_url = self.daemon_url.clone();
         let daemon_ws_url = self.daemon_ws_url.clone();
         let active_tasks = self.active_tasks.clone();
+        let send_state_changes = self.send_state_changes;
 
         let ws_bot = bot.clone();
         let ws_active_tasks = active_tasks.clone();
 
         tokio::spawn(async move {
-            Self::listen_to_daemon(ws_bot, daemon_ws_url, ws_active_tasks).await;
+            Self::listen_to_daemon(ws_bot, daemon_ws_url, ws_active_tasks, send_state_changes).await;
         });
 
         // Use a standard Dispatcher for both commands and plain text

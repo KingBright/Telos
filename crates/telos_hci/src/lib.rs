@@ -64,6 +64,7 @@ pub enum AgentFeedback {
         risk_level: RiskLevel,
     },
     Output {
+        task_id: String,
         session_id: String,
         content: String,
         is_final: bool,
