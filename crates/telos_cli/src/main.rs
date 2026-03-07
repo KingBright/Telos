@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use futures_util::stream::StreamExt;
-use inquire::Text;
+use inquire::{Text, Confirm};
 use reqwest::Client;
 use serde_json::json;
 use std::io::{self, Write};
@@ -8,6 +8,8 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use telos_core::config::TelosConfig;
+use telos_bot::providers::telegram::TelegramBotProvider;
+use telos_bot::traits::ChatBotProvider;
 
 #[derive(Parser)]
 #[command(name = "telos")]
@@ -29,6 +31,11 @@ enum Commands {
         /// The natural language task description
         task: String,
     },
+    /// Manage and start chatbots
+    Bot {
+        #[arg(long)]
+        telegram: bool,
+    },
 }
 
 #[tokio::main]
@@ -43,10 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Daemon { start } => {
             if *start {
                 println!("Starting Telos Daemon...");
+                #[allow(clippy::zombie_processes)]
                 std::process::Command::new("cargo")
                     .args(["run", "-p", "telos_daemon"])
                     .spawn()
                     .expect("Failed to start telos_daemon");
+                // We deliberately do not wait() as it runs in background.
+
                 println!("Daemon started in the background.");
             } else {
                 println!("Please use `telos daemon --start`");
@@ -56,7 +66,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Dispatching Task: {}", task);
             handle_run(task).await?;
         }
+        Commands::Bot { telegram } => {
+            if *telegram {
+                handle_telegram_bot().await?;
+            } else {
+                println!("Please specify a bot platform, e.g., `telos bot --telegram`");
+            }
+        }
     }
+
+    Ok(())
+}
+
+async fn handle_telegram_bot() -> Result<(), Box<dyn std::error::Error>> {
+    let config = TelosConfig::load().expect("Could not load config");
+    let token = config.telegram_bot_token.expect("Telegram bot token not found in config. Please re-run config or add it manually.");
+
+    println!("Starting Telegram Bot Adapter...");
+
+    let daemon_url = "http://127.0.0.1:3000".to_string();
+    let daemon_ws_url = "ws://127.0.0.1:3000/api/v1/stream".to_string();
+
+    let provider = TelegramBotProvider::new(token, daemon_url, daemon_ws_url);
+    provider.start().await.map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
     Ok(())
 }
@@ -116,12 +148,30 @@ fn check_and_init_config() {
                 .prompt()
                 .unwrap_or(default_db_path);
 
+            let wants_telegram = Confirm::new("Would you like to configure a Telegram bot integration?")
+                .with_default(false)
+                .prompt()
+                .unwrap_or(false);
+
+            let mut telegram_bot_token = None;
+            if wants_telegram {
+                let token = Text::new("Please enter your Telegram Bot Token:")
+                    .prompt()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if !token.is_empty() {
+                    telegram_bot_token = Some(token);
+                }
+            }
+
             let config = TelosConfig {
                 openai_api_key: api_key,
                 openai_base_url: base_url,
                 openai_model: model,
                 openai_embedding_model: embedding_model,
                 db_path,
+                telegram_bot_token,
             };
 
             match config.save() {
