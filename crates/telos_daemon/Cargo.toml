@@ -1,0 +1,24 @@
+[package]
+name = "telos_daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+telos_core = { path = "../telos_core" }
+telos_hci = { path = "../telos_hci" }
+telos_dag = { path = "../telos_dag" }
+telos_context = { path = "../telos_context" }
+telos_memory = { path = "../telos_memory" }
+telos_tooling = { path = "../telos_tooling" }
+telos_evolution = { path = "../telos_evolution" }
+telos_model_gateway = { path = "../telos_model_gateway" }
+telos_security = { path = "../telos_security" }
+telos_telemetry = { path = "../telos_telemetry" }

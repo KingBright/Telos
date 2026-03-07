@@ -1,3 +1,4 @@
+pub mod config;
 // --- Core Primitives shared across Telos modules ---
 
 #[derive(Debug, Clone, PartialEq)]

@@ -73,19 +73,58 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
-    embedding_model: String,
     llm_model: String,
+    embedding_model: String,
 }
 
 impl OpenAiProvider {
-    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+    pub fn new(api_key: String, base_url: String, llm_model: String, embedding_model: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
-            base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            embedding_model: "text-embedding-3-small".to_string(),
-            llm_model: "gpt-4o-mini".to_string(), // Fast and cheap for summaries
+            base_url,
+            llm_model,
+            embedding_model,
         }
+    }
+
+    pub async fn chat_completion(&self, prompt: &str) -> Result<String, ProviderError> {
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let payload = serde_json::json!({
+            "model": self.llm_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.7
+        });
+
+        let response = self.client.post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| ProviderError(format!("HTTP Error: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError(format!("API Error {}: {}", status, body)));
+        }
+
+        let json: serde_json::Value = response.json()
+            .await
+            .map_err(|e| ProviderError(format!("JSON Parse Error: {}", e)))?;
+
+        let reply = json["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| ProviderError("Invalid reply format from API".to_string()))?
+            .to_string();
+
+        Ok(reply)
     }
 }
 
@@ -171,6 +210,8 @@ impl LlmProvider for OpenAiProvider {
 
         Ok(summary)
     }
+
+
 }
 
 use std::sync::Arc;
