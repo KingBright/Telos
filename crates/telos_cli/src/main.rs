@@ -21,6 +21,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize and configure the Telos environment
+    Init,
     /// Start the telos daemon server
     Daemon {
         #[arg(short, long)]
@@ -40,33 +42,32 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialization Wizard
-    check_and_init_config();
-
-    // 2. Parse CLI Commands
     let cli = Cli::parse();
 
     match &cli.command {
+        Commands::Init => {
+            if check_and_init_config(true) {
+                start_daemon();
+            }
+        }
         Commands::Daemon { start } => {
             if *start {
-                println!("Starting Telos Daemon...");
-                #[allow(clippy::zombie_processes)]
-                std::process::Command::new("cargo")
-                    .args(["run", "-p", "telos_daemon"])
-                    .spawn()
-                    .expect("Failed to start telos_daemon");
-                // We deliberately do not wait() as it runs in background.
-
-                println!("Daemon started in the background.");
+                start_daemon();
             } else {
                 println!("Please use `telos daemon --start`");
             }
         }
         Commands::Run { task } => {
+            if check_and_init_config(false) {
+                start_daemon();
+            }
             println!("Dispatching Task: {}", task);
             handle_run(task).await?;
         }
         Commands::Bot { telegram } => {
+            if check_and_init_config(false) {
+                start_daemon();
+            }
             if *telegram {
                 handle_telegram_bot().await?;
             } else {
@@ -93,97 +94,124 @@ async fn handle_telegram_bot() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn check_and_init_config() {
-    match TelosConfig::load() {
-        Ok(_) => {
-            // Config exists and is valid
-        }
-        Err(_) => {
-            println!("Welcome to Telos! Let's set up your environment.");
+fn check_and_init_config(force: bool) -> bool {
+    if !force && TelosConfig::load().is_ok() {
+        return false; // Valid config already exists
+    }
 
-            let mut api_key = String::new();
-            while api_key.is_empty() {
-                api_key = Text::new("Please enter your API Key (e.g. OpenAI or Zhipu GLM key):")
-                    .prompt()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-            }
+    println!("Welcome to Telos! Let's set up your environment.");
 
-            let mut base_url = String::new();
-            while base_url.is_empty() {
-                base_url = Text::new("Please enter the API Base URL (e.g. https://open.bigmodel.cn/api/paas/v4 for GLM, or https://api.openai.com/v1 for OpenAI):")
-                    .prompt()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-            }
+    let mut api_key = String::new();
+    while api_key.is_empty() {
+        api_key = Text::new("Please enter your API Key (e.g. OpenAI or Zhipu GLM key):")
+            .prompt()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
 
-            let mut model = String::new();
-            while model.is_empty() {
-                model = Text::new("Please enter the LLM Model name (e.g. glm-4.7 for Zhipu, or gpt-4o-mini for OpenAI):")
-                    .prompt()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-            }
+    let mut base_url = String::new();
+    while base_url.is_empty() {
+        base_url = Text::new("Please enter the API Base URL (e.g. https://open.bigmodel.cn/api/paas/v4 for GLM, or https://api.openai.com/v1 for OpenAI):")
+            .prompt()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
 
-            let mut embedding_model = String::new();
-            while embedding_model.is_empty() {
-                embedding_model = Text::new("Please enter the Embedding Model name (e.g. Embedding-3 for Zhipu, or text-embedding-3-small for OpenAI):")
-                    .prompt()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-            }
+    let mut model = String::new();
+    while model.is_empty() {
+        model = Text::new("Please enter the LLM Model name (e.g. glm-4.7 for Zhipu, or gpt-4o-mini for OpenAI):")
+            .prompt()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
 
-            let default_db_path = {
-                let mut path = dirs::home_dir().expect("Could not find home directory");
-                path.push(".telos_memory.redb");
-                path.to_string_lossy().into_owned()
-            };
+    let mut embedding_model = String::new();
+    while embedding_model.is_empty() {
+        embedding_model = Text::new("Please enter the Embedding Model name (e.g. Embedding-3 for Zhipu, or text-embedding-3-small for OpenAI):")
+            .prompt()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+    }
 
-            let db_path = Text::new("Where should we store the memory database?")
-                .with_default(&default_db_path)
-                .prompt()
-                .unwrap_or(default_db_path);
+    let default_db_path = {
+        let mut path = dirs::home_dir().expect("Could not find home directory");
+        path.push(".telos_memory.redb");
+        path.to_string_lossy().into_owned()
+    };
 
-            let wants_telegram = Confirm::new("Would you like to configure a Telegram bot integration?")
-                .with_default(false)
-                .prompt()
-                .unwrap_or(false);
+    let db_path = Text::new("Where should we store the memory database?")
+        .with_default(&default_db_path)
+        .prompt()
+        .unwrap_or(default_db_path);
 
-            let mut telegram_bot_token = None;
-            if wants_telegram {
-                let token = Text::new("Please enter your Telegram Bot Token:")
-                    .prompt()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                if !token.is_empty() {
-                    telegram_bot_token = Some(token);
-                }
-            }
+    let wants_telegram = Confirm::new("Would you like to configure a Telegram bot integration?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false);
 
-            let config = TelosConfig {
-                openai_api_key: api_key,
-                openai_base_url: base_url,
-                openai_model: model,
-                openai_embedding_model: embedding_model,
-                db_path,
-                telegram_bot_token,
-            };
-
-            match config.save() {
-                Ok(_) => {
-                    println!("Configuration saved successfully to {:?}", TelosConfig::config_file_path());
-                }
-                Err(e) => {
-                    eprintln!("Failed to save config: {}", e);
-                }
-            }
+    let mut telegram_bot_token = None;
+    if wants_telegram {
+        let token = Text::new("Please enter your Telegram Bot Token:")
+            .prompt()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !token.is_empty() {
+            telegram_bot_token = Some(token);
         }
     }
+
+    let config = TelosConfig {
+        openai_api_key: api_key,
+        openai_base_url: base_url,
+        openai_model: model,
+        openai_embedding_model: embedding_model,
+        db_path,
+        telegram_bot_token,
+    };
+
+    match config.save() {
+        Ok(_) => {
+            println!("Configuration saved successfully to {:?}", TelosConfig::config_file_path());
+            true
+        }
+        Err(e) => {
+            eprintln!("Failed to save config: {}", e);
+            false
+        }
+    }
+}
+
+fn start_daemon() {
+    println!("Starting Telos Daemon...");
+    let exe_dir = std::env::current_exe()
+        .map(|p| p.parent().unwrap().to_path_buf())
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    // In release/debug builds, telos_daemon should be next to telos cli
+    let daemon_path = exe_dir.join("telos_daemon");
+
+    if daemon_path.exists() {
+        #[allow(clippy::zombie_processes)]
+        std::process::Command::new(daemon_path)
+            .spawn()
+            .expect("Failed to start telos_daemon");
+    } else {
+        // Fallback for local dev
+        #[allow(clippy::zombie_processes)]
+        std::process::Command::new("cargo")
+            .args(["run", "-p", "telos_daemon"])
+            .spawn()
+            .expect("Failed to start telos_daemon via cargo");
+    }
+
+    // Brief sleep to allow server to start
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    println!("Daemon started in the background.");
 }
 
 async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
