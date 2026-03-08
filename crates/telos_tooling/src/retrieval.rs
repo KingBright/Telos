@@ -2,12 +2,11 @@ use crate::{ToolExecutor, ToolRegistry, ToolSchema};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use std::collections::HashMap;
 use std::sync::RwLock;
-use crate::sandbox::{WasmExecutor, SandboxConfig};
 
 pub struct VectorToolRegistry {
     tools: HashMap<String, ToolSchema>,
     embeddings_cache: HashMap<String, Vec<f32>>,
-    executors: HashMap<String, WasmExecutor>,
+    executors: HashMap<String, std::sync::Arc<dyn ToolExecutor>>,
     model: RwLock<TextEmbedding>,
 }
 
@@ -24,7 +23,7 @@ impl VectorToolRegistry {
         }
     }
 
-    pub fn register_tool(&mut self, schema: ToolSchema, wasm_binary: Option<Vec<u8>>) {
+    pub fn register_tool(&mut self, schema: ToolSchema, executor: Option<std::sync::Arc<dyn ToolExecutor>>) {
         let text_to_embed = format!("{} {}", schema.name, schema.description);
 
         // Generate embedding for the tool description
@@ -36,11 +35,8 @@ impl VectorToolRegistry {
             self.embeddings_cache.insert(schema.name.clone(), embedding);
         }
 
-        if let Some(binary) = wasm_binary {
-            let config = SandboxConfig::default();
-            if let Ok(executor) = WasmExecutor::new(binary, config) {
-                self.executors.insert(schema.name.clone(), executor);
-            }
+        if let Some(exec) = executor {
+            self.executors.insert(schema.name.clone(), exec);
         }
 
         self.tools.insert(schema.name.clone(), schema);
@@ -98,11 +94,8 @@ impl ToolRegistry for VectorToolRegistry {
             .collect()
     }
 
-    fn get_executor(&self, tool_name: &str) -> Option<Box<dyn ToolExecutor>> {
-        if let Some(executor) = self.executors.get(tool_name) {
-            return Some(Box::new(executor.clone()));
-        }
-        None
+    fn get_executor(&self, tool_name: &str) -> Option<std::sync::Arc<dyn ToolExecutor>> {
+        self.executors.get(tool_name).cloned()
     }
 }
 impl Default for VectorToolRegistry {

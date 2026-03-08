@@ -22,6 +22,7 @@ use telos_dag::ExecutionEngine;
 use telos_memory::engine::RedbGraphStore;
 use telos_context::{RaptorContextManager, ScopedContext};
 use telos_context::providers::OpenAiProvider;
+use telos_tooling::ToolRegistry;
 use async_trait::async_trait;
 
 // 1. Adapter to convert Context OpenAiProvider to Gateway ModelProvider for the Gateway Manager
@@ -111,10 +112,11 @@ impl ExecutableNode for LlmPromptNode {
     }
 }
 
-use telos_tooling::sandbox::{WasmExecutor, SandboxConfig};
 
 struct WasmToolNode {
     tool_name: String,
+    tool_registry: std::sync::Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
+    tools_dir: String,
 }
 
 #[async_trait]
@@ -124,26 +126,119 @@ impl ExecutableNode for WasmToolNode {
         _ctx: &ScopedContext,
         _registry: &dyn SystemRegistry,
     ) -> Result<NodeResult, NodeError> {
-        // Real Tooling Wasm Execution - we will compile an empty Wasm binary.
-        // Real Wasm binaries start with \0asm followed by version.
-        let empty_wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let registry_guard = self.tool_registry.read().await;
 
-        // Spawn blocking to avoid starving async runtime while compiling Wasm
-        let result = tokio::task::spawn_blocking(move || {
-            let config = SandboxConfig::default();
-            WasmExecutor::new(empty_wasm, config)
-        }).await.unwrap();
+        let discovered_tools = registry_guard.discover_tools(&self.tool_name, 1);
+        if discovered_tools.is_empty() {
+             return Err(NodeError::ExecutionFailed(format!("No suitable tool found for intent: {}", self.tool_name)));
+        }
 
-        match result {
-            Ok(_executor) => {
-                let out = format!("Successfully loaded tool '{}' into Wasm Sandbox and verified execution capabilities.", self.tool_name);
+        let tool_schema = &discovered_tools[0];
+        let tool_name = &tool_schema.name;
+        println!("[Daemon] Selected tool: {}", tool_name);
+
+        let executor = registry_guard.get_executor(tool_name)
+            .ok_or_else(|| NodeError::ExecutionFailed(format!("Tool executor not found for {}", tool_name)))?;
+
+        // Extract parameters from LLM dynamically based on the tool schema and the node's prompt
+        let system_registry = _registry;
+        let gateway = system_registry.get_model_gateway()
+            .and_then(|g| g.downcast::<telos_model_gateway::gateway::GatewayManager>().ok())
+            .ok_or_else(|| NodeError::ExecutionFailed("Failed to get GatewayManager for tool parameter extraction".into()))?;
+
+        let prompt = format!(
+            "You are a tool execution planner. Extract the necessary parameters for the tool '{}' based on the following task.\n\
+            Task: {}\n\
+            Tool Schema: {}\n\n\
+            Respond strictly with a JSON object containing the parameters. Do not include markdown blocks.",
+            tool_name,
+            self.tool_name,
+            serde_json::to_string_pretty(&tool_schema.parameters_schema.raw_schema).unwrap()
+        );
+
+        let req = telos_model_gateway::LlmRequest {
+            session_id: "daemon_tool_param_extractor".to_string(),
+            messages: vec![telos_model_gateway::Message {
+                role: "user".to_string(),
+                content: prompt,
+            }],
+            required_capabilities: telos_model_gateway::Capability { requires_vision: false, strong_reasoning: false },
+            budget_limit: 1000,
+        };
+
+        let params_json_str = match gateway.generate(req).await {
+            Ok(res) => res.content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").to_string(),
+            Err(e) => return Err(NodeError::ExecutionFailed(format!("Failed to extract tool parameters via LLM: {:?}", e))),
+        };
+
+        let params: serde_json::Value = serde_json::from_str(&params_json_str)
+            .map_err(|e| NodeError::ExecutionFailed(format!("LLM returned invalid JSON for tool parameters: {}", e)))?;
+
+        println!("[Daemon] Extracted Tool Parameters: {}", params);
+
+        match executor.call(params).await {
+            Ok(output_data) => {
+                // Intercept __macro__: register_tool to fully support self-upgrading
+                if let Ok(json_res) = serde_json::from_slice::<serde_json::Value>(&output_data) {
+                    if json_res.get("__macro__").and_then(|m| m.as_str()) == Some("register_tool") {
+                        if let (Some(wasm_path), Some(schema_val)) = (json_res.get("wasm_path").and_then(|p| p.as_str()), json_res.get("schema")) {
+                            if let Ok(wasm_bytes) = std::fs::read(wasm_path) {
+                                let config_sb = telos_tooling::sandbox::SandboxConfig::default();
+                                // We spawn blocking to compile the new Wasm safely
+                                let wasm_bytes_clone = wasm_bytes.clone();
+                                let executor_res = tokio::task::spawn_blocking(move || {
+                                    telos_tooling::sandbox::WasmExecutor::new(wasm_bytes_clone, config_sb)
+                                }).await.unwrap();
+
+                                match executor_res {
+                                    Ok(wasm_executor) => {
+                                        if let Ok(schema) = serde_json::from_value::<telos_tooling::ToolSchema>(schema_val.clone()) {
+                                            // Persist the tool to disk for future runs
+                                            let target_dir = std::path::Path::new(&self.tools_dir);
+                                            if !target_dir.exists() {
+                                                let _ = std::fs::create_dir_all(target_dir);
+                                            }
+                                            let safe_name = schema.name.replace(|c: char| !c.is_alphanumeric(), "_");
+                                            let dest_wasm = target_dir.join(format!("{}.wasm", safe_name));
+                                            let dest_json = target_dir.join(format!("{}.json", safe_name));
+
+                                            if let Err(e) = std::fs::copy(&wasm_path, &dest_wasm) {
+                                                println!("[Daemon] Warning: Failed to persist Wasm binary: {}", e);
+                                            }
+                                            if let Ok(schema_str) = serde_json::to_string_pretty(&schema) {
+                                                if let Err(e) = std::fs::write(&dest_json, schema_str) {
+                                                    println!("[Daemon] Warning: Failed to persist Wasm Schema JSON: {}", e);
+                                                }
+                                            }
+
+                                            // Drop read lock
+                                            drop(registry_guard);
+                                            let mut write_guard = self.tool_registry.write().await;
+                                            write_guard.register_tool(schema, Some(std::sync::Arc::new(wasm_executor)));
+                                            println!("[Daemon] Successfully registered new Wasm Tool from path: {}", wasm_path);
+                                            return Ok(NodeResult {
+                                                output_data: format!("Tool Registration Successful: {}", wasm_path).into_bytes(),
+                                                extracted_knowledge: None,
+                                                next_routing_hint: None,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => return Err(NodeError::ExecutionFailed(format!("Failed to compile newly registered Wasm tool: {}", e))),
+                                }
+                            } else {
+                                return Err(NodeError::ExecutionFailed(format!("Failed to read newly generated Wasm file at path: {}", wasm_path)));
+                            }
+                        }
+                    }
+                }
+
                 Ok(NodeResult {
-                    output_data: out.into_bytes(),
+                    output_data,
                     extracted_knowledge: None,
                     next_routing_hint: None,
                 })
             }
-            Err(e) => Err(NodeError::ExecutionFailed(format!("WASM Sandbox error: {}", e))),
+            Err(e) => Err(NodeError::ExecutionFailed(format!("Tool Execution failed: {:?}", e))),
         }
     }
 }
@@ -192,6 +287,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway_adapter = Arc::new(GatewayAdapter { inner: openai_provider.clone() });
     let gateway = Arc::new(GatewayManager::new(gateway_adapter, 10000, 10.0));
 
+    // Initialize VectorToolRegistry with Native Tools
+    let mut tool_registry = telos_tooling::retrieval::VectorToolRegistry::new();
+    tool_registry.register_tool(
+        telos_tooling::native::FsReadTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::FsReadTool))
+    );
+    tool_registry.register_tool(
+        telos_tooling::native::FsWriteTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::FsWriteTool))
+    );
+    tool_registry.register_tool(
+        telos_tooling::native::ShellExecTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::ShellExecTool))
+    );
+    tool_registry.register_tool(
+        telos_tooling::native::ToolRegisterTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::ToolRegisterTool))
+    );
+
+    // --- Auto-Load Persisted Tools on Startup ---
+    let target_dir = std::path::Path::new(&config.tools_dir);
+    if target_dir.exists() && target_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(target_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Ok(json_content) = std::fs::read_to_string(&path) {
+                        if let Ok(schema) = serde_json::from_str::<telos_tooling::ToolSchema>(&json_content) {
+                            let wasm_path = path.with_extension("wasm");
+                            if wasm_path.exists() {
+                                if let Ok(wasm_bytes) = std::fs::read(&wasm_path) {
+                                    let sb_config = telos_tooling::sandbox::SandboxConfig::default();
+                                    let executor_res = tokio::task::block_in_place(|| {
+                                        telos_tooling::sandbox::WasmExecutor::new(wasm_bytes, sb_config)
+                                    });
+
+                                    if let Ok(wasm_executor) = executor_res {
+                                        tool_registry.register_tool(schema, Some(std::sync::Arc::new(wasm_executor)));
+                                        println!("[Daemon] Auto-loaded persisted tool from {:?}", wasm_path.file_name().unwrap());
+                                    } else {
+                                        eprintln!("[Daemon] Failed to compile persisted tool at {:?}", wasm_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let tool_registry = std::sync::Arc::new(tokio::sync::RwLock::new(tool_registry));
+
     let registry = Arc::new(DaemonRegistry { gateway: gateway.clone() });
     let _memory = Arc::new(RedbGraphStore::new(&config.db_path).expect("Failed to init MemoryOS database"));
     // Using cloud embeddings as configured
@@ -203,6 +351,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker_bg = Arc::clone(&broker);
     let gateway_clone = gateway.clone();
     let registry_clone = registry.clone();
+    let tool_registry = tool_registry.clone();
+    let config = config.clone();
     let paused_tasks: Arc<TokioMutex<HashMap<String, String>>> = Arc::new(TokioMutex::new(HashMap::new()));
     let paused_tasks_bg = paused_tasks.clone();
 
@@ -286,7 +436,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         terminal_nodes.push(node.id.clone());
                         if node.task_type == "TOOL" {
                             graph.add_node(node.id.clone(), Box::new(WasmToolNode {
-                                tool_name: node.prompt.clone()
+                                tool_name: node.prompt.clone(),
+                                tool_registry: tool_registry.clone(),
+                                tools_dir: config.tools_dir.clone(),
                             }));
                         } else {
                             graph.add_node(node.id.clone(), Box::new(LlmPromptNode {

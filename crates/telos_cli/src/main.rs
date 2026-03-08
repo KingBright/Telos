@@ -176,6 +176,7 @@ fn check_and_init_config(force: bool) -> bool {
         openai_model: model,
         openai_embedding_model: embedding_model,
         db_path,
+        tools_dir: default_tools_dir(),
         telegram_bot_token,
         bot_send_state_changes,
     };
@@ -290,4 +291,10 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn default_tools_dir() -> String {
+    let mut path = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push(".telos/tools");
+    path.to_string_lossy().into_owned()
 }

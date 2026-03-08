@@ -22,6 +22,7 @@ pub enum NodeStatus {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum RiskLevel {
     Normal,
     HighRisk,
