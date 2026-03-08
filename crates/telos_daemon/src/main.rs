@@ -462,7 +462,7 @@ Task:
                             println!("Failed to parse DAG plan: {}. Using fallback single node.", e);
                             DagPlan {
                                 reply: Some("I will handle that.".to_string()),
-                                nodes: vec![DagNode { id: "main".to_string(), task_type: "LLM".to_string(), prompt: enriched_payload.clone() }],
+                                nodes: vec![DagNode { id: "main".to_string(), task_type: "LLM".to_string(), prompt: payload.clone() }],
                                 edges: vec![]
                             }
                         }
