@@ -100,3 +100,72 @@ mod tests {
         assert_eq!(file_tools[0].name, "file_reader");
     }
 }
+    #[tokio::test]
+    async fn test_fs_list_dir_tool() {
+        use crate::native::FsListDirTool;
+        use serde_json::json;
+        use crate::ToolExecutor;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_file.txt");
+        fs::write(&file_path, "hello").unwrap();
+        let sub_dir = temp_dir.path().join("sub_dir");
+        fs::create_dir(&sub_dir).unwrap();
+
+        let tool = FsListDirTool;
+        let params = json!({"path": temp_dir.path().to_str().unwrap()});
+        let result = tool.call(params).await;
+
+        assert!(result.is_ok());
+        let result_bytes = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&result_bytes).unwrap();
+        let arr = parsed.as_array().unwrap();
+
+        assert_eq!(arr.len(), 2);
+
+        let mut names: Vec<&str> = arr.iter()
+            .map(|v| v.get("name").unwrap().as_str().unwrap())
+            .collect();
+        names.sort();
+
+        assert_eq!(names, vec!["sub_dir", "test_file.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_code_search_tool() {
+        use crate::native::CodeSearchTool;
+        use serde_json::json;
+        use crate::ToolExecutor;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path1 = temp_dir.path().join("file1.txt");
+        let file_path2 = temp_dir.path().join("file2.txt");
+
+        fs::write(&file_path1, "line 1\nsearch_pattern\nline 3").unwrap();
+        fs::write(&file_path2, "nothing here").unwrap();
+
+        let tool = CodeSearchTool;
+        let params = json!({
+            "path": temp_dir.path().to_str().unwrap(),
+            "pattern": "search_pattern"
+        });
+        let result = tool.call(params).await;
+
+        assert!(result.is_ok());
+        let result_bytes = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&result_bytes).unwrap();
+        let arr = parsed.as_array().unwrap();
+
+        assert_eq!(arr.len(), 1);
+        let match_obj = &arr[0];
+        let matched_text = match_obj.get("text").unwrap().as_str().unwrap();
+        let line_num = match_obj.get("line_number").unwrap().as_i64().unwrap();
+
+        assert_eq!(matched_text, "search_pattern");
+        assert_eq!(line_num, 2);
+
+}

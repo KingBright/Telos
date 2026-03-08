@@ -185,3 +185,135 @@ impl ToolRegisterTool {
         }
     }
 }
+
+// 5. File System List Directory Tool
+#[derive(Clone)]
+pub struct FsListDirTool;
+
+#[async_trait]
+impl ToolExecutor for FsListDirTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let path = params.get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'path' parameter".into()))?;
+
+        let dir = fs::read_dir(path)
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read directory: {}", e)))?;
+
+        let mut entries = Vec::new();
+        for entry in dir.flatten() {
+                let metadata = entry.metadata().ok();
+                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+
+                entries.push(serde_json::json!({
+                    "name": entry.file_name().to_string_lossy().to_string(),
+                    "is_dir": is_dir,
+                    "size": size
+                }));
+        }
+
+        let result = serde_json::to_vec(&entries)
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to serialize result: {}", e)))?;
+
+        Ok(result)
+    }
+}
+
+impl FsListDirTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "fs_list_dir".into(),
+            description: "Lists the contents of a directory. Returns a JSON array of files and folders. Requires a 'path' parameter.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+}
+
+// 6. Code Search Tool (Recursive Grep)
+#[derive(Clone)]
+pub struct CodeSearchTool;
+
+#[async_trait]
+impl ToolExecutor for CodeSearchTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let path = params.get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'path' parameter".into()))?;
+
+        let pattern = params.get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'pattern' parameter".into()))?;
+
+        let root_path = std::path::Path::new(path);
+        if !root_path.exists() {
+             return Err(ToolError::ExecutionFailed(format!("Path does not exist: {}", path)));
+        }
+
+        let mut results = Vec::new();
+        let mut to_visit = vec![root_path.to_path_buf()];
+
+        while let Some(current_dir) = to_visit.pop() {
+            if let Ok(entries) = fs::read_dir(&current_dir) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+
+                    if entry_path.is_dir() {
+                        to_visit.push(entry_path);
+                    } else if entry_path.is_file() {
+                         if let Ok(file) = std::fs::File::open(&entry_path) {
+                            use std::io::{BufRead, BufReader};
+                            let reader = BufReader::new(file);
+
+                            for (index, line) in reader.lines().enumerate() {
+                                if let Ok(line_text) = line {
+                                    if line_text.contains(pattern) {
+                                        results.push(serde_json::json!({
+                                            "file": entry_path.to_string_lossy().to_string(),
+                                            "line_number": index + 1,
+                                            "text": line_text.trim().to_string()
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let result_bytes = serde_json::to_vec(&results)
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to serialize result: {}", e)))?;
+
+        Ok(result_bytes)
+    }
+}
+
+impl CodeSearchTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "code_search".into(),
+            description: "Recursively searches for a text pattern in all files under a given path. Returns a JSON array of matches. Requires 'path' and 'pattern' parameters.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "pattern": { "type": "string" }
+                    },
+                    "required": ["path", "pattern"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+}

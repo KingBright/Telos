@@ -230,7 +230,6 @@ impl LlmProvider for OpenAiProvider {
 }
 
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// A Local Provider that uses ONNX Runtime (`fastembed`) for high-performance,
 /// in-process embeddings with zero network overhead.

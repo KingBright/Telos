@@ -1,0 +1,2 @@
+#!/bin/bash
+sed -i '/tool_registry.register_tool(/i\    tool_registry.register_tool(\n        telos_tooling::native::FsListDirTool::schema(),\n        Some(std::sync::Arc::new(telos_tooling::native::FsListDirTool)),\n    );\n    tool_registry.register_tool(\n        telos_tooling::native::CodeSearchTool::schema(),\n        Some(std::sync::Arc::new(telos_tooling::native::CodeSearchTool)),\n    );' crates/telos_daemon/src/main.rs

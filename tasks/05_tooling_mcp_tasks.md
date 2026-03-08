@@ -15,3 +15,7 @@
 - Implemented `native.rs` containing system tools to allow self-modification and execution.
 - Modified `WasmToolNode` in daemon to fetch execution paths dynamically via `VectorToolRegistry` instead of hardcoded Wasm binaries.
 - [x] Implemented cold-start tool recovery (persisting and auto-loading dynamic Wasm tools to `.telos/tools` via `TelosConfig`).
+
+## Post-Review Notes 2
+- [x] Implemented native foundational tools (FsListDirTool, CodeSearchTool) to reduce reliance on dangerous shell commands.
+- [x] Registered new native tools in `telos_daemon`.

@@ -376,6 +376,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize VectorToolRegistry with Native Tools
     let mut tool_registry = telos_tooling::retrieval::VectorToolRegistry::new_keyword_only();
     tool_registry.register_tool(
+        telos_tooling::native::FsListDirTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::FsListDirTool)),
+    );
+    tool_registry.register_tool(
+        telos_tooling::native::CodeSearchTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::CodeSearchTool)),
+    );
+    tool_registry.register_tool(
         telos_tooling::native::FsReadTool::schema(),
         Some(std::sync::Arc::new(telos_tooling::native::FsReadTool)),
     );
