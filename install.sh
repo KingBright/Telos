@@ -5,9 +5,20 @@ set -e
 echo "Building Telos project..."
 cargo build --release
 
-echo "Installing binaries to ~/.cargo/bin..."
+# 动态获取 cargo 的 target 目录
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | \
+    grep -o '"target_directory":"[^"]*"' | \
+    sed 's/"target_directory":"//;s/"//')
+
+if [ -z "$TARGET_DIR" ]; then
+    echo "Error: Failed to determine target directory"
+    exit 1
+fi
+
+echo "Installing binaries from $TARGET_DIR/release to ~/.cargo/bin..."
 mkdir -p ~/.cargo/bin
-cp target/release/telos target/release/telos_daemon ~/.cargo/bin/
+cp "$TARGET_DIR/release/telos_cli" "$TARGET_DIR/release/telos_daemon" ~/.cargo/bin/
+mv ~/.cargo/bin/telos_cli ~/.cargo/bin/telos
 
 echo "Installation successful."
 
