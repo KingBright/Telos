@@ -1,38 +1,72 @@
 use crate::{ToolExecutor, ToolRegistry, ToolSchema};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 pub struct VectorToolRegistry {
     tools: HashMap<String, ToolSchema>,
-    embeddings_cache: HashMap<String, Vec<f32>>,
     executors: HashMap<String, std::sync::Arc<dyn ToolExecutor>>,
-    model: RwLock<TextEmbedding>,
+    #[cfg(feature = "local-embeddings")]
+    embeddings_cache: HashMap<String, Vec<f32>>,
+    #[cfg(feature = "local-embeddings")]
+    model: Option<std::sync::RwLock<fastembed::TextEmbedding>>,
 }
 
 impl VectorToolRegistry {
     pub fn new() -> Self {
-        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
-            .expect("Failed to initialize fastembed model");
+        #[cfg(feature = "local-embeddings")]
+        {
+            let model_result = std::panic::catch_unwind(|| {
+                fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
+                    fastembed::EmbeddingModel::AllMiniLML6V2,
+                ))
+            });
 
+            match model_result {
+                Ok(Ok(model)) => {
+                    println!("[ToolRegistry] Fastembed model loaded successfully.");
+                    return Self {
+                        tools: HashMap::new(),
+                        executors: HashMap::new(),
+                        embeddings_cache: HashMap::new(),
+                        model: Some(std::sync::RwLock::new(model)),
+                    };
+                }
+                _ => {
+                    println!("[ToolRegistry] Fastembed model unavailable, using keyword fallback.");
+                }
+            }
+        }
+
+        Self::new_keyword_only()
+    }
+
+    /// Create a registry without attempting to load fastembed at all (instant startup).
+    pub fn new_keyword_only() -> Self {
+        println!("[ToolRegistry] Using keyword-only tool discovery.");
         Self {
             tools: HashMap::new(),
-            embeddings_cache: HashMap::new(),
             executors: HashMap::new(),
-            model: RwLock::new(model),
+            #[cfg(feature = "local-embeddings")]
+            embeddings_cache: HashMap::new(),
+            #[cfg(feature = "local-embeddings")]
+            model: None,
         }
     }
 
-    pub fn register_tool(&mut self, schema: ToolSchema, executor: Option<std::sync::Arc<dyn ToolExecutor>>) {
-        let text_to_embed = format!("{} {}", schema.name, schema.description);
-
-        // Generate embedding for the tool description
-        let mut model = self.model.write().unwrap();
-        let embeddings = model.embed(vec![text_to_embed], None)
-            .expect("Failed to generate embedding");
-
-        if let Some(embedding) = embeddings.into_iter().next() {
-            self.embeddings_cache.insert(schema.name.clone(), embedding);
+    pub fn register_tool(
+        &mut self,
+        schema: ToolSchema,
+        executor: Option<std::sync::Arc<dyn ToolExecutor>>,
+    ) {
+        #[cfg(feature = "local-embeddings")]
+        if let Some(ref model) = self.model {
+            let text_to_embed = format!("{} {}", schema.name, schema.description);
+            if let Ok(mut m) = model.write() {
+                if let Ok(embeddings) = m.embed(vec![text_to_embed], None) {
+                    if let Some(embedding) = embeddings.into_iter().next() {
+                        self.embeddings_cache.insert(schema.name.clone(), embedding);
+                    }
+                }
+            }
         }
 
         if let Some(exec) = executor {
@@ -42,7 +76,7 @@ impl VectorToolRegistry {
         self.tools.insert(schema.name.clone(), schema);
     }
 
-    // Simple cosine similarity helper
+    #[cfg(feature = "local-embeddings")]
     fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         let mut dot_product = 0.0;
         let mut norm_a = 0.0;
@@ -60,44 +94,71 @@ impl VectorToolRegistry {
             dot_product / (norm_a.sqrt() * norm_b.sqrt())
         }
     }
-}
 
-impl ToolRegistry for VectorToolRegistry {
-    fn discover_tools(&self, intent: &str, limit: usize) -> Vec<ToolSchema> {
-        let mut model = self.model.write().unwrap();
-        let query_embedding: Vec<f32> = match model.embed(vec![intent.to_string()], None) {
-            Ok(embeddings) => {
-                if let Some(emb) = embeddings.into_iter().next() {
-                    emb
-                } else {
-                    return vec![];
-                }
-            },
-            Err(_) => return vec![],
-        };
+    /// Keyword-based tool discovery fallback.
+    fn keyword_discover(&self, intent: &str, limit: usize) -> Vec<ToolSchema> {
+        let query_lower = intent.to_lowercase();
+        let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
-        let mut scored_tools: Vec<(&String, f32)> = self.embeddings_cache
+        let mut scored: Vec<(&String, f32)> = self
+            .tools
             .iter()
-            .map(|(name, emb)| {
-                let score = Self::cosine_similarity(&query_embedding, emb);
+            .map(|(name, schema)| {
+                let haystack = format!("{} {}", name, schema.description).to_lowercase();
+                let score: f32 =
+                    query_words.iter().filter(|w| haystack.contains(*w)).count() as f32;
                 (name, score)
             })
             .collect();
 
-        // Sort descending by score
-        scored_tools.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        scored_tools
+        scored
             .into_iter()
             .take(limit)
             .filter_map(|(name, _)| self.tools.get(name).cloned())
             .collect()
+    }
+}
+
+impl ToolRegistry for VectorToolRegistry {
+    fn discover_tools(&self, intent: &str, limit: usize) -> Vec<ToolSchema> {
+        #[cfg(feature = "local-embeddings")]
+        if let Some(ref model) = self.model {
+            if let Ok(mut m) = model.write() {
+                if let Ok(embeddings) = m.embed(vec![intent.to_string()], None) {
+                    if let Some(query_embedding) = embeddings.into_iter().next() {
+                        let mut scored_tools: Vec<(&String, f32)> = self
+                            .embeddings_cache
+                            .iter()
+                            .map(|(name, emb)| {
+                                let score = Self::cosine_similarity(&query_embedding, emb);
+                                (name, score)
+                            })
+                            .collect();
+
+                        scored_tools.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+
+                        return scored_tools
+                            .into_iter()
+                            .take(limit)
+                            .filter_map(|(name, _)| self.tools.get(name).cloned())
+                            .collect();
+                    }
+                }
+            }
+        }
+
+        self.keyword_discover(intent, limit)
     }
 
     fn get_executor(&self, tool_name: &str) -> Option<std::sync::Arc<dyn ToolExecutor>> {
         self.executors.get(tool_name).cloned()
     }
 }
+
 impl Default for VectorToolRegistry {
     fn default() -> Self {
         Self::new()

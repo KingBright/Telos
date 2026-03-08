@@ -40,7 +40,7 @@ impl EmbeddingProvider for MockApiProvider {
         let char_sum: u32 = text.chars().map(|c| c as u32).sum();
 
         for (i, v) in vec.iter_mut().enumerate().take(32) {
-             *v = ((char_sum + i as u32) % 100) as f32 / 100.0 * (len / 100.0).sin();
+            *v = ((char_sum + i as u32) % 100) as f32 / 100.0 * (len / 100.0).sin();
         }
 
         // Normalize the mock vector
@@ -78,9 +78,17 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(api_key: String, base_url: String, llm_model: String, embedding_model: String) -> Self {
+    pub fn new(
+        api_key: String,
+        base_url: String,
+        llm_model: String,
+        embedding_model: String,
+    ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             api_key,
             base_url,
             llm_model,
@@ -102,7 +110,9 @@ impl OpenAiProvider {
             "temperature": 0.7
         });
 
-        let response = self.client.post(&url)
+        let response = self
+            .client
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&payload)
             .send()
@@ -115,7 +125,8 @@ impl OpenAiProvider {
             return Err(ProviderError(format!("API Error {}: {}", status, body)));
         }
 
-        let json: serde_json::Value = response.json()
+        let json: serde_json::Value = response
+            .json()
             .await
             .map_err(|e| ProviderError(format!("JSON Parse Error: {}", e)))?;
 
@@ -138,7 +149,9 @@ impl EmbeddingProvider for OpenAiProvider {
             "input": text,
         });
 
-        let response = self.client.post(&url)
+        let response = self
+            .client
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&payload)
             .send()
@@ -151,7 +164,8 @@ impl EmbeddingProvider for OpenAiProvider {
             return Err(ProviderError(format!("API Error {}: {}", status, body)));
         }
 
-        let json: serde_json::Value = response.json()
+        let json: serde_json::Value = response
+            .json()
             .await
             .map_err(|e| ProviderError(format!("JSON Parse Error: {}", e)))?;
 
@@ -186,7 +200,9 @@ impl LlmProvider for OpenAiProvider {
             "temperature": 0.3
         });
 
-        let response = self.client.post(&url)
+        let response = self
+            .client
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&payload)
             .send()
@@ -199,7 +215,8 @@ impl LlmProvider for OpenAiProvider {
             return Err(ProviderError(format!("API Error {}: {}", status, body)));
         }
 
-        let json: serde_json::Value = response.json()
+        let json: serde_json::Value = response
+            .json()
             .await
             .map_err(|e| ProviderError(format!("JSON Parse Error: {}", e)))?;
 
@@ -210,8 +227,6 @@ impl LlmProvider for OpenAiProvider {
 
         Ok(summary)
     }
-
-
 }
 
 use std::sync::Arc;
@@ -219,21 +234,27 @@ use tokio::sync::Mutex;
 
 /// A Local Provider that uses ONNX Runtime (`fastembed`) for high-performance,
 /// in-process embeddings with zero network overhead.
+#[cfg(feature = "local-embeddings")]
 #[derive(Clone)]
 pub struct LocalEmbeddingProvider {
     model: Arc<Mutex<fastembed::TextEmbedding>>,
 }
 
+#[cfg(feature = "local-embeddings")]
 impl LocalEmbeddingProvider {
     pub fn new() -> Result<Self, ProviderError> {
         // InitTextEmbedding defaults to BGE-small-en-v1.5 or similar highly efficient models
-        let model = fastembed::TextEmbedding::try_new(Default::default())
-            .map_err(|e| ProviderError(format!("Failed to initialize local embedding model: {}", e)))?;
+        let model = fastembed::TextEmbedding::try_new(Default::default()).map_err(|e| {
+            ProviderError(format!("Failed to initialize local embedding model: {}", e))
+        })?;
 
-        Ok(Self { model: Arc::new(Mutex::new(model)) })
+        Ok(Self {
+            model: Arc::new(Mutex::new(model)),
+        })
     }
 }
 
+#[cfg(feature = "local-embeddings")]
 #[async_trait]
 impl EmbeddingProvider for LocalEmbeddingProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, ProviderError> {
@@ -244,12 +265,14 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
 
         let mut model_lock = model.lock().await;
 
-        let mut embeddings = tokio::task::block_in_place(|| {
-             model_lock.embed(documents, None::<usize>)
-        }).map_err(|e| ProviderError(format!("Local embedding failed: {}", e)))?;
+        let mut embeddings =
+            tokio::task::block_in_place(|| model_lock.embed(documents, None::<usize>))
+                .map_err(|e| ProviderError(format!("Local embedding failed: {}", e)))?;
 
         if embeddings.is_empty() {
-            return Err(ProviderError("Model returned empty embedding array".to_string()));
+            return Err(ProviderError(
+                "Model returned empty embedding array".to_string(),
+            ));
         }
 
         // Return the first (and only) embedding
@@ -303,7 +326,10 @@ impl LlmProvider for GatewayLlmProvider {
             budget_limit: 1000,
         };
 
-        let response = self.gateway.generate(req).await
+        let response = self
+            .gateway
+            .generate(req)
+            .await
             .map_err(|e| ProviderError(format!("Gateway Error: {:?}", e)))?;
 
         Ok(response.content)

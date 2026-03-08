@@ -1,16 +1,16 @@
 use clap::{Parser, Subcommand};
 use futures_util::stream::StreamExt;
-use inquire::{Text, Confirm};
+use inquire::{Confirm, Text};
 use reqwest::Client;
 use serde_json::json;
 use std::io::{self, Write};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use telos_core::config::TelosConfig;
-use telos_hci::AgentFeedback;
 use telos_bot::providers::telegram::TelegramBotProvider;
 use telos_bot::traits::ChatBotProvider;
+use telos_core::config::TelosConfig;
+use telos_hci::AgentFeedback;
 use telos_project::manager::ProjectRegistry;
 
 #[derive(Parser)]
@@ -50,18 +50,12 @@ enum Commands {
 #[derive(Subcommand)]
 enum ProjectCommands {
     /// Initialize a new project in the current or specified directory
-    Init {
-        name: String,
-        path: Option<String>,
-    },
+    Init { name: String, path: Option<String> },
     /// List all registered projects
     List,
     /// Switch active project context
-    Switch {
-        id_or_name: String,
-    },
+    Switch { id_or_name: String },
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -110,15 +104,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_telegram_bot() -> Result<(), Box<dyn std::error::Error>> {
     let config = TelosConfig::load().expect("Could not load config");
-    let token = config.telegram_bot_token.expect("Telegram bot token not found in config. Please re-run config or add it manually.");
+    let token = config
+        .telegram_bot_token
+        .expect("Telegram bot token not found in config. Please re-run config or add it manually.");
 
     println!("Starting Telegram Bot Adapter...");
 
     let daemon_url = "http://127.0.0.1:3000".to_string();
     let daemon_ws_url = "ws://127.0.0.1:3000/api/v1/stream".to_string();
 
-    let provider = TelegramBotProvider::new(token, daemon_url, daemon_ws_url, config.bot_send_state_changes);
-    provider.start().await.map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+    let provider = TelegramBotProvider::new(
+        token,
+        daemon_url,
+        daemon_ws_url,
+        config.bot_send_state_changes,
+    );
+    provider
+        .start()
+        .await
+        .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
     Ok(())
 }
@@ -150,11 +154,13 @@ fn check_and_init_config(force: bool) -> bool {
 
     let mut model = String::new();
     while model.is_empty() {
-        model = Text::new("Please enter the LLM Model name (e.g. glm-4.7 for Zhipu, or gpt-4o-mini for OpenAI):")
-            .prompt()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        model = Text::new(
+            "Please enter the LLM Model name (e.g. glm-4.7 for Zhipu, or gpt-4o-mini for OpenAI):",
+        )
+        .prompt()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     }
 
     let mut embedding_model = String::new();
@@ -194,10 +200,12 @@ fn check_and_init_config(force: bool) -> bool {
         }
     }
 
-    let bot_send_state_changes = Confirm::new("Should the Telegram bot send intermediate state changes (sub-task progress)?")
-        .with_default(false)
-        .prompt()
-        .unwrap_or(false);
+    let bot_send_state_changes = Confirm::new(
+        "Should the Telegram bot send intermediate state changes (sub-task progress)?",
+    )
+    .with_default(false)
+    .prompt()
+    .unwrap_or(false);
 
     let config = TelosConfig {
         openai_api_key: api_key,
@@ -213,7 +221,10 @@ fn check_and_init_config(force: bool) -> bool {
 
     match config.save() {
         Ok(_) => {
-            println!("Configuration saved successfully to {:?}", TelosConfig::config_file_path());
+            println!(
+                "Configuration saved successfully to {:?}",
+                TelosConfig::config_file_path()
+            );
             true
         }
         Err(e) => {
@@ -259,7 +270,10 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (ws_stream, _) = match connect_async(ws_url).await {
         Ok(ws) => ws,
         Err(e) => {
-            println!("Failed to connect to daemon WebSocket: {}. Is the daemon running?", e);
+            println!(
+                "Failed to connect to daemon WebSocket: {}. Is the daemon running?",
+                e
+            );
             return Ok(());
         }
     };
@@ -296,7 +310,9 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Message::Text(text) = msg {
             if let Ok(feedback) = serde_json::from_str::<AgentFeedback>(&text) {
                 match feedback {
-                    AgentFeedback::RequireHumanIntervention { prompt, task_id, .. } => {
+                    AgentFeedback::RequireHumanIntervention {
+                        prompt, task_id, ..
+                    } => {
                         println!("\n🚨 [HUMAN INTERVENTION REQUIRED] 🚨");
                         println!("{}", prompt);
 
@@ -313,19 +329,25 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
                             .await?;
 
                         if res.status().is_success() {
-                             println!("-> User Decision sent: Approved={}", approved);
+                            println!("-> User Decision sent: Approved={}", approved);
                         } else {
-                             println!("-> Failed to send decision.");
+                            println!("-> Failed to send decision.");
                         }
                     }
-                    AgentFeedback::Output { content, is_final, .. } => {
+                    AgentFeedback::Output {
+                        content, is_final, ..
+                    } => {
                         println!(">> {}", content);
                         if is_final {
                             println!("Task completed.");
                             break;
                         }
                     }
-                    AgentFeedback::StateChanged { current_node, status, .. } => {
+                    AgentFeedback::StateChanged {
+                        current_node,
+                        status,
+                        ..
+                    } => {
                         println!("[STATE] {} -> {:?}", current_node, status);
                     }
                 }
@@ -349,37 +371,37 @@ async fn handle_project(action: &ProjectCommands) -> Result<(), Box<dyn std::err
         ProjectCommands::Init { name, path } => {
             match registry.create_project(name.clone(), path.clone(), None) {
                 Ok(project) => {
-                    println!("Project '{}' created successfully at: {:?}", project.name, project.path);
+                    println!(
+                        "Project '{}' created successfully at: {:?}",
+                        project.name, project.path
+                    );
                     registry.set_active_project(&project.id)?;
                     println!("Switched active project to: {}", project.name);
                 }
                 Err(e) => eprintln!("Failed to create project: {}", e),
             }
         }
-        ProjectCommands::List => {
-            match registry.list_projects() {
-                Ok(projects) => {
-                    if projects.is_empty() {
-                        println!("No projects found. Use `telos project init <name>` to create one.");
-                    } else {
-                        let config = TelosConfig::load().unwrap_or_else(|_| panic!("Failed to load config"));
-                        let active_id = config.active_project_id.unwrap_or_default();
-                        println!("Registered Projects:");
-                        for p in projects {
-                            let active_marker = if p.id == active_id { "*" } else { " " };
-                            println!("{} {} ({}) - {:?}", active_marker, p.name, p.id, p.path);
-                        }
+        ProjectCommands::List => match registry.list_projects() {
+            Ok(projects) => {
+                if projects.is_empty() {
+                    println!("No projects found. Use `telos project init <name>` to create one.");
+                } else {
+                    let config =
+                        TelosConfig::load().unwrap_or_else(|_| panic!("Failed to load config"));
+                    let active_id = config.active_project_id.unwrap_or_default();
+                    println!("Registered Projects:");
+                    for p in projects {
+                        let active_marker = if p.id == active_id { "*" } else { " " };
+                        println!("{} {} ({}) - {:?}", active_marker, p.name, p.id, p.path);
                     }
                 }
-                Err(e) => eprintln!("Failed to list projects: {}", e),
             }
-        }
-        ProjectCommands::Switch { id_or_name } => {
-            match registry.set_active_project(id_or_name) {
-                Ok(project) => println!("Switched active project to: {}", project.name),
-                Err(e) => eprintln!("Failed to switch project: {}", e),
-            }
-        }
+            Err(e) => eprintln!("Failed to list projects: {}", e),
+        },
+        ProjectCommands::Switch { id_or_name } => match registry.set_active_project(id_or_name) {
+            Ok(project) => println!("Switched active project to: {}", project.name),
+            Err(e) => eprintln!("Failed to switch project: {}", e),
+        },
     }
     Ok(())
 }
