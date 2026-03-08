@@ -14,6 +14,7 @@ pub struct NodeResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum NodeStatus {
     Pending,
     Running,
