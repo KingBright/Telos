@@ -13,6 +13,7 @@ pub enum AgentEvent {
         session_id: String,
         payload: String,
         trace_id: Uuid,
+        project_id: Option<String>,
     },
     AutoTrigger {
         source: String,

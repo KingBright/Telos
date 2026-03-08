@@ -11,6 +11,7 @@ use telos_core::config::TelosConfig;
 use telos_hci::AgentFeedback;
 use telos_bot::providers::telegram::TelegramBotProvider;
 use telos_bot::traits::ChatBotProvider;
+use telos_project::manager::ProjectRegistry;
 
 #[derive(Parser)]
 #[command(name = "telos")]
@@ -39,7 +40,28 @@ enum Commands {
         #[arg(long)]
         telegram: bool,
     },
+    /// Manage projects
+    Project {
+        #[command(subcommand)]
+        action: ProjectCommands,
+    },
 }
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    /// Initialize a new project in the current or specified directory
+    Init {
+        name: String,
+        path: Option<String>,
+    },
+    /// List all registered projects
+    List,
+    /// Switch active project context
+    Switch {
+        id_or_name: String,
+    },
+}
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -74,6 +96,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 println!("Please specify a bot platform, e.g., `telos bot --telegram`");
             }
+        }
+        Commands::Project { action } => {
+            if check_and_init_config(false) {
+                start_daemon();
+            }
+            handle_project(action).await?;
         }
     }
 
@@ -180,6 +208,7 @@ fn check_and_init_config(force: bool) -> bool {
         tools_dir: default_tools_dir(),
         telegram_bot_token,
         bot_send_state_changes,
+        active_project_id: None,
     };
 
     match config.save() {
@@ -236,11 +265,19 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     };
     let (_, mut read) = ws_stream.split();
 
+    let config = TelosConfig::load().unwrap_or_else(|_| panic!("Config should exist"));
+    let project_id = config.active_project_id;
+
     // Now send the HTTP POST request to trigger the execution
     let client = Client::new();
+    let payload = json!({
+        "payload": task,
+        "project_id": project_id
+    });
+
     let res = client
         .post("http://127.0.0.1:3000/api/v1/run")
-        .json(&json!({ "payload": task }))
+        .json(&payload)
         .send()
         .await?;
 
@@ -303,4 +340,46 @@ fn default_tools_dir() -> String {
     let mut path = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     path.push(".telos/tools");
     path.to_string_lossy().into_owned()
+}
+
+async fn handle_project(action: &ProjectCommands) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = ProjectRegistry::new();
+
+    match action {
+        ProjectCommands::Init { name, path } => {
+            match registry.create_project(name.clone(), path.clone(), None) {
+                Ok(project) => {
+                    println!("Project '{}' created successfully at: {:?}", project.name, project.path);
+                    registry.set_active_project(&project.id)?;
+                    println!("Switched active project to: {}", project.name);
+                }
+                Err(e) => eprintln!("Failed to create project: {}", e),
+            }
+        }
+        ProjectCommands::List => {
+            match registry.list_projects() {
+                Ok(projects) => {
+                    if projects.is_empty() {
+                        println!("No projects found. Use `telos project init <name>` to create one.");
+                    } else {
+                        let config = TelosConfig::load().unwrap_or_else(|_| panic!("Failed to load config"));
+                        let active_id = config.active_project_id.unwrap_or_default();
+                        println!("Registered Projects:");
+                        for p in projects {
+                            let active_marker = if p.id == active_id { "*" } else { " " };
+                            println!("{} {} ({}) - {:?}", active_marker, p.name, p.id, p.path);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Failed to list projects: {}", e),
+            }
+        }
+        ProjectCommands::Switch { id_or_name } => {
+            match registry.set_active_project(id_or_name) {
+                Ok(project) => println!("Switched active project to: {}", project.name),
+                Err(e) => eprintln!("Failed to switch project: {}", e),
+            }
+        }
+    }
+    Ok(())
 }

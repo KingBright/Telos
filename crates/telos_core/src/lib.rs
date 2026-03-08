@@ -1,3 +1,4 @@
+pub mod project;
 pub mod config;
 // --- Core Primitives shared across Telos modules ---
 

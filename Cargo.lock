@@ -4588,6 +4588,7 @@ dependencies = [
  "telos_bot",
  "telos_core",
  "telos_hci",
+ "telos_project",
  "tokio",
  "tokio-tungstenite",
  "uuid",
@@ -4614,6 +4615,7 @@ dependencies = [
  "dirs 5.0.1",
  "serde",
  "toml 0.8.23",
+ "uuid",
 ]
 
 [[package]]
@@ -4633,6 +4635,7 @@ dependencies = [
  "telos_hci",
  "telos_memory",
  "telos_model_gateway",
+ "telos_project",
  "telos_security",
  "telos_telemetry",
  "telos_tooling",
@@ -4702,6 +4705,19 @@ dependencies = [
  "async-trait",
  "rand 0.8.5",
  "tokio",
+]
+
+[[package]]
+name = "telos_project"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "serde",
+ "serde_json",
+ "telos_core",
+ "tokio",
+ "toml 0.8.23",
+ "uuid",
 ]
 
 [[package]]

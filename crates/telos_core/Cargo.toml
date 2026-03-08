@@ -7,3 +7,4 @@ edition = "2021"
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 dirs = { workspace = true }
+uuid = { workspace = true }

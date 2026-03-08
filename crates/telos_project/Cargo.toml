@@ -1,0 +1,13 @@
+[package]
+name = "telos_project"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+telos_core = { path = "../telos_core" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+dirs = { workspace = true }
+toml = { workspace = true }

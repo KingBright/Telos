@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+telos_project = { path = "../telos_project" }
 tokio = { workspace = true, features = ["full"] }
 axum = { version = "0.7", features = ["ws", "macros"] }
 serde = { workspace = true, features = ["derive"] }

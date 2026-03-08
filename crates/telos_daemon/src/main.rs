@@ -253,6 +253,7 @@ struct AppState {
 #[derive(Deserialize)]
 struct RunRequest {
     payload: String,
+    project_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -361,8 +362,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[Daemon] Event loop started.");
         while let Some(event) = event_rx.recv().await {
             match event {
-                AgentEvent::UserInput { session_id, payload, trace_id } => {
+                AgentEvent::UserInput { session_id, payload, trace_id, project_id } => {
                     println!("[Daemon] Received UserInput: {} (trace: {})", payload, trace_id);
+
+                    let mut enriched_payload = payload.clone();
+
+                    if let Some(pid) = &project_id {
+                        println!("[Daemon] Active Project ID: {}", pid);
+                        if let Ok(Some(project)) = telos_project::manager::ProjectRegistry::new().get_project(pid) {
+                            let working_dir = project.path.clone();
+                            println!("[Daemon] Project working directory: {:?}", working_dir);
+
+                            // Load custom project instructions
+                            let project_config = telos_core::project::ProjectConfig::load(&working_dir);
+
+                            // Dynamically inject project context into the payload for the agent
+                            enriched_payload = format!(
+                                "Context:
+- Active Project: {}
+- Description: {}
+- Working Directory: {:?}
+- Custom Instructions: {}
+
+Task:
+{}",
+                                project.name,
+                                project.description.unwrap_or_else(|| "None".to_string()),
+                                working_dir,
+                                project_config.custom_instructions.unwrap_or_else(|| "None".to_string()),
+                                payload
+                            );
+
+                            println!("[Daemon] Dynamically injected project context into payload.");
+                            // We purposefully DO NOT change the global process directory in an async loop.
+                            // Tools should rely on the Working Directory parameter passed in the context.
+                        }
+                    }
 
                     broker_bg.publish_feedback(AgentFeedback::StateChanged {
                         task_id: trace_id.to_string(),
@@ -612,6 +647,7 @@ async fn handle_run(State(state): State<AppState>, Json(req): Json<RunRequest>) 
         session_id: "default".into(),
         payload: req.payload,
         trace_id,
+        project_id: req.project_id,
     }).await;
 
     Json(RunResponse {
