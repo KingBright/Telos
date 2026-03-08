@@ -12,3 +12,5 @@
 - Completed Telegram bot implementation using `teloxide`.
 - Integrated `telos_bot` module into `telos_cli` as a subcommand to launch adapters.
 - Verified test suite and clippy linting passes perfectly.
+
+- [x] Refactor Telegram bot to parse JSON WebSocket feedbacks and handle interactive Approval buttons.

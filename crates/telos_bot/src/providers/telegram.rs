@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use teloxide::{prelude::*, utils::command::BotCommands};
+use teloxide::types::{InlineKeyboardMarkup, InlineKeyboardButton};
+use telos_hci::AgentFeedback;
 use reqwest::Client;
 use serde_json::json;
 use tokio_tungstenite::connect_async;
@@ -61,7 +63,6 @@ impl TelegramBotProvider {
         active_tasks: Arc<Mutex<HashMap<String, String>>>,
     ) -> ResponseResult<()> {
         if let Some(text) = msg.text() {
-            bot.send_message(msg.chat.id, "Dispatching task to Telos Daemon...").await?;
 
             let client = Client::new();
             let res = client
@@ -101,36 +102,56 @@ impl TelegramBotProvider {
 
                     while let Some(message) = read.next().await {
                         if let Ok(WsMessage::Text(text)) = message {
-                            let mut target_chat_id = None;
-                            let mut trace_id_to_remove = None;
-                            {
-                                let active_map = active_tasks.lock().await;
-                                for (trace_id, chat_id) in active_map.iter() {
-                                    if text.contains(trace_id) {
+                            if let Ok(feedback) = serde_json::from_str::<AgentFeedback>(&text) {
+                                let mut target_chat_id = None;
+                                let mut trace_id_to_remove = None;
+                                {
+                                    let active_map = active_tasks.lock().await;
+                                    let task_id = match &feedback {
+                                        AgentFeedback::StateChanged { task_id, .. } => task_id,
+                                        AgentFeedback::RequireHumanIntervention { task_id, .. } => task_id,
+                                        AgentFeedback::Output { task_id, .. } => task_id,
+                                    };
+
+                                    if let Some(chat_id) = active_map.get(task_id) {
                                         target_chat_id = Some(chat_id.clone());
-                                        trace_id_to_remove = Some(trace_id.clone());
-                                        break;
+                                        if let AgentFeedback::Output { is_final: true, .. } = &feedback {
+                                            trace_id_to_remove = Some(task_id.clone());
+                                        }
                                     }
                                 }
-                            }
 
-                            if let Some(chat_id_str) = target_chat_id {
-                                if let Ok(chat_id_num) = chat_id_str.parse::<i64>() {
-                                    let chat_id = ChatId(chat_id_num);
+                                if let Some(chat_id_str) = target_chat_id {
+                                    if let Ok(chat_id_num) = chat_id_str.parse::<i64>() {
+                                        let chat_id = ChatId(chat_id_num);
 
-                                    if text.contains("RequireHumanIntervention") {
-                                        let _ = bot.send_message(chat_id, format!("🚨 [HUMAN INTERVENTION REQUIRED] 🚨\n{}", text)).await;
-                                        let _ = bot.send_message(chat_id, "Please use CLI to approve for now.").await;
-                                    } else if text.contains("Output") {
-                                        let _ = bot.send_message(chat_id, format!(">> {}", text)).await;
-                                        if text.contains("is_final: true") {
-                                            let _ = bot.send_message(chat_id, "Task completed.").await;
-                                            if let Some(tid) = trace_id_to_remove {
-                                                active_tasks.lock().await.remove(&tid);
+                                        match feedback {
+                                            AgentFeedback::RequireHumanIntervention { prompt, task_id, .. } => {
+                                                let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                                                    InlineKeyboardButton::callback("✅ Approve", format!("approve_{}", task_id)),
+                                                    InlineKeyboardButton::callback("❌ Reject", format!("reject_{}", task_id)),
+                                                ]]);
+                                                let _ = bot.send_message(chat_id, format!("🚨 <b>Human Intervention Required</b>\n\n{}", prompt))
+                                                    .parse_mode(teloxide::types::ParseMode::Html)
+                                                    .reply_markup(keyboard).await;
+                                            }
+                                            AgentFeedback::Output { content, is_final, .. } => {
+                                                let _ = bot.send_message(chat_id, format!("\n{}", content)).await;
+                                                if is_final {
+                                                    let _ = bot.send_message(chat_id, "<i>Task completed.</i>")
+                                                        .parse_mode(teloxide::types::ParseMode::Html).await;
+                                                    if let Some(tid) = trace_id_to_remove {
+                                                        active_tasks.lock().await.remove(&tid);
+                                                    }
+                                                }
+                                            }
+                                            AgentFeedback::StateChanged { current_node, status, .. } => {
+                                                if send_state_changes {
+                                                    let _ = bot.send_message(chat_id, format!("<i>[STATE] {} -> {:?}</i>", current_node, status))
+                                                        .parse_mode(teloxide::types::ParseMode::Html).await;
+                                                }
                                             }
                                         }
-                                    } else if send_state_changes {
-                                        let _ = bot.send_message(chat_id, format!("[STATE] {}", text)).await;
                                     }
                                 }
                             }
@@ -143,6 +164,40 @@ impl TelegramBotProvider {
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
+    }
+
+    async fn handle_callback(
+        bot: Bot,
+        q: CallbackQuery,
+        daemon_url: String,
+    ) -> ResponseResult<()> {
+        if let Some(data) = &q.data {
+            let parts: Vec<&str> = data.split('_').collect();
+            if parts.len() == 2 {
+                let action = parts[0];
+                let task_id = parts[1];
+
+                let approved = action == "approve";
+
+                let client = Client::new();
+                let _res = client
+                    .post(format!("{}/api/v1/approve", daemon_url))
+                    .json(&json!({ "task_id": task_id, "approved": approved }))
+                    .send()
+                    .await;
+
+                let ack_text = if approved { "Approved execution." } else { "Rejected execution." };
+
+                bot.answer_callback_query(q.id.clone())
+                    .text(ack_text)
+                    .await?;
+
+                if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(regular_msg)) = q.message {
+                    bot.edit_message_text(regular_msg.chat.id, regular_msg.id, format!("{} {}", ack_text, task_id)).await?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -164,7 +219,17 @@ impl ChatBotProvider for TelegramBotProvider {
 
         // Use a standard Dispatcher for both commands and plain text
         let handler = dptree::entry()
-            .branch(
+                        .branch(
+                Update::filter_callback_query()
+                    .endpoint({
+                        let du = daemon_url.clone();
+                        move |b: Bot, q: CallbackQuery| {
+                            let du = du.clone();
+                            async move { Self::handle_callback(b, q, du).await }
+                        }
+                    })
+            )
+.branch(
                 Update::filter_message()
                     .filter_command::<Command>()
                     .endpoint({
