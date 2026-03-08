@@ -364,13 +364,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AgentEvent::UserInput { session_id, payload, trace_id, project_id } => {
                     println!("[Daemon] Received UserInput: {} (trace: {})", payload, trace_id);
 
-                    let mut working_dir = std::path::PathBuf::from(".");
+                    let mut enriched_payload = payload.clone();
+
                     if let Some(pid) = &project_id {
                         println!("[Daemon] Active Project ID: {}", pid);
                         if let Ok(Some(project)) = telos_project::manager::ProjectRegistry::new().get_project(pid) {
-                            working_dir = project.path.clone();
+                            let working_dir = project.path.clone();
                             println!("[Daemon] Project working directory: {:?}", working_dir);
-                            let _ = std::env::set_current_dir(&working_dir);
+
+                            // Load custom project instructions
+                            let project_config = telos_core::project::ProjectConfig::load(&working_dir);
+
+                            // Dynamically inject project context into the payload for the agent
+                            enriched_payload = format!(
+                                "Context:
+- Active Project: {}
+- Description: {}
+- Working Directory: {:?}
+- Custom Instructions: {}
+
+Task:
+{}",
+                                project.name,
+                                project.description.unwrap_or_else(|| "None".to_string()),
+                                working_dir,
+                                project_config.custom_instructions.unwrap_or_else(|| "None".to_string()),
+                                payload
+                            );
+
+                            println!("[Daemon] Dynamically injected project context into payload.");
+                            // We purposefully DO NOT change the global process directory in an async loop.
+                            // Tools should rely on the Working Directory parameter passed in the context.
                         }
                     }
 
@@ -434,7 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Fallback if LLM fails to return valid JSON
                             println!("Failed to parse DAG plan: {}. Using fallback single node.", e);
                             DagPlan {
-                                nodes: vec![DagNode { id: "main".to_string(), task_type: "LLM".to_string(), prompt: payload.clone() }],
+                                nodes: vec![DagNode { id: "main".to_string(), task_type: "LLM".to_string(), prompt: enriched_payload.clone() }],
                                 edges: vec![]
                             }
                         }

@@ -31,3 +31,16 @@ impl Project {
         }
     }
 }
+
+impl ProjectConfig {
+    pub fn load(project_path: &std::path::Path) -> Self {
+        let config_path = project_path.join(".telos_project.toml");
+        if !config_path.exists() {
+            return Self::default();
+        }
+        std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|contents| toml::from_str(&contents).ok())
+            .unwrap_or_else(Self::default)
+    }
+}
