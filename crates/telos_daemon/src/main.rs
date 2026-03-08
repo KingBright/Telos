@@ -252,6 +252,7 @@ struct AppState {
 #[derive(Deserialize)]
 struct RunRequest {
     payload: String,
+    project_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -360,8 +361,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[Daemon] Event loop started.");
         while let Some(event) = event_rx.recv().await {
             match event {
-                AgentEvent::UserInput { session_id, payload, trace_id } => {
+                AgentEvent::UserInput { session_id, payload, trace_id, project_id } => {
                     println!("[Daemon] Received UserInput: {} (trace: {})", payload, trace_id);
+
+                    let mut working_dir = std::path::PathBuf::from(".");
+                    if let Some(pid) = &project_id {
+                        println!("[Daemon] Active Project ID: {}", pid);
+                        if let Ok(Some(project)) = telos_project::manager::ProjectRegistry::new().get_project(pid) {
+                            working_dir = project.path.clone();
+                            println!("[Daemon] Project working directory: {:?}", working_dir);
+                            let _ = std::env::set_current_dir(&working_dir);
+                        }
+                    }
 
                     broker_bg.publish_feedback(AgentFeedback::StateChanged {
                         task_id: trace_id.to_string(),
@@ -596,6 +607,7 @@ async fn handle_run(State(state): State<AppState>, Json(req): Json<RunRequest>) 
         session_id: "default".into(),
         payload: req.payload,
         trace_id,
+        project_id: req.project_id,
     }).await;
 
     Json(RunResponse {

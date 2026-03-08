@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+telos_project = { path = "../telos_project" }
 dirs = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 clap = { version = "4.5.16", features = ["derive"] }

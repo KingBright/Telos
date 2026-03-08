@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 use crate::traits::{ChatBotProvider, BotCommand};
+use telos_core::config::TelosConfig;
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "These commands are supported:")]
@@ -18,6 +19,8 @@ enum Command {
     Help,
     #[command(description = "start interacting with Telos.")]
     Start,
+    #[command(description = "show the active project or instruct how to use CLI to switch.")]
+    Project,
 }
 
 pub struct TelegramBotProvider {
@@ -50,6 +53,12 @@ impl TelegramBotProvider {
             Command::Help | Command::Start => {
                 bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?;
             }
+            Command::Project => {
+                let config = TelosConfig::load();
+                let active = config.ok().and_then(|c| c.active_project_id).unwrap_or_else(|| "None".to_string());
+                bot.send_message(msg.chat.id, format!("Active Project ID: {}
+Use `telos project switch` via CLI to change projects.", active)).await?;
+            }
         }
         Ok(())
     }
@@ -64,9 +73,12 @@ impl TelegramBotProvider {
             bot.send_message(msg.chat.id, "Dispatching task to Telos Daemon...").await?;
 
             let client = Client::new();
+            let config = TelosConfig::load();
+            let project_id = config.ok().and_then(|c| c.active_project_id);
+
             let res = client
                 .post(format!("{}/api/v1/run", daemon_url))
-                .json(&json!({ "payload": text }))
+                .json(&json!({ "payload": text, "project_id": project_id }))
                 .send()
                 .await;
 

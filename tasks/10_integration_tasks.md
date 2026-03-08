@@ -65,3 +65,12 @@ This file tracks the integration points between different modules to ensure the 
 
 - [x] **Tooling (Module 5) -> Daemon Execution (Module 11)**:
   - WasmToolNode in Daemon retrieves dynamic tools via `VectorToolRegistry`. Added `FsRead`, `FsWrite`, `ShellExec`, and `ToolRegister` to enable code execution and tool creation cycles.
+
+## 13 Project Management (telos_project) Integration
+
+- [x] **CLI (Module 11) -> Project Management (Module 13)**:
+  - Added CLI subcommands `telos project init/list/switch` to manage contexts.
+- [x] **Daemon (Module 11) -> Project Management (Module 13)**:
+  - Event payloads (`RunRequest`, `AgentEvent::UserInput`) updated to handle optional project IDs allowing nodes to contextualize file execution.
+- [x] **Bot (Module 12) -> Project Management (Module 13)**:
+  - Bots now automatically inject the active project config ID into execution calls.

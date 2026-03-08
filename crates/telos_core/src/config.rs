@@ -17,6 +17,8 @@ pub struct TelosConfig {
     pub telegram_bot_token: Option<String>,
     #[serde(default)]
     pub bot_send_state_changes: bool,
+
+    pub active_project_id: Option<String>,
 }
 
 
