@@ -60,3 +60,8 @@ This file tracks the integration points between different modules to ensure the 
 
 - [x] **Chatbot Adapter (Module 12) -> Daemon Server (Module 11)**:
   - Chatbot acts similarly to the CLI client, making HTTP requests to `telos_daemon` for executing tasks and subscribing to WebSocket streams to receive `AgentFeedback`.
+
+## Native Tools & Self-Evolution (telos_tooling / telos_daemon)
+
+- [x] **Tooling (Module 5) -> Daemon Execution (Module 11)**:
+  - WasmToolNode in Daemon retrieves dynamic tools via `VectorToolRegistry`. Added `FsRead`, `FsWrite`, `ShellExec`, and `ToolRegister` to enable code execution and tool creation cycles.

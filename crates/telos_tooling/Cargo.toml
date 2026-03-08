@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
 telos_core = { path = "../telos_core" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 async-trait.workspace = true

@@ -10,10 +10,20 @@ pub struct TelosConfig {
     pub openai_embedding_model: String,
     pub db_path: String,
 
+    #[serde(default = "default_tools_dir")]
+    pub tools_dir: String,
+
     // Optional chatbot integrations
     pub telegram_bot_token: Option<String>,
     #[serde(default)]
     pub bot_send_state_changes: bool,
+}
+
+
+fn default_tools_dir() -> String {
+    let mut path = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push(".telos/tools");
+    path.to_string_lossy().into_owned()
 }
 
 impl TelosConfig {
