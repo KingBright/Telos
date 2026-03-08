@@ -74,6 +74,7 @@ struct DagNode {
 
 #[derive(serde::Deserialize, Debug)]
 struct DagPlan {
+    reply: Option<String>,
     nodes: Vec<DagNode>,
     edges: Vec<DagEdge>,
 }
@@ -202,7 +203,7 @@ impl ExecutableNode for WasmToolNode {
                                             let dest_wasm = target_dir.join(format!("{}.wasm", safe_name));
                                             let dest_json = target_dir.join(format!("{}.json", safe_name));
 
-                                            if let Err(e) = std::fs::copy(&wasm_path, &dest_wasm) {
+                                            if let Err(e) = std::fs::copy(wasm_path, &dest_wasm) {
                                                 println!("[Daemon] Warning: Failed to persist Wasm binary: {}", e);
                                             }
                                             if let Ok(schema_str) = serde_json::to_string_pretty(&schema) {
@@ -417,9 +418,11 @@ Task:
                     // --- DYNAMIC DAG GENERATION VIA LLM ---
                     let prompt = format!(
                         "You are an expert planner. Break down the following task into a directed acyclic graph (DAG) of sub-tasks.\n\
+                        First, generate a friendly, conversational response in the `reply` field acknowledging the user's intent.\n\
                         Task: {}\n\n\
                         Respond strictly with a JSON object matching this schema:\n\
                         {{\n\
+                            \"reply\": \"string\",\n\
                             \"nodes\": [ {{ \"id\": \"string\", \"task_type\": \"LLM\" or \"TOOL\", \"prompt\": \"Detailed execution instruction for this node\" }} ],\n\
                             \"edges\": [ {{ \"from\": \"node_id_1\", \"to\": \"node_id_2\" }} ]\n\
                         }}\n\
@@ -458,6 +461,7 @@ Task:
                             // Fallback if LLM fails to return valid JSON
                             println!("Failed to parse DAG plan: {}. Using fallback single node.", e);
                             DagPlan {
+                                reply: Some("I will handle that.".to_string()),
                                 nodes: vec![DagNode { id: "main".to_string(), task_type: "LLM".to_string(), prompt: enriched_payload.clone() }],
                                 edges: vec![]
                             }
@@ -466,6 +470,18 @@ Task:
 
                     let mut graph = TaskGraph::new(trace_id.to_string());
                     let mut terminal_nodes = vec![];
+
+                    if let Some(reply) = &dag_plan.reply {
+                        broker_bg.publish_feedback(AgentFeedback::Output {
+                            task_id: trace_id.to_string(),
+                            session_id: session_id.clone(),
+                            content: reply.clone(),
+                            is_final: false,
+                        });
+                    }
+
+
+
 
                     for node in &dag_plan.nodes {
                         terminal_nodes.push(node.id.clone());
@@ -662,7 +678,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut rx = state.broker.subscribe_feedback();
 
     while let Ok(feedback) = rx.recv().await {
-        let msg_str = format!("{:?}", feedback);
+        let msg_str = serde_json::to_string(&feedback).unwrap_or_else(|_| "{}".to_string());
         if socket.send(Message::Text(msg_str)).await.is_err() {
             break;
         }

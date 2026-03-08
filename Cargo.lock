@@ -4567,6 +4567,7 @@ dependencies = [
  "serde",
  "serde_json",
  "telos_core",
+ "telos_hci",
  "teloxide",
  "tokio",
  "tokio-tungstenite",
@@ -4678,6 +4679,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "lru",
+ "serde",
  "telos_core",
  "tokio",
  "uuid",

@@ -53,6 +53,8 @@ impl AgentEvent {
 
 /// 系统给UI/外部的反馈数据结构
 #[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
 pub enum AgentFeedback {
     StateChanged {
         task_id: String,
