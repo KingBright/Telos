@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use telos_bot::providers::telegram::TelegramBotProvider;
 use telos_bot::traits::ChatBotProvider;
 use telos_core::config::TelosConfig;
-use telos_hci::AgentFeedback;
+use telos_hci::{AgentFeedback, LogLevel, global_log_level};
 use telos_project::manager::ProjectRegistry;
 
 #[derive(Parser)]
@@ -45,6 +45,11 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectCommands,
     },
+    /// Get or set the log level (quiet, normal, verbose, debug)
+    LogLevel {
+        /// The log level to set (optional, if not provided shows current level)
+        level: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -55,6 +60,167 @@ enum ProjectCommands {
     List,
     /// Switch active project context
     Switch { id_or_name: String },
+}
+
+/// CLI Feedback Formatter
+struct CliFeedbackFormatter {
+    level: LogLevel,
+}
+
+impl CliFeedbackFormatter {
+    fn new(level: LogLevel) -> Self {
+        Self { level }
+    }
+
+    /// Format and print feedback based on current log level
+    fn format(&self, feedback: &AgentFeedback) -> Option<String> {
+        if !feedback.should_show(self.level) {
+            return None;
+        }
+
+        match feedback {
+            AgentFeedback::PlanCreated { plan, .. } => {
+                let mut output = format!("\n📋 Plan Created: {} steps\n", plan.total_steps);
+                if let Some(ref reply) = plan.reply {
+                    output.push_str(&format!("  {}\n", reply));
+                }
+                if self.level.should_show(LogLevel::Verbose) {
+                    output.push_str("  Nodes:\n");
+                    for node in &plan.nodes {
+                        let deps = if node.dependencies.is_empty() {
+                            "none".to_string()
+                        } else {
+                            node.dependencies.join(", ")
+                        };
+                        output.push_str(&format!(
+                            "    • {} ({}) - deps: {}\n",
+                            node.id, node.task_type, deps
+                        ));
+                    }
+                }
+                Some(output)
+            }
+
+            AgentFeedback::NodeStarted { node_id, detail, .. } => {
+                let mut output = format!("\n▶ Starting [{}] ({})\n", node_id, detail.task_type);
+                if self.level.should_show(LogLevel::Verbose) {
+                    output.push_str(&format!("  Task: {}\n", detail.input_preview));
+                }
+                Some(output)
+            }
+
+            AgentFeedback::NodeCompleted {
+                node_id,
+                result_preview,
+                execution_time_ms,
+                ..
+            } => {
+                let mut output = format!(
+                    "✓ [{}] Completed ({}ms)\n",
+                    node_id, execution_time_ms
+                );
+                if self.level.should_show(LogLevel::Verbose) {
+                    output.push_str(&format!("  Result: {}\n", result_preview));
+                }
+                Some(output)
+            }
+
+            AgentFeedback::NodeFailed { node_id, error, .. } => {
+                let mut output = format!("✗ [{}] FAILED\n", node_id);
+                output.push_str(&format!("  Type: {}\n", error.error_type));
+                output.push_str(&format!("  Message: {}\n", error.message));
+                if self.level.should_show(LogLevel::Debug) {
+                    if let Some(ref stack) = error.stack_trace {
+                        output.push_str(&format!("  Stack: {}\n", stack));
+                    }
+                }
+                Some(output)
+            }
+
+            AgentFeedback::ProgressUpdate { progress, .. } => {
+                let status_icons = format!(
+                    "✓ {} ✗ {} ⏳ {}",
+                    progress.completed, progress.failed, progress.running
+                );
+                Some(format!(
+                    "\n📊 Progress: {}/{} ({}%) | {}\n",
+                    progress.completed, progress.total, progress.percentage, status_icons
+                ))
+            }
+
+            AgentFeedback::TaskCompleted { summary, .. } => {
+                let icon = if summary.success { "✅" } else { "⚠️" };
+                let status = if summary.success { "Success" } else { "Finished with errors" };
+                let time_str = format_duration(summary.total_time_ms);
+
+                let mut output = format!(
+                    "\n{} Task {} | {} nodes (✓ {} ✗ {}) | {}\n",
+                    icon,
+                    status,
+                    summary.total_nodes,
+                    summary.completed_nodes,
+                    summary.failed_nodes,
+                    time_str
+                );
+
+                if !summary.success && !summary.failed_node_ids.is_empty() {
+                    output.push_str(&format!(
+                        "  Failed nodes: {}\n",
+                        summary.failed_node_ids.join(", ")
+                    ));
+                }
+
+                if self.level.should_show(LogLevel::Normal) {
+                    output.push_str(&format!("  {}\n", summary.summary));
+                }
+
+                Some(output)
+            }
+
+            AgentFeedback::StateChanged {
+                current_node,
+                status,
+                ..
+            } => {
+                // Only show state changes in Debug mode
+                if self.level.should_show(LogLevel::Debug) {
+                    Some(format!("[DEBUG] {} -> {:?}\n", current_node, status))
+                } else {
+                    None
+                }
+            }
+
+            AgentFeedback::RequireHumanIntervention { prompt, .. } => {
+                Some(format!("\n🚨 [HUMAN INTERVENTION REQUIRED] 🚨\n{}\n", prompt))
+            }
+
+            AgentFeedback::Output { content, is_final, .. } => {
+                let prefix = if *is_final { "✓" } else { ">>" };
+                Some(format!("{} {}\n", prefix, content))
+            }
+
+            AgentFeedback::LogLevelChanged {
+                old_level,
+                new_level,
+            } => Some(format!(
+                "Log level changed: {:?} → {:?}\n",
+                old_level, new_level
+            )),
+        }
+    }
+}
+
+fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let secs = ms / 1000;
+        let mins = secs / 60;
+        let remaining_secs = secs % 60;
+        format!("{}m {}s", mins, remaining_secs)
+    }
 }
 
 #[tokio::main]
@@ -96,6 +262,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 start_daemon();
             }
             handle_project(action).await?;
+        }
+        Commands::LogLevel { level } => {
+            handle_log_level(level).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_log_level(level: &Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new();
+
+    match level {
+        Some(level_str) => {
+            // Set log level
+            let res = client
+                .post("http://127.0.0.1:3000/api/v1/log-level")
+                .json(&json!({ "level": level_str }))
+                .send()
+                .await?;
+
+            if res.status().is_success() {
+                let body: serde_json::Value = res.json().await?;
+                println!(
+                    "Log level changed: {} → {}",
+                    body["old_level"].as_str().unwrap_or("?"),
+                    body["new_level"].as_str().unwrap_or("?")
+                );
+            } else {
+                println!("Failed to set log level. Is the daemon running?");
+            }
+        }
+        None => {
+            // Get current log level
+            let res = client
+                .get("http://127.0.0.1:3000/api/v1/log-level")
+                .send()
+                .await?;
+
+            if res.status().is_success() {
+                let body: serde_json::Value = res.json().await?;
+                println!(
+                    "Current log level: {}",
+                    body["level"].as_str().unwrap_or("unknown")
+                );
+                println!("Available levels: quiet, normal, verbose, debug");
+            } else {
+                println!("Failed to get log level. Is the daemon running?");
+            }
         }
     }
 
@@ -266,6 +481,27 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     let ws_url = "ws://127.0.0.1:3000/api/v1/stream";
     println!("Connecting to Feedback Stream at {} ...", ws_url);
 
+    // Get current log level from daemon
+    let client = Client::new();
+    let current_level = match client
+        .get("http://127.0.0.1:3000/api/v1/log-level")
+        .send()
+        .await
+    {
+        Ok(res) if res.status().is_success() => {
+            if let Ok(body) = res.json::<serde_json::Value>().await {
+                LogLevel::from_str(body["level"].as_str().unwrap_or("normal"))
+            } else {
+                LogLevel::Normal
+            }
+        }
+        _ => LogLevel::Normal,
+    };
+
+    // Update local global log level
+    global_log_level().set(current_level);
+    let formatter = CliFeedbackFormatter::new(current_level);
+
     // Connect to WebSocket FIRST to prevent race condition
     let (ws_stream, _) = match connect_async(ws_url).await {
         Ok(ws) => ws,
@@ -283,7 +519,6 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     let project_id = config.active_project_id;
 
     // Now send the HTTP POST request to trigger the execution
-    let client = Client::new();
     let payload = json!({
         "payload": task,
         "project_id": project_id
@@ -309,47 +544,46 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
         let msg = message?;
         if let Message::Text(text) = msg {
             if let Ok(feedback) = serde_json::from_str::<AgentFeedback>(&text) {
-                match feedback {
-                    AgentFeedback::RequireHumanIntervention {
-                        prompt, task_id, ..
-                    } => {
-                        println!("\n🚨 [HUMAN INTERVENTION REQUIRED] 🚨");
-                        println!("{}", prompt);
+                // Check for log level changes
+                if let AgentFeedback::LogLevelChanged { new_level, .. } = &feedback {
+                    global_log_level().set(*new_level);
+                    println!("Log level changed: {:?}", new_level);
+                    continue;
+                }
 
-                        print!("Approve this action? [y/N]: ");
-                        io::stdout().flush().unwrap();
-                        let mut input = String::new();
-                        io::stdin().read_line(&mut input)?;
-                        let approved = input.trim().eq_ignore_ascii_case("y");
+                // Format and print feedback
+                if let Some(formatted) = formatter.format(&feedback) {
+                    print!("{}", formatted);
+                    io::stdout().flush().unwrap();
+                }
 
-                        let res = client
-                            .post("http://127.0.0.1:3000/api/v1/approve")
-                            .json(&json!({ "task_id": task_id, "approved": approved }))
-                            .send()
-                            .await?;
+                // Handle human intervention
+                if let AgentFeedback::RequireHumanIntervention {
+                    task_id, ..
+                } = &feedback
+                {
+                    print!("Approve this action? [y/N]: ");
+                    io::stdout().flush().unwrap();
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    let approved = input.trim().eq_ignore_ascii_case("y");
 
-                        if res.status().is_success() {
-                            println!("-> User Decision sent: Approved={}", approved);
-                        } else {
-                            println!("-> Failed to send decision.");
-                        }
+                    let res = client
+                        .post("http://127.0.0.1:3000/api/v1/approve")
+                        .json(&json!({ "task_id": task_id, "approved": approved }))
+                        .send()
+                        .await?;
+
+                    if res.status().is_success() {
+                        println!("-> User Decision sent: Approved={}", approved);
+                    } else {
+                        println!("-> Failed to send decision.");
                     }
-                    AgentFeedback::Output {
-                        content, is_final, ..
-                    } => {
-                        println!(">> {}", content);
-                        if is_final {
-                            println!("Task completed.");
-                            break;
-                        }
-                    }
-                    AgentFeedback::StateChanged {
-                        current_node,
-                        status,
-                        ..
-                    } => {
-                        println!("[STATE] {} -> {:?}", current_node, status);
-                    }
+                }
+
+                // Check for task completion
+                if feedback.is_final() {
+                    break;
                 }
             }
         }

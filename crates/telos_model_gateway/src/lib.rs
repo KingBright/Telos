@@ -34,6 +34,7 @@ pub struct LlmResponse {
 pub enum GatewayError {
     TooManyRequests, // 429
     ServiceUnavailable, // 503
+    NetworkError(String), // Connection failures, timeouts, DNS errors
     Other(String),
 }
 

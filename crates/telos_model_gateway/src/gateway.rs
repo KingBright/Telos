@@ -57,11 +57,15 @@ impl ModelGateway for GatewayManager {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     match e {
-                        GatewayError::TooManyRequests | GatewayError::ServiceUnavailable => {
+                        GatewayError::TooManyRequests
+                        | GatewayError::ServiceUnavailable
+                        | GatewayError::NetworkError(_) => {
                             if retries >= self.backoff.get_max_retries() {
                                 return Err(e);
                             }
                             retries += 1;
+                            eprintln!("[Gateway] Request failed (attempt {}/{}), retrying: {:?}",
+                                retries, self.backoff.get_max_retries(), e);
                             self.backoff.wait(retries).await;
                         }
                         _ => return Err(e),

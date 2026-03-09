@@ -10,6 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
@@ -19,9 +20,12 @@ use telos_context::providers::OpenAiProvider;
 use telos_context::{RaptorContextManager, ScopedContext};
 use telos_core::config::TelosConfig;
 use telos_core::{NodeError, NodeResult, SystemRegistry};
-use telos_dag::ExecutionEngine;
+use telos_dag::{ExecutionEngine, NodeMetadata};
 use telos_dag::{ExecutableNode, GraphState, TaskGraph};
-use telos_hci::{AgentEvent, AgentFeedback, EventBroker, TokioEventBroker};
+use telos_hci::{
+    global_log_level, AgentEvent, AgentFeedback, EventBroker, LogLevel, PlanInfo, PlanNodeInfo,
+    TaskSummary, TokioEventBroker,
+};
 use telos_memory::engine::RedbGraphStore;
 use telos_model_gateway::gateway::{GatewayManager, ModelProvider};
 use telos_model_gateway::{Capability, GatewayError, LlmRequest, LlmResponse, ModelGateway};
@@ -46,7 +50,26 @@ impl ModelProvider for GatewayAdapter {
                 content,
                 tokens_used: req.budget_limit,
             }),
-            Err(e) => Err(GatewayError::Other(e.0)),
+            Err(e) => {
+                let error_msg = e.0.to_lowercase();
+                // Detect network-related errors for retry
+                if error_msg.contains("error sending request")
+                    || error_msg.contains("connection")
+                    || error_msg.contains("timeout")
+                    || error_msg.contains("dns")
+                    || error_msg.contains("network")
+                    || error_msg.contains("socket")
+                    || error_msg.contains("http error")
+                {
+                    Err(GatewayError::NetworkError(e.0))
+                } else if error_msg.contains("429") || error_msg.contains("rate limit") {
+                    Err(GatewayError::TooManyRequests)
+                } else if error_msg.contains("503") || error_msg.contains("service unavailable") {
+                    Err(GatewayError::ServiceUnavailable)
+                } else {
+                    Err(GatewayError::Other(e.0))
+                }
+            }
         }
     }
 }
@@ -84,6 +107,16 @@ struct DagPlan {
     nodes: Vec<DagNode>,
     edges: Vec<DagEdge>,
 }
+
+/// Helper to truncate strings for preview
+fn truncate_for_preview(s: &str, max_len: usize) -> String {
+    if s.len() > max_len {
+        format!("{}...", &s[..max_len])
+    } else {
+        s.to_string()
+    }
+}
+
 struct LlmPromptNode {
     prompt: String,
     gateway: Arc<GatewayManager>,
@@ -350,6 +383,23 @@ struct ApproveResponse {
     status: String,
 }
 
+#[derive(Deserialize)]
+struct SetLogLevelRequest {
+    level: String,
+}
+
+#[derive(Serialize)]
+struct GetLogLevelResponse {
+    level: String,
+}
+
+#[derive(Serialize)]
+struct SetLogLevelResponse {
+    status: String,
+    old_level: String,
+    new_level: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initializing Telos Daemon...");
@@ -386,6 +436,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tool_registry.register_tool(
         telos_tooling::native::ShellExecTool::schema(),
         Some(std::sync::Arc::new(telos_tooling::native::ShellExecTool)),
+    );
+    tool_registry.register_tool(
+        telos_tooling::native::CalculatorTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::CalculatorTool)),
     );
     tool_registry.register_tool(
         telos_tooling::native::ToolRegisterTool::schema(),
@@ -465,6 +519,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[Daemon] Event loop started.");
         while let Some(event) = event_rx.recv().await {
             match event {
+                AgentEvent::SetLogLevel { level } => {
+                    let old_level = global_log_level().get();
+                    global_log_level().set(level);
+                    broker_bg.publish_feedback(AgentFeedback::LogLevelChanged {
+                        old_level,
+                        new_level: level,
+                    });
+                    println!(
+                        "[Daemon] Log level changed: {:?} -> {:?}",
+                        old_level, level
+                    );
+                }
                 AgentEvent::UserInput {
                     session_id,
                     payload,
@@ -480,6 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new();
 
                     tokio::spawn(async move {
+                        let task_start_time = Instant::now();
                         println!(
                             "[Daemon] Received UserInput: {} (trace: {})",
                             payload, trace_id
@@ -536,7 +603,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // --- DYNAMIC DAG GENERATION VIA LLM ---
                         let prompt = format!(
-                            "You are an expert planner. Break down the following task into a directed acyclic graph (DAG) of sub-tasks.\nFirst, generate a friendly, conversational response in the `reply` field acknowledging the user's intent.\nTask: {}\n\nRespond strictly with a JSON object matching this schema:\n{{\n    \"reply\": \"string\",\n    \"nodes\": [ {{ \"id\": \"string\", \"task_type\": \"LLM\" or \"TOOL\", \"prompt\": \"Detailed execution instruction for this node\" }} ],\n    \"edges\": [ {{ \"from\": \"node_id_1\", \"to\": \"node_id_2\" }} ]\n}}\nDo not include markdown blocks, only raw JSON.",
+                            r#"You are an expert planner. Break down the following task into a directed acyclic graph (DAG) of sub-tasks.
+
+## Available Tools (use task_type: "TOOL" for these):
+- fs_read: Read file contents (requires path parameter)
+- fs_write: Write content to file (requires path and content parameters)
+- shell_exec: Execute shell commands (requires command parameter)
+- calculator: Perform mathematical calculations (requires expression parameter)
+
+## Task Type Rules:
+1. Use "LLM" for:
+   - Answering questions, explanations, analysis, writing text
+   - Creative tasks (writing, brainstorming)
+   - Code analysis and explanation
+   - Simple arithmetic (2+2, basic math)
+   - Reasoning and logic tasks
+
+2. Use "TOOL" ONLY when:
+   - Need to read/write files → fs_read or fs_write
+   - Need to run shell commands → shell_exec
+   - Need to evaluate complex math expressions → calculator
+   - **DO NOT use TOOL for simple questions or calculations**
+
+3. Task Type Decision Examples:
+   - "calculate 2+2" → LLM (simple math)
+   - "calculate sqrt(pi * e^2)" → TOOL calculator (complex)
+   - "what is the capital of France" → LLM (knowledge)
+   - "read file /tmp/test.txt" → TOOL fs_read
+   - "analyze this code" → LLM (analysis)
+
+## Instructions:
+First, generate a friendly, conversational response in the `reply` field acknowledging the user's intent.
+Then create nodes for the task breakdown.
+
+Task: {}
+
+Respond strictly with a JSON object matching this schema:
+{{
+    "reply": "string",
+    "nodes": [ {{ "id": "string", "task_type": "LLM" or "TOOL", "prompt": "Detailed execution instruction for this node" }} ],
+    "edges": [ {{ "from": "node_id_1", "to": "node_id_2" }} ]
+}}
+Do not include markdown blocks, only raw JSON."#,
                             payload
                         );
 
@@ -597,6 +705,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut graph = TaskGraph::new(trace_id.to_string());
                         let mut terminal_nodes = vec![];
 
+                        // Build plan info for PlanCreated feedback
+                        let mut plan_node_infos: Vec<PlanNodeInfo> = Vec::new();
+
+                        for node in &dag_plan.nodes {
+                            terminal_nodes.push(node.id.clone());
+
+                            // Build node metadata
+                            let metadata = NodeMetadata {
+                                task_type: node.task_type.clone(),
+                                prompt_preview: truncate_for_preview(&node.prompt, 100),
+                                tool_name: if node.task_type == "TOOL" {
+                                    Some(node.prompt.clone())
+                                } else {
+                                    None
+                                },
+                            };
+
+                            // Build PlanNodeInfo
+                            plan_node_infos.push(PlanNodeInfo {
+                                id: node.id.clone(),
+                                task_type: node.task_type.clone(),
+                                prompt_preview: truncate_for_preview(&node.prompt, 100),
+                                dependencies: Vec::new(), // Will be populated after edge processing
+                            });
+
+                            if node.task_type == "TOOL" {
+                                graph.add_node_with_metadata(
+                                    node.id.clone(),
+                                    Box::new(WasmToolNode {
+                                        tool_name: node.prompt.clone(),
+                                        tool_registry: tool_registry.clone(),
+                                        tools_dir: config.tools_dir.clone(),
+                                    }),
+                                    metadata,
+                                );
+                            } else {
+                                graph.add_node_with_metadata(
+                                    node.id.clone(),
+                                    Box::new(LlmPromptNode {
+                                        prompt: node.prompt.clone(),
+                                        gateway: gateway_clone.clone(),
+                                    }),
+                                    metadata,
+                                );
+                            }
+                        }
+
+                        // Process edges and update dependencies
+                        for edge in &dag_plan.edges {
+                            let _ = graph.add_edge(&edge.from, &edge.to);
+                            terminal_nodes.retain(|id| id != &edge.from);
+
+                            // Update dependencies in plan_node_infos
+                            if let Some(node_info) =
+                                plan_node_infos.iter_mut().find(|n| n.id == edge.to)
+                            {
+                                node_info.dependencies.push(edge.from.clone());
+                            }
+                        }
+
+                        if terminal_nodes.is_empty() && !dag_plan.nodes.is_empty() {
+                            terminal_nodes.push(dag_plan.nodes.last().unwrap().id.clone());
+                        }
+
+                        // Publish PlanCreated feedback
+                        let plan_info = PlanInfo {
+                            reply: dag_plan.reply.clone(),
+                            nodes: plan_node_infos.clone(),
+                            total_steps: dag_plan.nodes.len(),
+                            estimated_complexity: if dag_plan.nodes.len() <= 2 {
+                                Some("low".to_string())
+                            } else if dag_plan.nodes.len() <= 5 {
+                                Some("medium".to_string())
+                            } else {
+                                Some("high".to_string())
+                            },
+                        };
+                        broker_bg.publish_feedback(AgentFeedback::PlanCreated {
+                            task_id: trace_id.to_string(),
+                            plan: plan_info,
+                        });
+
+                        // Also send the reply as Output for backward compatibility
                         if let Some(reply) = &dag_plan.reply {
                             broker_bg.publish_feedback(AgentFeedback::Output {
                                 task_id: trace_id.to_string(),
@@ -604,37 +795,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 content: reply.clone(),
                                 is_final: false,
                             });
-                        }
-
-                        for node in &dag_plan.nodes {
-                            terminal_nodes.push(node.id.clone());
-                            if node.task_type == "TOOL" {
-                                graph.add_node(
-                                    node.id.clone(),
-                                    Box::new(WasmToolNode {
-                                        tool_name: node.prompt.clone(),
-                                        tool_registry: tool_registry.clone(),
-                                        tools_dir: config.tools_dir.clone(),
-                                    }),
-                                );
-                            } else {
-                                graph.add_node(
-                                    node.id.clone(),
-                                    Box::new(LlmPromptNode {
-                                        prompt: node.prompt.clone(),
-                                        gateway: gateway_clone.clone(),
-                                    }),
-                                );
-                            }
-                        }
-
-                        for edge in &dag_plan.edges {
-                            let _ = graph.add_edge(&edge.from, &edge.to);
-                            terminal_nodes.retain(|id| id != &edge.from); // Keep only nodes that have no outgoing edges
-                        }
-
-                        if terminal_nodes.is_empty() && !dag_plan.nodes.is_empty() {
-                            terminal_nodes.push(dag_plan.nodes.last().unwrap().id.clone());
                         }
 
                         graph.current_state = GraphState {
@@ -657,16 +817,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await;
 
+                        // Calculate task summary
+                        let total_time_ms = task_start_time.elapsed().as_millis() as u64;
+                        let mut completed_nodes = 0;
+                        let mut failed_nodes = 0;
+                        let mut failed_node_ids: Vec<String> = Vec::new();
+
+                        for (node_id, status) in &graph.node_statuses {
+                            if *status == telos_core::NodeStatus::Completed {
+                                completed_nodes += 1;
+                            } else if *status == telos_core::NodeStatus::Failed {
+                                failed_nodes += 1;
+                                failed_node_ids.push(node_id.clone());
+                            }
+                        }
+
                         // Fetch the results from the terminal nodes
                         let mut final_results = Vec::new();
-                        for node_id in terminal_nodes {
-                            if let Some(Ok(res)) = graph.node_results.get(&node_id) {
+                        for node_id in &terminal_nodes {
+                            if let Some(Ok(res)) = graph.node_results.get(node_id) {
                                 final_results.push(format!(
                                     "[{}] {}",
                                     node_id,
                                     String::from_utf8_lossy(&res.output_data)
                                 ));
-                            } else if let Some(Err(e)) = graph.node_results.get(&node_id) {
+                            } else if let Some(Err(e)) = graph.node_results.get(node_id) {
                                 final_results.push(format!("[{}] Failed: {:?}", node_id, e));
                             }
                         }
@@ -676,10 +851,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             final_results.join("\n")
                         };
+
+                        let task_success = failed_nodes == 0;
+
+                        // Build summary message
+                        let summary = if task_success {
+                            format!(
+                                "Task completed successfully. {} node(s) executed in {:.1}s.",
+                                completed_nodes,
+                                total_time_ms as f64 / 1000.0
+                            )
+                        } else {
+                            format!(
+                                "Task finished with errors. {} succeeded, {} failed. Node(s) failed: {}",
+                                completed_nodes,
+                                failed_nodes,
+                                failed_node_ids.join(", ")
+                            )
+                        };
+
+                        // Publish TaskCompleted feedback
+                        broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                            task_id: trace_id.to_string(),
+                            summary: TaskSummary {
+                                success: task_success,
+                                total_nodes: graph.node_statuses.len(),
+                                completed_nodes,
+                                failed_nodes,
+                                total_time_ms,
+                                summary: summary.clone(),
+                                failed_node_ids: failed_node_ids.clone(),
+                            },
+                        });
+
+                        // Also send Output for backward compatibility
                         broker_bg.publish_feedback(AgentFeedback::Output {
                             task_id: trace_id.to_string(),
                             session_id,
-                            content: format!("Execution Complete. Responses:\n{}", combined_result),
+                            content: format!("{}\n\n{}", summary, combined_result),
                             is_final: true,
                         });
                     });
@@ -694,6 +903,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new();
 
                     tokio::spawn(async move {
+                        let task_start_time = Instant::now();
                         println!(
                             "[Daemon] Received UserApproval for task {} (approved: {})",
                             task_id, approved
@@ -707,6 +917,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 is_final: true,
                             });
                             paused_tasks_bg.lock().await.remove(&task_id);
+
+                            // Publish TaskCompleted for rejected task
+                            broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                                task_id: task_id.clone(),
+                                summary: TaskSummary {
+                                    success: false,
+                                    total_nodes: 0,
+                                    completed_nodes: 0,
+                                    failed_nodes: 0,
+                                    total_time_ms: 0,
+                                    summary: "Task was rejected by user".to_string(),
+                                    failed_node_ids: vec![],
+                                },
+                            });
                             return;
                         }
 
@@ -721,7 +945,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
 
                             let mut graph = TaskGraph::new(task_id.clone());
-                            graph.add_node(
+                            graph.add_node_with_metadata(
                                 "llm_node".to_string(),
                                 Box::new(LlmPromptNode {
                                     prompt: format!(
@@ -730,6 +954,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ),
                                     gateway: gateway_clone.clone(),
                                 }),
+                                NodeMetadata {
+                                    task_type: "LLM".to_string(),
+                                    prompt_preview: truncate_for_preview(&payload, 100),
+                                    tool_name: None,
+                                },
                             );
                             graph.current_state = GraphState {
                                 is_running: true,
@@ -759,6 +988,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 None => "No result generated by node".to_string(),
                             };
 
+                            let total_time_ms = task_start_time.elapsed().as_millis() as u64;
+                            let task_success = graph
+                                .node_statuses
+                                .get("llm_node")
+                                .map(|s| *s == telos_core::NodeStatus::Completed)
+                                .unwrap_or(false);
+
+                            // Publish TaskCompleted
+                            broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                                task_id: task_id.clone(),
+                                summary: TaskSummary {
+                                    success: task_success,
+                                    total_nodes: 1,
+                                    completed_nodes: if task_success { 1 } else { 0 },
+                                    failed_nodes: if task_success { 0 } else { 1 },
+                                    total_time_ms,
+                                    summary: if task_success {
+                                        "Approved task completed successfully".to_string()
+                                    } else {
+                                        "Approved task failed during execution".to_string()
+                                    },
+                                    failed_node_ids: if task_success {
+                                        vec![]
+                                    } else {
+                                        vec!["llm_node".to_string()]
+                                    },
+                                },
+                            });
+
                             broker_bg.publish_feedback(AgentFeedback::Output {
                                 task_id: task_id.clone(),
                                 session_id: "default".into(),
@@ -774,6 +1032,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 session_id: "default".into(),
                                 content: "Task failed to resume: Payload lost or expired.".into(),
                                 is_final: true,
+                            });
+
+                            broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                                task_id: task_id.clone(),
+                                summary: TaskSummary {
+                                    success: false,
+                                    total_nodes: 0,
+                                    completed_nodes: 0,
+                                    failed_nodes: 0,
+                                    total_time_ms: 0,
+                                    summary: "Task failed to resume: Payload lost or expired"
+                                        .to_string(),
+                                    failed_node_ids: vec![],
+                                },
                             });
                         }
                     });
@@ -812,6 +1084,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/run", post(handle_run))
         .route("/api/v1/approve", post(handle_approve))
         .route("/api/v1/stream", get(ws_handler))
+        .route("/api/v1/log-level", get(get_log_level).post(set_log_level))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
@@ -860,6 +1133,37 @@ async fn handle_approve(
 
     Json(ApproveResponse {
         status: "approval received".into(),
+    })
+}
+
+async fn get_log_level() -> Json<GetLogLevelResponse> {
+    let level = global_log_level().get();
+    Json(GetLogLevelResponse {
+        level: format!("{:?}", level).to_lowercase(),
+    })
+}
+
+async fn set_log_level(
+    State(state): State<AppState>,
+    Json(req): Json<SetLogLevelRequest>,
+) -> Json<SetLogLevelResponse> {
+    let old_level = global_log_level().get();
+    let new_level = LogLevel::from_str(&req.level);
+
+    global_log_level().set(new_level);
+
+    // Publish LogLevelChanged feedback via broker
+    state
+        .broker
+        .publish_feedback(AgentFeedback::LogLevelChanged {
+            old_level,
+            new_level,
+        });
+
+    Json(SetLogLevelResponse {
+        status: "ok".into(),
+        old_level: format!("{:?}", old_level).to_lowercase(),
+        new_level: format!("{:?}", new_level).to_lowercase(),
     })
 }
 

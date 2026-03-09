@@ -133,7 +133,197 @@ impl ShellExecTool {
     }
 }
 
-// 4. Tool Register Tool
+// 4. Calculator Tool
+#[derive(Clone)]
+pub struct CalculatorTool;
+
+#[async_trait]
+impl ToolExecutor for CalculatorTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let expression = params.get("expression")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'expression' parameter".into()))?;
+
+        // Use evalexpr for safe mathematical expression evaluation
+        // For now, use a simple approach with basic operations
+        let result = Self::evaluate_expression(expression)?;
+
+        let output = serde_json::json!({
+            "expression": expression,
+            "result": result
+        });
+
+        Ok(serde_json::to_vec(&output).unwrap_or_else(|_| format!("{{\"result\": {}}}", result).into_bytes()))
+    }
+}
+
+impl CalculatorTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "calculator".into(),
+            description: "Evaluates mathematical expressions. Supports basic operations (+, -, *, /, ^), functions (sqrt, sin, cos, tan, log, exp, abs), and constants (pi, e). Requires an 'expression' parameter.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "expression": {
+                            "type": "string",
+                            "description": "Mathematical expression to evaluate, e.g., '2+2', 'sqrt(16)', 'sin(pi/2)'"
+                        }
+                    },
+                    "required": ["expression"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+
+    /// Safely evaluate a mathematical expression
+    fn evaluate_expression(expr: &str) -> Result<f64, ToolError> {
+        let expr = expr.trim().replace(" ", "");
+
+        // Handle common constants
+        let expr = expr.replace("pi", &std::f64::consts::PI.to_string());
+        let expr = expr.replace("e", &std::f64::consts::E.to_string());
+
+        // Simple recursive descent parser for basic expressions
+        Self::parse_expression(&expr, &mut 0)
+    }
+
+    fn parse_expression(expr: &str, pos: &mut usize) -> Result<f64, ToolError> {
+        let mut result = Self::parse_term(expr, pos)?;
+
+        while *pos < expr.len() {
+            let c = expr.chars().nth(*pos).unwrap();
+            if c == '+' {
+                *pos += 1;
+                let term = Self::parse_term(expr, pos)?;
+                result += term;
+            } else if c == '-' {
+                *pos += 1;
+                let term = Self::parse_term(expr, pos)?;
+                result -= term;
+            } else {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn parse_term(expr: &str, pos: &mut usize) -> Result<f64, ToolError> {
+        let mut result = Self::parse_factor(expr, pos)?;
+
+        while *pos < expr.len() {
+            let c = expr.chars().nth(*pos).unwrap();
+            if c == '*' {
+                *pos += 1;
+                let factor = Self::parse_factor(expr, pos)?;
+                result *= factor;
+            } else if c == '/' {
+                *pos += 1;
+                let factor = Self::parse_factor(expr, pos)?;
+                if factor == 0.0 {
+                    return Err(ToolError::ExecutionFailed("Division by zero".into()));
+                }
+                result /= factor;
+            } else if c == '^' {
+                *pos += 1;
+                let factor = Self::parse_factor(expr, pos)?;
+                result = result.powf(factor);
+            } else {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn parse_factor(expr: &str, pos: &mut usize) -> Result<f64, ToolError> {
+        // Skip whitespace (already removed, but just in case)
+        while *pos < expr.len() && expr.chars().nth(*pos).unwrap().is_whitespace() {
+            *pos += 1;
+        }
+
+        if *pos >= expr.len() {
+            return Err(ToolError::ExecutionFailed("Unexpected end of expression".into()));
+        }
+
+        let c = expr.chars().nth(*pos).unwrap();
+
+        // Handle negative numbers
+        if c == '-' {
+            *pos += 1;
+            return Ok(-Self::parse_factor(expr, pos)?);
+        }
+
+        // Handle parentheses
+        if c == '(' {
+            *pos += 1;
+            let result = Self::parse_expression(expr, pos)?;
+            if *pos >= expr.len() || expr.chars().nth(*pos).unwrap() != ')' {
+                return Err(ToolError::ExecutionFailed("Missing closing parenthesis".into()));
+            }
+            *pos += 1;
+            return Ok(result);
+        }
+
+        // Handle functions
+        if c.is_alphabetic() {
+            let start = *pos;
+            while *pos < expr.len() && (expr.chars().nth(*pos).unwrap().is_alphanumeric() || expr.chars().nth(*pos).unwrap() == '_') {
+                *pos += 1;
+            }
+            let func_name = &expr[start..*pos];
+
+            if *pos < expr.len() && expr.chars().nth(*pos).unwrap() == '(' {
+                *pos += 1;
+                let arg = Self::parse_expression(expr, pos)?;
+                if *pos >= expr.len() || expr.chars().nth(*pos).unwrap() != ')' {
+                    return Err(ToolError::ExecutionFailed("Missing closing parenthesis for function".into()));
+                }
+                *pos += 1;
+
+                let result = match func_name {
+                    "sqrt" => arg.sqrt(),
+                    "sin" => arg.sin(),
+                    "cos" => arg.cos(),
+                    "tan" => arg.tan(),
+                    "log" => arg.ln(),
+                    "log10" => arg.log10(),
+                    "exp" => arg.exp(),
+                    "abs" => arg.abs(),
+                    "floor" => arg.floor(),
+                    "ceil" => arg.ceil(),
+                    "round" => arg.round(),
+                    _ => return Err(ToolError::ExecutionFailed(format!("Unknown function: {}", func_name))),
+                };
+                return Ok(result);
+            }
+        }
+
+        // Handle numbers
+        let start = *pos;
+        while *pos < expr.len() {
+            let c = expr.chars().nth(*pos).unwrap();
+            if c.is_ascii_digit() || c == '.' {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+
+        if start == *pos {
+            return Err(ToolError::ExecutionFailed(format!("Expected number at position {}", *pos)));
+        }
+
+        let num_str = &expr[start..*pos];
+        num_str.parse::<f64>()
+            .map_err(|e| ToolError::ExecutionFailed(format!("Invalid number '{}': {}", num_str, e)))
+    }
+}
+
+// 5. Tool Register Tool
 // Allows dynamic registration of newly compiled Wasm modules.
 // Because it needs to mutate the registry, we'll implement this with a reference or a specific API design later,
 // as the registry is behind RwLock and managed globally.

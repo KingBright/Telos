@@ -9,6 +9,14 @@ pub mod engine;
 #[cfg(test)]
 mod tests;
 
+/// Metadata for a node in the execution graph
+#[derive(Debug, Clone, Default)]
+pub struct NodeMetadata {
+    pub task_type: String,         // "LLM" or "TOOL"
+    pub prompt_preview: String,    // Truncated prompt for display
+    pub tool_name: Option<String>, // For TOOL type nodes
+}
+
 #[async_trait::async_trait]
 pub trait ExecutableNode: Send + Sync {
     async fn execute(
@@ -36,6 +44,8 @@ pub struct TaskGraph {
     pub node_statuses: HashMap<String, NodeStatus>,
     // Results from execution
     pub node_results: HashMap<String, Result<NodeResult, NodeError>>,
+    // Metadata for each node (task_type, prompt_preview, etc.)
+    pub node_metadata: HashMap<String, NodeMetadata>,
     pub current_state: GraphState,
 }
 
@@ -48,6 +58,7 @@ impl TaskGraph {
             node_indices: HashMap::new(),
             node_statuses: HashMap::new(),
             node_results: HashMap::new(),
+            node_metadata: HashMap::new(),
             current_state: GraphState {
                 is_running: false,
                 completed: false,
@@ -59,7 +70,29 @@ impl TaskGraph {
         let index = self.edges.add_node(id.clone());
         self.node_indices.insert(id.clone(), index);
         self.nodes.insert(id.clone(), node);
-        self.node_statuses.insert(id, NodeStatus::Pending);
+        self.node_statuses.insert(id.clone(), NodeStatus::Pending);
+        self.node_metadata.insert(id, NodeMetadata::default());
+    }
+
+    /// Add a node with explicit metadata
+    pub fn add_node_with_metadata(
+        &mut self,
+        id: String,
+        node: Box<dyn ExecutableNode>,
+        metadata: NodeMetadata,
+    ) {
+        let index = self.edges.add_node(id.clone());
+        self.node_indices.insert(id.clone(), index);
+        self.nodes.insert(id.clone(), node);
+        self.node_statuses.insert(id.clone(), NodeStatus::Pending);
+        self.node_metadata.insert(id, metadata);
+    }
+
+    /// Set metadata for an existing node
+    pub fn set_node_metadata(&mut self, id: &str, metadata: NodeMetadata) {
+        if self.node_indices.contains_key(id) {
+            self.node_metadata.insert(id.to_string(), metadata);
+        }
     }
 
     pub fn add_edge(&mut self, from: &str, to: &str) -> Result<(), String> {

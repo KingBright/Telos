@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Read(//Users/jinliang/.cargo/**)",
-      "Bash(~/.cargo/bin/telos:*)"
+      "Bash(~/.cargo/bin/telos:*)",
+      "Bash(lsof:*)",
+      "Bash(pkill:*)"
     ]
   }
 }
