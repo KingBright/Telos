@@ -23,7 +23,7 @@ cargo build --release
 
 ## 2. Initialization Wizard
 
-Telos strictly avoids hardcoded configurations. The system requires a persistent `.telos_config.toml` file in your home directory to load API keys, Base URLs, LLM Models, and Embedding Models dynamically.
+Telos strictly avoids hardcoded configurations. The system requires a persistent configuration file at `~/.telos/config.toml` to load API keys, Base URLs, LLM Models, and Embedding Models dynamically.
 
 If this configuration is missing, the CLI will automatically trigger an interactive setup wizard to guide you.
 
@@ -159,7 +159,7 @@ Telos includes a robust chatbot abstraction layer that allows you to interact wi
 
 Before starting the bot, you need to configure your Telegram Bot Token.
 1. Create a new bot using [@BotFather](https://t.me/BotFather) on Telegram and obtain your HTTP API Token.
-2. Run the initialization wizard again to update your config, or manually edit `~/.telos_config.toml` to add the token:
+2. Run the initialization wizard again to update your config, or manually edit `~/.telos/config.toml` to add the token:
 
 ```toml
 telegram_bot_token = "YOUR_TELEGRAM_BOT_TOKEN_HERE"

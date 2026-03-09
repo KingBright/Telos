@@ -1,5 +1,6 @@
 use crate::{ToolExecutor, ToolRegistry, ToolSchema};
 use std::collections::HashMap;
+use tracing::{info, debug};
 
 pub struct VectorToolRegistry {
     tools: HashMap<String, ToolSchema>,
@@ -22,7 +23,7 @@ impl VectorToolRegistry {
 
             match model_result {
                 Ok(Ok(model)) => {
-                    println!("[ToolRegistry] Fastembed model loaded successfully.");
+                    info!("[ToolRegistry] Fastembed model loaded successfully.");
                     return Self {
                         tools: HashMap::new(),
                         executors: HashMap::new(),
@@ -31,7 +32,7 @@ impl VectorToolRegistry {
                     };
                 }
                 _ => {
-                    println!("[ToolRegistry] Fastembed model unavailable, using keyword fallback.");
+                    info!("[ToolRegistry] Fastembed model unavailable, using keyword fallback.");
                 }
             }
         }
@@ -41,7 +42,7 @@ impl VectorToolRegistry {
 
     /// Create a registry without attempting to load fastembed at all (instant startup).
     pub fn new_keyword_only() -> Self {
-        println!("[ToolRegistry] Using keyword-only tool discovery.");
+        info!("[ToolRegistry] Using keyword-only tool discovery.");
         Self {
             tools: HashMap::new(),
             executors: HashMap::new(),
@@ -97,7 +98,7 @@ impl VectorToolRegistry {
 
     /// Keyword-based tool discovery fallback.
     fn keyword_discover(&self, intent: &str, limit: usize) -> Vec<ToolSchema> {
-        let query_lower = intent.to_lowercase();
+        let query_lower = intent.to_lowercase().replace('_', " ").replace('-', " ");
         let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
         let mut scored: Vec<(&String, f32)> = self
@@ -107,22 +108,43 @@ impl VectorToolRegistry {
                 let haystack = format!("{} {}", name, schema.description).to_lowercase();
                 let score: f32 =
                     query_words.iter().filter(|w| haystack.contains(*w)).count() as f32;
+                debug!(
+                    "[ToolRegistry] Checking '{}' against words {:?} -> score {}",
+                    name, query_words, score
+                );
                 (name, score)
             })
             .collect();
+
+        if scored.iter().all(|(_, s)| *s == 0.0) {
+            debug!(
+                "[ToolRegistry] No matches at all for query words: {:?}",
+                query_words
+            );
+        }
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         scored
             .into_iter()
+            .filter(|&(_, score)| score > 0.0)
             .take(limit)
             .filter_map(|(name, _)| self.tools.get(name).cloned())
             .collect()
+    }
+
+    /// List all registered tools with their schemas
+    pub fn list_all_tools(&self) -> Vec<ToolSchema> {
+        self.tools.values().cloned().collect()
     }
 }
 
 impl ToolRegistry for VectorToolRegistry {
     fn discover_tools(&self, intent: &str, limit: usize) -> Vec<ToolSchema> {
+        debug!(
+            "[ToolRegistry] discover_tools called with intent: '{}'",
+            intent
+        );
         #[cfg(feature = "local-embeddings")]
         if let Some(ref model) = self.model {
             if let Ok(mut m) = model.write() {
@@ -156,6 +178,10 @@ impl ToolRegistry for VectorToolRegistry {
 
     fn get_executor(&self, tool_name: &str) -> Option<std::sync::Arc<dyn ToolExecutor>> {
         self.executors.get(tool_name).cloned()
+    }
+
+    fn list_all_tools(&self) -> Vec<ToolSchema> {
+        self.tools.values().cloned().collect()
     }
 }
 

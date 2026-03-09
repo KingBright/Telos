@@ -1,11 +1,14 @@
 use async_trait::async_trait;
 use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
-use std::num::NonZeroUsize;
+use telos_core::{NodeStatus, RiskLevel};
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
-use telos_core::{NodeResult, NodeStatus, RiskLevel};
+
+// Re-export types from telos_core that are part of the public API
+pub use telos_core::{AgentOutput, HelpRequest};
 
 // ============================================================================
 // Log Level System
@@ -25,8 +28,6 @@ pub enum LogLevel {
     /// All internal state, error stacks, timing info
     Debug = 3,
 }
-
-
 
 impl LogLevel {
     /// Convert from u8 value
@@ -108,18 +109,18 @@ pub fn global_log_level() -> &'static LogLevelManager {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlanNodeInfo {
     pub id: String,
-    pub task_type: String,  // "LLM" or "TOOL"
-    pub prompt_preview: String,  // Truncated prompt for display
-    pub dependencies: Vec<String>,  // IDs of nodes this depends on
+    pub task_type: String,         // "LLM" or "TOOL"
+    pub prompt_preview: String,    // Truncated prompt for display
+    pub dependencies: Vec<String>, // IDs of nodes this depends on
 }
 
 /// Information about the complete execution plan
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlanInfo {
-    pub reply: Option<String>,  // LLM's conversational response
+    pub reply: Option<String>, // LLM's conversational response
     pub nodes: Vec<PlanNodeInfo>,
     pub total_steps: usize,
-    pub estimated_complexity: Option<String>,  // "low", "medium", "high"
+    pub estimated_complexity: Option<String>, // "low", "medium", "high"
 }
 
 /// Detailed information about node execution
@@ -127,8 +128,8 @@ pub struct PlanInfo {
 pub struct NodeExecutionDetail {
     pub node_id: String,
     pub task_type: String,
-    pub input_preview: String,  // Truncated input for display
-    pub started_at: Option<u64>,  // Unix timestamp in ms
+    pub input_preview: String,   // Truncated input for display
+    pub started_at: Option<u64>, // Unix timestamp in ms
 }
 
 /// Progress information for the running task
@@ -143,7 +144,13 @@ pub struct ProgressInfo {
 }
 
 impl ProgressInfo {
-    pub fn new(completed: usize, total: usize, running: usize, failed: usize, pending: usize) -> Self {
+    pub fn new(
+        completed: usize,
+        total: usize,
+        running: usize,
+        failed: usize,
+        pending: usize,
+    ) -> Self {
         let percentage = if total > 0 {
             ((completed as f64 / total as f64) * 100.0) as u8
         } else {
@@ -163,7 +170,7 @@ impl ProgressInfo {
 /// Detailed error information
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ErrorDetail {
-    pub error_type: String,  // e.g., "ExecutionFailed", "Timeout", "ToolNotFound"
+    pub error_type: String, // e.g., "ExecutionFailed", "Timeout", "ToolNotFound"
     pub message: String,
     pub stack_trace: Option<String>,
     pub retry_suggested: bool,
@@ -172,9 +179,16 @@ pub struct ErrorDetail {
 impl ErrorDetail {
     pub fn from_node_error(error: &telos_core::NodeError) -> Self {
         let (error_type, message) = match error {
-            telos_core::NodeError::ExecutionFailed(msg) => ("ExecutionFailed".to_string(), msg.clone()),
-            telos_core::NodeError::Timeout => ("Timeout".to_string(), "Operation timed out".to_string()),
-            telos_core::NodeError::DependencyConflict => ("DependencyConflict".to_string(), "Dependency conflict occurred".to_string()),
+            telos_core::NodeError::ExecutionFailed(msg) => {
+                ("ExecutionFailed".to_string(), msg.clone())
+            }
+            telos_core::NodeError::Timeout => {
+                ("Timeout".to_string(), "Operation timed out".to_string())
+            }
+            telos_core::NodeError::DependencyConflict => (
+                "DependencyConflict".to_string(),
+                "Dependency conflict occurred".to_string(),
+            ),
         };
         Self {
             error_type,
@@ -193,8 +207,8 @@ pub struct TaskSummary {
     pub completed_nodes: usize,
     pub failed_nodes: usize,
     pub total_time_ms: u64,
-    pub summary: String,  // Human-readable summary
-    pub failed_node_ids: Vec<String>,  // IDs of failed nodes
+    pub summary: String,              // Human-readable summary
+    pub failed_node_ids: Vec<String>, // IDs of failed nodes
 }
 
 // ============================================================================
@@ -217,6 +231,7 @@ pub enum AgentEvent {
     },
     UserApproval {
         task_id: String,
+        node_id: Option<String>,
         approved: bool,
         supplement_info: Option<String>,
         trace_id: Uuid,
@@ -224,13 +239,18 @@ pub enum AgentEvent {
     ReplanRequested {
         node_id: String,
         reason: String,
-        partial_result: NodeResult,
+        partial_result: telos_core::NodeResult,
+        trace_id: Uuid,
+    },
+    /// Direct intervention logically aimed at an active Task DAG (Architect Agent)
+    UserIntervention {
+        task_id: String,
+        node_id: Option<String>,
+        instruction: String,
         trace_id: Uuid,
     },
     /// Change the log level at runtime
-    SetLogLevel {
-        level: LogLevel,
-    },
+    SetLogLevel { level: LogLevel },
 }
 
 impl AgentEvent {
@@ -240,6 +260,7 @@ impl AgentEvent {
             AgentEvent::AutoTrigger { trace_id, .. } => *trace_id,
             AgentEvent::UserApproval { trace_id, .. } => *trace_id,
             AgentEvent::ReplanRequested { trace_id, .. } => *trace_id,
+            AgentEvent::UserIntervention { trace_id, .. } => *trace_id,
             AgentEvent::SetLogLevel { .. } => Uuid::nil(),
         }
     }
@@ -251,6 +272,7 @@ impl AgentEvent {
             self,
             AgentEvent::ReplanRequested { .. }
                 | AgentEvent::UserApproval { .. }
+                | AgentEvent::UserIntervention { .. }
                 | AgentEvent::SetLogLevel { .. }
         )
     }
@@ -283,12 +305,8 @@ pub enum AgentFeedback {
     },
 
     // === New Enhanced Feedback Types ===
-
     /// Plan generation completed (Normal+)
-    PlanCreated {
-        task_id: String,
-        plan: PlanInfo,
-    },
+    PlanCreated { task_id: String, plan: PlanInfo },
 
     /// Node started execution (Verbose+)
     NodeStarted {
@@ -301,7 +319,7 @@ pub enum AgentFeedback {
     NodeCompleted {
         task_id: String,
         node_id: String,
-        result_preview: String,  // Truncated result for display
+        result_preview: String, // Truncated result for display
         execution_time_ms: u64,
     },
 
@@ -310,6 +328,13 @@ pub enum AgentFeedback {
         task_id: String,
         node_id: String,
         error: ErrorDetail,
+    },
+
+    /// Node needs help - cannot proceed without external assistance (Normal+)
+    NodeNeedsHelp {
+        task_id: String,
+        node_id: String,
+        help: HelpRequest,
     },
 
     /// Progress update (Normal+)
@@ -329,6 +354,13 @@ pub enum AgentFeedback {
         old_level: LogLevel,
         new_level: LogLevel,
     },
+
+    /// Execution trace logs (LLM calls, Tool calls) (Verbose+)
+    Trace {
+        task_id: String,
+        node_id: String,
+        trace: telos_core::TraceLog,
+    },
 }
 
 // ============================================================================
@@ -347,13 +379,15 @@ impl AgentFeedback {
             // Normal and above
             AgentFeedback::Output { .. }
             | AgentFeedback::StateChanged { .. }
-            | AgentFeedback::PlanCreated { .. }
-            | AgentFeedback::NodeCompleted { .. }
-            | AgentFeedback::NodeFailed { .. }
+            | AgentFeedback::NodeNeedsHelp { .. }
             | AgentFeedback::ProgressUpdate { .. } => LogLevel::Normal,
 
             // Verbose and above
-            AgentFeedback::NodeStarted { .. } => LogLevel::Verbose,
+            AgentFeedback::NodeStarted { .. }
+            | AgentFeedback::PlanCreated { .. }
+            | AgentFeedback::NodeCompleted { .. }
+            | AgentFeedback::NodeFailed { .. }
+            | AgentFeedback::Trace { .. } => LogLevel::Verbose,
         }
     }
 
@@ -372,6 +406,8 @@ impl AgentFeedback {
             | AgentFeedback::NodeStarted { task_id, .. }
             | AgentFeedback::NodeCompleted { task_id, .. }
             | AgentFeedback::NodeFailed { task_id, .. }
+            | AgentFeedback::NodeNeedsHelp { task_id, .. }
+            | AgentFeedback::Trace { task_id, .. }
             | AgentFeedback::ProgressUpdate { task_id, .. }
             | AgentFeedback::TaskCompleted { task_id, .. } => Some(task_id),
             AgentFeedback::LogLevelChanged { .. } => None,
@@ -415,7 +451,11 @@ pub struct TokioEventBroker {
 }
 
 impl TokioEventBroker {
-    pub fn new(event_capacity: usize, feedback_capacity: usize, lru_cache_size: usize) -> (Self, mpsc::Receiver<AgentEvent>) {
+    pub fn new(
+        event_capacity: usize,
+        feedback_capacity: usize,
+        lru_cache_size: usize,
+    ) -> (Self, mpsc::Receiver<AgentEvent>) {
         let (event_tx, event_rx) = mpsc::channel(event_capacity);
         let (feedback_tx, _) = broadcast::channel(feedback_capacity);
 
@@ -457,12 +497,13 @@ impl EventBroker for TokioEventBroker {
                     Err(EventBrokerError::ChannelFull)
                 } else {
                     // For critical events, block and wait to ensure delivery
-                    self.event_tx.send(event).await.map_err(|_| EventBrokerError::ChannelFull)
+                    self.event_tx
+                        .send(event)
+                        .await
+                        .map_err(|_| EventBrokerError::ChannelFull)
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(EventBrokerError::ChannelFull)
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(EventBrokerError::ChannelFull),
         }
     }
 

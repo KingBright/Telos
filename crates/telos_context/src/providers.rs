@@ -1,7 +1,109 @@
 use async_trait::async_trait;
+use tracing::{info, debug, error};
 
+/// Provider 错误类型
 #[derive(Debug, Clone)]
-pub struct ProviderError(pub String);
+pub struct ProviderError {
+    /// 用户友好的错误消息
+    pub message: String,
+    /// 错误分类
+    pub kind: ProviderErrorKind,
+}
+
+/// Provider 错误分类
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    /// 网络错误（可重试）
+    NetworkError,
+    /// 认证错误（永久性）
+    AuthenticationError,
+    /// 速率限制（可重试）
+    RateLimited,
+    /// 服务不可用（可重试）
+    ServiceUnavailable,
+    /// 配额超限（永久性）
+    QuotaExceeded,
+    /// 内容过滤（永久性）
+    ContentFiltered,
+    /// 其他错误
+    Other,
+}
+
+impl ProviderError {
+    pub fn new(message: impl Into<String>, kind: ProviderErrorKind) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+        }
+    }
+
+    /// 从 HTTP 状态码创建
+    pub fn from_http_status(status: u16, body: &str) -> Self {
+        let kind = match status {
+            401 | 403 => ProviderErrorKind::AuthenticationError,
+            429 => ProviderErrorKind::RateLimited,
+            503 => ProviderErrorKind::ServiceUnavailable,
+            _ if status >= 500 => ProviderErrorKind::ServiceUnavailable,
+            _ => ProviderErrorKind::Other,
+        };
+        Self {
+            message: format!("HTTP {}: {}", status, body),
+            kind,
+        }
+    }
+
+    /// 从网络错误创建
+    pub fn from_network_error(error: &str) -> Self {
+        Self {
+            message: error.to_string(),
+            kind: ProviderErrorKind::NetworkError,
+        }
+    }
+
+    /// 是否可重试
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.kind,
+            ProviderErrorKind::NetworkError
+                | ProviderErrorKind::RateLimited
+                | ProviderErrorKind::ServiceUnavailable
+        )
+    }
+
+    /// 转换为用户友好消息
+    pub fn to_user_message(&self) -> String {
+        match self.kind {
+            ProviderErrorKind::NetworkError => "网络连接失败，请检查网络".to_string(),
+            ProviderErrorKind::AuthenticationError => "认证失败，请检查 API 密钥".to_string(),
+            ProviderErrorKind::RateLimited => "请求过于频繁，请稍后重试".to_string(),
+            ProviderErrorKind::ServiceUnavailable => "服务暂时不可用".to_string(),
+            ProviderErrorKind::QuotaExceeded => "配额已用尽".to_string(),
+            ProviderErrorKind::ContentFiltered => "内容被过滤".to_string(),
+            ProviderErrorKind::Other => self.message.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+// 向后兼容：保留旧的构造方式
+impl From<String> for ProviderError {
+    fn from(message: String) -> Self {
+        Self::new(message, ProviderErrorKind::Other)
+    }
+}
+
+impl From<&str> for ProviderError {
+    fn from(message: &str) -> Self {
+        Self::new(message, ProviderErrorKind::Other)
+    }
+}
 
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
@@ -86,7 +188,7 @@ impl OpenAiProvider {
     ) -> Self {
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(120))  // 2 minutes for LLM API calls
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             api_key,
@@ -97,18 +199,30 @@ impl OpenAiProvider {
     }
 
     pub async fn chat_completion(&self, prompt: &str) -> Result<String, ProviderError> {
+        let messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": prompt
+            })
+        ];
+        self.generate_chat(messages).await
+    }
+
+    pub async fn generate_chat(&self, messages: Vec<serde_json::Value>) -> Result<String, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
 
         let payload = serde_json::json!({
             "model": self.llm_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": messages,
             "temperature": 0.7
         });
+
+        // === DIAGNOSTIC: Request details ===
+        info!("[OpenAiProvider] API Request: {} (Model: {})", url, self.llm_model);
+        debug!("[OpenAiProvider] Messages count: {}", messages.len());
+        debug!("[OpenAiProvider] API Key: {}...{}",
+            &self.api_key.chars().take(8).collect::<String>(),
+            &self.api_key.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>());
 
         let response = self
             .client
@@ -117,23 +231,51 @@ impl OpenAiProvider {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| ProviderError(format!("HTTP Error: {}", e)))?;
+            .map_err(|e| {
+                error!("[OpenAiProvider] ❌ REQUEST FAILED:\n{:#?}", e);
+                ProviderError::from_network_error(&format!("{:?}", e))
+            })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        let status_code = status.as_u16();
+
+        // === DIAGNOSTIC: Response status ===
+        info!("[OpenAiProvider] API Response Status: {} ({})", status_code, status.canonical_reason().unwrap_or("Unknown"));
+
+        if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError(format!("API Error {}: {}", status, body)));
+            error!("[OpenAiProvider] ❌ ERROR RESPONSE BODY: {}", body);
+            return Err(ProviderError::from_http_status(status_code, &body));
         }
 
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| ProviderError(format!("JSON Parse Error: {}", e)))?;
+        // Read response body as text first for debugging
+        let response_text = response.text().await.map_err(|e| {
+            error!("[OpenAiProvider] ❌ FAILED TO READ RESPONSE: {}", e);
+            ProviderError::from_network_error(&format!("Failed to read response: {}", e))
+        })?;
+
+        let json: serde_json::Value = serde_json::from_str(&response_text).map_err(|e| {
+            error!("[OpenAiProvider] ❌ JSON PARSE ERROR");
+            debug!("[OpenAiProvider] Response text (first 500 chars): {}",
+                &response_text.chars().take(500).collect::<String>());
+            ProviderError::new(
+                format!("JSON Parse Error: {} | Response: {}", e,
+                    &response_text.chars().take(200).collect::<String>()),
+                ProviderErrorKind::Other,
+            )
+        })?;
 
         let reply = json["choices"][0]["message"]["content"]
             .as_str()
-            .ok_or_else(|| ProviderError("Invalid reply format from API".to_string()))?
+            .ok_or_else(|| {
+                error!("[OpenAiProvider] ❌ INVALID FORMAT - Response JSON: {}", 
+                    serde_json::to_string_pretty(&json).unwrap_or_else(|_| "Failed to serialize".to_string()));
+                ProviderError::new("Invalid reply format from API", ProviderErrorKind::Other)
+            })?
             .to_string();
+
+        info!("[OpenAiProvider] ✅ SUCCESS - Response length: {} bytes", reply.len());
+        debug!("[OpenAiProvider] Response Content: {}", reply);
 
         Ok(reply)
     }
@@ -156,22 +298,22 @@ impl EmbeddingProvider for OpenAiProvider {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| ProviderError(format!("HTTP Error: {}", e)))?;
+            .map_err(|e| ProviderError::from_network_error(&format!("{:?}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError(format!("API Error {}: {}", status, body)));
+            return Err(ProviderError::from_http_status(status.as_u16(), &body));
         }
 
         let json: serde_json::Value = response
             .json()
             .await
-            .map_err(|e| ProviderError(format!("JSON Parse Error: {}", e)))?;
+            .map_err(|e| ProviderError::new(format!("JSON Parse Error: {}", e), ProviderErrorKind::Other))?;
 
         let embedding = json["data"][0]["embedding"]
             .as_array()
-            .ok_or_else(|| ProviderError("Invalid embedding format from API".to_string()))?
+            .ok_or_else(|| ProviderError::new("Invalid embedding format from API", ProviderErrorKind::Other))?
             .iter()
             .map(|v: &serde_json::Value| v.as_f64().unwrap_or(0.0) as f32)
             .collect();
@@ -207,22 +349,22 @@ impl LlmProvider for OpenAiProvider {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| ProviderError(format!("HTTP Error: {}", e)))?;
+            .map_err(|e| ProviderError::from_network_error(&format!("{:?}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError(format!("API Error {}: {}", status, body)));
+            return Err(ProviderError::from_http_status(status.as_u16(), &body));
         }
 
         let json: serde_json::Value = response
             .json()
             .await
-            .map_err(|e| ProviderError(format!("JSON Parse Error: {}", e)))?;
+            .map_err(|e| ProviderError::new(format!("JSON Parse Error: {}", e), ProviderErrorKind::Other))?;
 
         let summary = json["choices"][0]["message"]["content"]
             .as_str()
-            .ok_or_else(|| ProviderError("Invalid summary format from API".to_string()))?
+            .ok_or_else(|| ProviderError::new("Invalid summary format from API", ProviderErrorKind::Other))?
             .to_string();
 
         Ok(summary)
@@ -245,7 +387,10 @@ impl LocalEmbeddingProvider {
     pub fn new() -> Result<Self, ProviderError> {
         // InitTextEmbedding defaults to BGE-small-en-v1.5 or similar highly efficient models
         let model = fastembed::TextEmbedding::try_new(Default::default()).map_err(|e| {
-            ProviderError(format!("Failed to initialize local embedding model: {}", e))
+            ProviderError::new(
+                format!("Failed to initialize local embedding model: {}", e),
+                ProviderErrorKind::Other,
+            )
         })?;
 
         Ok(Self {
@@ -267,11 +412,17 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
 
         let mut embeddings =
             tokio::task::block_in_place(|| model_lock.embed(documents, None::<usize>))
-                .map_err(|e| ProviderError(format!("Local embedding failed: {}", e)))?;
+                .map_err(|e| {
+                    ProviderError::new(
+                        format!("Local embedding failed: {}", e),
+                        ProviderErrorKind::Other,
+                    )
+                })?;
 
         if embeddings.is_empty() {
-            return Err(ProviderError(
-                "Model returned empty embedding array".to_string(),
+            return Err(ProviderError::new(
+                "Model returned empty embedding array",
+                ProviderErrorKind::Other,
             ));
         }
 
@@ -330,7 +481,12 @@ impl LlmProvider for GatewayLlmProvider {
             .gateway
             .generate(req)
             .await
-            .map_err(|e| ProviderError(format!("Gateway Error: {:?}", e)))?;
+            .map_err(|e| {
+                ProviderError::new(
+                    e.to_user_message(),
+                    if e.is_retryable() { ProviderErrorKind::ServiceUnavailable } else { ProviderErrorKind::Other },
+                )
+            })?;
 
         Ok(response.content)
     }

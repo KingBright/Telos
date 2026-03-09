@@ -8,13 +8,13 @@ telos_project = { path = "../telos_project" }
 dirs = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 clap = { version = "4.5.16", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { workspace = true }
 tokio-tungstenite = { version = "0.24.0" }
 futures-util = "0.3.31"
 inquire = "0.7.5"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-uuid = { workspace = true, features = ["v4", "serde"] }
+uuid = { version = "1.21.0", features = ["v4", "serde"] }
 
 telos_core = { path = "../telos_core" }
 telos_hci = { path = "../telos_hci" }

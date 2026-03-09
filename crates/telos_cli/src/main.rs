@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use telos_bot::providers::telegram::TelegramBotProvider;
 use telos_bot::traits::ChatBotProvider;
 use telos_core::config::TelosConfig;
-use telos_hci::{AgentFeedback, LogLevel, global_log_level};
+use telos_hci::{global_log_level, AgentFeedback, LogLevel};
 use telos_project::manager::ProjectRegistry;
 
 #[derive(Parser)]
@@ -101,7 +101,9 @@ impl CliFeedbackFormatter {
                 Some(output)
             }
 
-            AgentFeedback::NodeStarted { node_id, detail, .. } => {
+            AgentFeedback::NodeStarted {
+                node_id, detail, ..
+            } => {
                 let mut output = format!("\n▶ Starting [{}] ({})\n", node_id, detail.task_type);
                 if self.level.should_show(LogLevel::Verbose) {
                     output.push_str(&format!("  Task: {}\n", detail.input_preview));
@@ -115,10 +117,7 @@ impl CliFeedbackFormatter {
                 execution_time_ms,
                 ..
             } => {
-                let mut output = format!(
-                    "✓ [{}] Completed ({}ms)\n",
-                    node_id, execution_time_ms
-                );
+                let mut output = format!("✓ [{}] Completed ({}ms)\n", node_id, execution_time_ms);
                 if self.level.should_show(LogLevel::Verbose) {
                     output.push_str(&format!("  Result: {}\n", result_preview));
                 }
@@ -150,7 +149,11 @@ impl CliFeedbackFormatter {
 
             AgentFeedback::TaskCompleted { summary, .. } => {
                 let icon = if summary.success { "✅" } else { "⚠️" };
-                let status = if summary.success { "Success" } else { "Finished with errors" };
+                let status = if summary.success {
+                    "Success"
+                } else {
+                    "Finished with errors"
+                };
                 let time_str = format_duration(summary.total_time_ms);
 
                 let mut output = format!(
@@ -190,11 +193,14 @@ impl CliFeedbackFormatter {
                 }
             }
 
-            AgentFeedback::RequireHumanIntervention { prompt, .. } => {
-                Some(format!("\n🚨 [HUMAN INTERVENTION REQUIRED] 🚨\n{}\n", prompt))
-            }
+            AgentFeedback::RequireHumanIntervention { prompt, .. } => Some(format!(
+                "\n🚨 [HUMAN INTERVENTION REQUIRED] 🚨\n{}\n",
+                prompt
+            )),
 
-            AgentFeedback::Output { content, is_final, .. } => {
+            AgentFeedback::Output {
+                content, is_final, ..
+            } => {
                 let prefix = if *is_final { "✓" } else { ">>" };
                 Some(format!("{} {}\n", prefix, content))
             }
@@ -206,6 +212,19 @@ impl CliFeedbackFormatter {
                 "Log level changed: {:?} → {:?}\n",
                 old_level, new_level
             )),
+
+            AgentFeedback::NodeNeedsHelp { node_id, help, .. } => {
+                let suggestions_text = if help.suggestions.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  Suggestions:\n  • {}", help.suggestions.join("\n  • "))
+                };
+                Some(format!(
+                    "\n❓ [{}] Needs Help ({})\n  {}\n{}\n",
+                    node_id, help.help_type, help.detail, suggestions_text
+                ))
+            }
+            AgentFeedback::Trace { .. } => None,
         }
     }
 }
@@ -387,11 +406,7 @@ fn check_and_init_config(force: bool) -> bool {
             .to_string();
     }
 
-    let default_db_path = {
-        let mut path = dirs::home_dir().expect("Could not find home directory");
-        path.push(".telos_memory.redb");
-        path.to_string_lossy().into_owned()
-    };
+    let default_db_path = TelosConfig::memory_db_path().to_string_lossy().into_owned();
 
     let db_path = Text::new("Where should we store the memory database?")
         .with_default(&default_db_path)
@@ -432,6 +447,10 @@ fn check_and_init_config(force: bool) -> bool {
         telegram_bot_token,
         bot_send_state_changes,
         active_project_id: None,
+        max_concurrent_requests: 20,
+        log_level: "normal".to_string(),
+        global_prompt: None,
+        proxy: None,
     };
 
     match config.save() {
@@ -478,7 +497,8 @@ fn start_daemon() {
 }
 
 async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let ws_url = "ws://127.0.0.1:3000/api/v1/stream";
+    let trace_id = uuid::Uuid::new_v4().to_string();
+    let ws_url = format!("ws://127.0.0.1:3000/api/v1/stream?trace_id={}", trace_id);
     println!("Connecting to Feedback Stream at {} ...", ws_url);
 
     // Get current log level from daemon
@@ -521,7 +541,8 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Now send the HTTP POST request to trigger the execution
     let payload = json!({
         "payload": task,
-        "project_id": project_id
+        "project_id": project_id,
+        "trace_id": trace_id
     });
 
     let res = client
@@ -536,7 +557,7 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let response_body: serde_json::Value = res.json().await?;
-    let trace_id = response_body["trace_id"].as_str().unwrap_or("unknown");
+    let _server_trace_id = response_body["trace_id"].as_str().unwrap_or("unknown");
     println!("Task Dispatched. Trace ID: {}", trace_id);
 
     // Listen for incoming events
@@ -557,11 +578,8 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
                     io::stdout().flush().unwrap();
                 }
 
-                // Handle human intervention
-                if let AgentFeedback::RequireHumanIntervention {
-                    task_id, ..
-                } = &feedback
-                {
+                // Handle human intervention (Approval)
+                if let AgentFeedback::RequireHumanIntervention { task_id, .. } = &feedback {
                     print!("Approve this action? [y/N]: ");
                     io::stdout().flush().unwrap();
                     let mut input = String::new();
@@ -578,6 +596,36 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
                         println!("-> User Decision sent: Approved={}", approved);
                     } else {
                         println!("-> Failed to send decision.");
+                    }
+                }
+
+                // Handle Node Needs Help (Intervention)
+                if let AgentFeedback::NodeNeedsHelp {
+                    task_id, node_id, ..
+                } = &feedback
+                {
+                    print!("\nProvide input for node [{}]: ", node_id);
+                    io::stdout().flush().unwrap();
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    let instruction = input.trim().to_string();
+
+                    if !instruction.is_empty() {
+                        let res = client
+                            .post("http://127.0.0.1:3000/api/v1/intervention")
+                            .json(&json!({
+                                "task_id": task_id,
+                                "node_id": Some(node_id),
+                                "instruction": instruction
+                            }))
+                            .send()
+                            .await?;
+
+                        if res.status().is_success() {
+                            println!("-> Response sent to agent.");
+                        } else {
+                            println!("-> Failed to send response.");
+                        }
                     }
                 }
 

@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telos Trace Viewer</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1e1e1e; color: #d4d4d4; padding: 20px; }
+        .event { border-bottom: 1px solid #333; padding: 10px 0; }
+        .header { cursor: pointer; display: flex; justify-content: space-between; font-weight: bold; color: #569cd6; }
+        .header:hover { color: #9cdcfe; }
+        .details { display: none; padding: 10px; background: #252526; margin-top: 10px; border-radius: 4px; overflow-x: auto; white-space: pre-wrap; font-family: monospace; font-size: 13px; }
+        .type-llm { color: #c586c0; }
+        .type-tool { color: #ce9178; }
+    </style>
+</head>
+<body>
+    <div style="display:flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 20px;">
+        <h1 style="margin:0;">Telos Trace Viewer</h1>
+        <button onclick="fetchTraces()" style="background:#0e639c; color:white; border:none; padding:8px 16px; border-radius:4px; cursor:pointer;">Refresh</button>
+    </div>
+    <div id="traces">Loading...</div>
+    <script>
+        async function fetchTraces() {
+            try {
+                const res = await fetch('/api/v1/traces');
+                const data = await res.json();
+                const container = document.getElementById('traces');
+                container.innerHTML = '';
+                
+                if (!data.traces || data.traces.length === 0) {
+                    container.innerHTML = '<p>No traces found in current active run.</p>';
+                    return;
+                }
+                
+                data.traces.slice().reverse().forEach((fb, i) => {
+                    if (fb.type !== "Trace") return;
+                    const log = fb.trace;
+                    const el = document.createElement('div');
+                    el.className = 'event';
+                    
+                    let title = '';
+                    let detailsObj = {};
+                    let typeClass = '';
+                    
+                    if (log.LlmCall) {
+                        title = `[${fb.node_id}] LLM Call`;
+                        typeClass = 'type-llm';
+                        detailsObj = log.LlmCall;
+                    } else if (log.ToolCall) {
+                        title = `[${fb.node_id}] Tool Call: ${log.ToolCall.name}`;
+                        typeClass = 'type-tool';
+                        detailsObj = log.ToolCall;
+                    }
+                    
+                    el.innerHTML = `
+                        <div class="header ${typeClass}" onclick="document.getElementById('det-${i}').style.display = document.getElementById('det-${i}').style.display === 'block' ? 'none' : 'block'">
+                            <span>${title}</span>
+                            <span style="color:#808080; font-size: 12px; font-weight: normal;">Task: ${fb.task_id}</span>
+                        </div>
+                        <div id="det-${i}" class="details">${JSON.stringify(detailsObj, null, 2)}</div>
+                    `;
+                    container.appendChild(el);
+                });
+            } catch (e) {
+                console.error(e);
+                document.getElementById('traces').innerHTML = '<p>Error loading traces.</p>';
+            }
+        }
+        fetchTraces();
+        setInterval(fetchTraces, 3000); // Poll every 3 seconds
+    </script>
+</body>
+</html>

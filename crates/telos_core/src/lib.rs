@@ -1,5 +1,10 @@
-pub mod project;
+#[cfg(feature = "full")]
 pub mod config;
+#[cfg(feature = "full")]
+pub mod project;
+
+pub mod agent_traits;
+
 // --- Core Primitives shared across Telos modules ---
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,18 +19,18 @@ pub struct NodeResult {
     pub next_routing_hint: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum NodeStatus {
     Pending,
     Running,
     Completed,
     Failed,
+    WaitingForInput,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RiskLevel {
+    #[default]
     Normal,
     HighRisk,
 }
@@ -37,7 +42,379 @@ pub enum NodeError {
     DependencyConflict,
 }
 
+// ============================================================================
+// Sub-DAG Primitives for Advanced Agentic Decompositions
+// ============================================================================
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubGraphNode {
+    pub id: String,
+    pub agent_type: String, // e.g., "coder", "reviewer", "tester"
+    pub task: String,
+    #[serde(default)]
+    pub schema_payload: String, // specific JSON payload the worker expects
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubGraphEdge {
+    pub from: String,
+    pub to: String,
+    pub dep_type: DependencyType,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentSubGraph {
+    pub nodes: Vec<SubGraphNode>,
+    pub edges: Vec<SubGraphEdge>,
+}
+
+// ============================================================================
+// Agent Node Protocol - Structured Input/Output for all node types
+// ============================================================================
+
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentInput {
+    /// 节点ID
+    pub node_id: String,
+    /// 任务描述（来自 Planner）
+    pub task: String,
+    /// 来自上游依赖的输出（key = dependency node ID）
+    #[serde(default)]
+    pub dependencies: HashMap<String, AgentOutput>,
+    /// 节点特定的 JSON 负载负载（可选）
+    #[serde(default)]
+    pub schema_payload: Option<String>,
+    /// 注入的长期记忆事实文本（可选）
+    #[serde(default)]
+    pub memory_context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum TraceLog {
+    LlmCall {
+        request: serde_json::Value,
+        response: serde_json::Value,
+    },
+    ToolCall {
+        name: String,
+        params: serde_json::Value,
+        result: serde_json::Value,
+    },
+}
+
+/// Agent 节点输出
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentOutput {
+    /// 是否成功完成
+    pub success: bool,
+    /// 输出数据（成功时有值）
+    pub output: Option<serde_json::Value>,
+    /// 动态子图定义（由ArchitectAgent生成）
+    pub sub_graph: Option<AgentSubGraph>,
+    /// 错误信息（失败时有值）
+    pub error: Option<AgentErrorDetail>,
+    /// 请求帮助（无法自己解决时）
+    pub needs_help: Option<HelpRequest>,
+    /// 追踪日志
+    #[serde(default)]
+    pub trace_logs: Vec<TraceLog>,
+}
+
+impl AgentOutput {
+    /// 创建成功的输出
+    pub fn success(output: serde_json::Value) -> Self {
+        Self {
+            success: true,
+            output: Some(output),
+            sub_graph: None,
+            error: None,
+            needs_help: None,
+            trace_logs: vec![],
+        }
+    }
+
+    /// 创建带子图的输出（Architect专门使用）
+    pub fn with_subgraph(output: serde_json::Value, sub_graph: AgentSubGraph) -> Self {
+        Self {
+            success: true,
+            output: Some(output),
+            sub_graph: Some(sub_graph),
+            error: None,
+            needs_help: None,
+            trace_logs: vec![],
+        }
+    }
+
+    /// 创建失败的输出
+    pub fn failure(error_type: &str, message: &str) -> Self {
+        Self {
+            success: false,
+            output: None,
+            sub_graph: None,
+            error: Some(AgentErrorDetail::permanent(error_type, message, ErrorLayer::Agent)),
+            needs_help: None,
+            trace_logs: vec![],
+        }
+    }
+
+    /// 创建带严重程度的失败输出
+    pub fn failure_with_severity(
+        error_type: &str,
+        message: &str,
+        severity: ErrorSeverity,
+        layer: ErrorLayer,
+    ) -> Self {
+        Self {
+            success: false,
+            output: None,
+            sub_graph: None,
+            error: Some(AgentErrorDetail {
+                error_type: error_type.to_string(),
+                message: message.to_string(),
+                technical_detail: None,
+                severity,
+                layer,
+                retry_suggested: matches!(severity, ErrorSeverity::Transient),
+            }),
+            needs_help: None,
+            trace_logs: vec![],
+        }
+    }
+
+    /// 从 GatewayError 创建失败输出
+    pub fn from_gateway_error(
+        error_type: &str,
+        user_message: &str,
+        technical_detail: &str,
+        retry_suggested: bool,
+    ) -> Self {
+        let severity = if retry_suggested {
+            ErrorSeverity::Transient
+        } else {
+            ErrorSeverity::Permanent
+        };
+        Self {
+            success: false,
+            output: None,
+            sub_graph: None,
+            error: Some(AgentErrorDetail {
+                error_type: error_type.to_string(),
+                message: user_message.to_string(),
+                technical_detail: Some(technical_detail.to_string()),
+                severity,
+                layer: ErrorLayer::Gateway,
+                retry_suggested,
+            }),
+            needs_help: None,
+            trace_logs: vec![],
+        }
+    }
+
+    /// 创建请求帮助的输出
+    pub fn help(help_type: &str, detail: &str, suggestions: Vec<String>) -> Self {
+        Self {
+            success: false,
+            output: None,
+            sub_graph: None,
+            error: None,
+            needs_help: Some(HelpRequest {
+                help_type: help_type.to_string(),
+                detail: detail.to_string(),
+                suggestions,
+            }),
+            trace_logs: vec![],
+        }
+    }
+
+    /// Add a trace log to this output
+    pub fn with_trace(mut self, trace: TraceLog) -> Self {
+        self.trace_logs.push(trace);
+        self
+    }
+
+    /// 从旧版 NodeResult 转换（向后兼容）
+    pub fn from_node_result(result: &NodeResult) -> Self {
+        let output_str = String::from_utf8_lossy(&result.output_data);
+        Self {
+            success: true,
+            output: Some(serde_json::json!({ "text": output_str })),
+            sub_graph: None,
+            error: None,
+            needs_help: None,
+            trace_logs: vec![],
+        }
+    }
+
+    /// 转换为旧版 NodeResult（向后兼容）
+    pub fn to_node_result(&self) -> NodeResult {
+        let output_data = if let Some(ref output) = self.output {
+            output.to_string().into_bytes()
+        } else if let Some(ref error) = self.error {
+            error.message.clone().into_bytes()
+        } else if let Some(ref help) = self.needs_help {
+            format!("Help needed: {} - {}", help.help_type, help.detail).into_bytes()
+        } else {
+            vec![]
+        };
+        NodeResult {
+            output_data,
+            extracted_knowledge: None,
+            next_routing_hint: None,
+        }
+    }
+}
+
+// ============================================================================
+// 错误分类系统 - 分层异常处理
+// ============================================================================
+
+/// 错误严重程度
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ErrorSeverity {
+    /// 临时性错误，可自动重试
+    Transient,
+    /// 永久性错误，需人工干预
+    Permanent,
+    /// 致命错误，应立即停止任务
+    Fatal,
+}
+
+impl Default for ErrorSeverity {
+    fn default() -> Self {
+        Self::Transient
+    }
+}
+
+/// 错误来源层级
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ErrorLayer {
+    Network,
+    Provider,
+    Gateway,
+    Agent,
+    Dag,
+    WebSocket,
+}
+
+impl Default for ErrorLayer {
+    fn default() -> Self {
+        Self::Agent
+    }
+}
+
+/// 错误详情（增强版）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentErrorDetail {
+    /// 错误类型标识
+    pub error_type: String,
+    /// 用户友好的错误消息
+    pub message: String,
+    /// 技术细节（仅用于调试）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub technical_detail: Option<String>,
+    /// 错误严重程度
+    #[serde(default)]
+    pub severity: ErrorSeverity,
+    /// 错误来源层级
+    #[serde(default)]
+    pub layer: ErrorLayer,
+    /// 是否建议重试
+    pub retry_suggested: bool,
+}
+
+impl AgentErrorDetail {
+    /// 创建临时性错误（可重试）
+    pub fn transient(error_type: &str, message: &str, layer: ErrorLayer) -> Self {
+        Self {
+            error_type: error_type.to_string(),
+            message: message.to_string(),
+            technical_detail: None,
+            severity: ErrorSeverity::Transient,
+            layer,
+            retry_suggested: true,
+        }
+    }
+
+    /// 创建永久性错误（需人工干预）
+    pub fn permanent(error_type: &str, message: &str, layer: ErrorLayer) -> Self {
+        Self {
+            error_type: error_type.to_string(),
+            message: message.to_string(),
+            technical_detail: None,
+            severity: ErrorSeverity::Permanent,
+            layer,
+            retry_suggested: false,
+        }
+    }
+
+    /// 创建致命错误（立即停止）
+    pub fn fatal(error_type: &str, message: &str, layer: ErrorLayer) -> Self {
+        Self {
+            error_type: error_type.to_string(),
+            message: message.to_string(),
+            technical_detail: None,
+            severity: ErrorSeverity::Fatal,
+            layer,
+            retry_suggested: false,
+        }
+    }
+
+    /// 添加技术细节
+    pub fn with_technical_detail(mut self, detail: impl Into<String>) -> Self {
+        self.technical_detail = Some(detail.into());
+        self
+    }
+
+    /// 检查是否为可重试错误
+    pub fn is_retryable(&self) -> bool {
+        matches!(self.severity, ErrorSeverity::Transient)
+    }
+
+    /// 检查是否为致命错误
+    pub fn is_fatal(&self) -> bool {
+        matches!(self.severity, ErrorSeverity::Fatal)
+    }
+}
+
+/// 帮助请求
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HelpRequest {
+    /// 帮助类型: "missing_tool", "clarification", "permission", etc.
+    pub help_type: String,
+    /// 详细描述
+    pub detail: String,
+    /// 建议的解决方案
+    #[serde(default)]
+    pub suggestions: Vec<String>,
+}
+
+/// 依赖类型
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DependencyType {
+    /// 数据依赖：下游需要上游的输出数据
+    Data,
+    /// 控制依赖：下游只需要上游完成，不需要数据
+    Control,
+}
+
+impl Default for DependencyType {
+    fn default() -> Self {
+        Self::Data
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemContext {
+    pub current_time: String,
+    pub location: String,
+}
+
 pub trait SystemRegistry: Send + Sync {
+    fn get_system_context(&self) -> Option<SystemContext> {
+        None
+    }
     fn get_memory_os(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         None
     }

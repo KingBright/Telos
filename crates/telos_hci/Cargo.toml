@@ -8,5 +8,5 @@ serde = { workspace = true, features = ["derive"] }
 telos_core = { path = "../telos_core" }
 async-trait.workspace = true
 tokio.workspace = true
-uuid.workspace = true
-lru.workspace = true
+uuid = { version = "1.21.0", features = ["v4", "serde"] }
+lru = "0.16.3"

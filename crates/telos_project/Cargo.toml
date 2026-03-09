@@ -7,7 +7,7 @@ edition = "2021"
 telos_core = { path = "../telos_core" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-uuid = { workspace = true }
+uuid = { version = "1.21.0", features = ["v4", "serde"] }
 tokio = { workspace = true }
 dirs = { workspace = true }
 toml = { workspace = true }

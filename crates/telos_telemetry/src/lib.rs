@@ -88,6 +88,125 @@ pub fn init_telemetry(log_dir: &str, file_prefix: &str) -> tracing_appender::non
     guard
 }
 
+/// Initializes a standardized logging subscriber for the Telos system.
+/// This includes:
+/// - Human-readable console output with timestamps
+/// - (Optional) Persistent file logging
+/// - Automatic LogLevel filtering based on `TELOS_LOG_LEVEL` or provided level
+pub fn init_logging(log_level: &str) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
+
+    // Create a formatter with timestamps
+    let fmt = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_file(true)
+        .with_line_number(true);
+
+    // Default to plain text with timestamps
+    fmt.init();
+}
+
+/// A more advanced initialization that supports non-blocking file logging and custom formats.
+pub fn init_standard_logging(
+    log_level: &str,
+    log_dir: Option<&str>,
+    file_prefix: Option<&str>
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{fmt, Registry};
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
+
+    let mut guard = None;
+
+    let registry = Registry::default().with(filter);
+
+    // Console layer
+    let console_layer = fmt::Layer::default()
+        .with_writer(std::io::stderr) // Standard practice to log to stderr
+        .with_ansi(true)
+        .with_target(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339()); // Standard readable timestamps
+
+    let registry = registry.with(console_layer);
+
+    // Optional File layer
+    if let (Some(dir), Some(prefix)) = (log_dir, file_prefix) {
+        // Ensure log directory exists
+        if !std::path::Path::new(dir).exists() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Run cleanup before starting
+        let _ = cleanup_old_logs(dir, 1024 * 1024 * 1024); // 1GB limit
+
+        let file_appender = tracing_appender::rolling::hourly(dir, prefix);
+        let (non_blocking, g) = tracing_appender::non_blocking(file_appender);
+        guard = Some(g);
+
+        let file_layer = fmt::Layer::default()
+            .with_writer(non_blocking)
+            .with_ansi(false) // No colors in files
+            .with_target(true)
+            .with_file(true)
+            .with_line_number(true)
+            .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339());
+
+        registry.with(file_layer).init();
+    } else {
+        registry.init();
+    }
+
+    guard
+}
+
+/// Simple cleanup function to keep log directory under a certain size.
+/// It sorts files by modification time and deletes the oldest ones until under the limit.
+pub fn cleanup_old_logs(dir: &str, max_size_bytes: u64) -> std::io::Result<()> {
+    let path = std::path::Path::new(dir);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let mut files = Vec::new();
+    let mut current_size = 0;
+
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_file() {
+            let modified = metadata.modified()?;
+            files.push((entry.path(), metadata.len(), modified));
+            current_size += metadata.len();
+        }
+    }
+
+    if current_size <= max_size_bytes {
+        return Ok(());
+    }
+
+    // Sort by modified time: oldest first
+    files.sort_by_key(|&(_, _, modified)| modified);
+
+    for (path, size, _) in files {
+        if current_size <= max_size_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            current_size -= size;
+            info!(path = ?path, "Deleted old log file to free up space");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

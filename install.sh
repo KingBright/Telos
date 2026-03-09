@@ -5,15 +5,60 @@ set -e
 echo "Building Telos project..."
 cargo build --release
 
-# 动态获取 cargo 的 target 目录
-TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | \
-    grep -o '"target_directory":"[^"]*"' | \
-    sed 's/"target_directory":"//;s/"//')
+# 动态获取 cargo 的 target 目录（多种方法尝试）
+get_target_dir() {
+    # 方法 1: cargo metadata（最可靠）
+    local dir
+    dir=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | \
+        grep -o '"target_directory":"[^"]*"' | \
+        sed 's/"target_directory":"//;s/"//')
+    if [ -n "$dir" ]; then
+        echo "$dir"
+        return 0
+    fi
+
+    # 方法 2: 全局 cargo config
+    local global_config="$HOME/.cargo/config.toml"
+    if [ -f "$global_config" ]; then
+        dir=$(grep -E '^\s*target-dir\s*=' "$global_config" 2>/dev/null | \
+            sed 's/.*=\s*["\x27]\?//;s/["\x27]\?\s*$//')
+        if [ -n "$dir" ]; then
+            # 处理相对路径
+            if [[ "$dir" != /* ]]; then
+                dir="$(pwd)/$dir"
+            fi
+            echo "$dir"
+            return 0
+        fi
+    fi
+
+    # 方法 3: 本地 .cargo/config.toml
+    local local_config="$(pwd)/.cargo/config.toml"
+    if [ -f "$local_config" ]; then
+        dir=$(grep -E '^\s*target-dir\s*=' "$local_config" 2>/dev/null | \
+            sed 's/.*=\s*["\x27]\?//;s/["\x27]\?\s*$//')
+        if [ -n "$dir" ]; then
+            if [[ "$dir" != /* ]]; then
+                dir="$(pwd)/$dir"
+            fi
+            echo "$dir"
+            return 0
+        fi
+    fi
+
+    # 方法 4: 默认 ./target
+    echo "$(pwd)/target"
+    return 0
+}
+
+TARGET_DIR=$(get_target_dir)
 
 if [ -z "$TARGET_DIR" ]; then
     echo "Error: Failed to determine target directory"
     exit 1
 fi
+
+echo "Target directory: $TARGET_DIR"
 
 OS="$(uname -s)"
 
@@ -36,8 +81,9 @@ mv ~/.cargo/bin/telos_cli ~/.cargo/bin/telos
 
 echo "Installation successful."
 
-CONFIG_FILE="$HOME/.telos_config.toml"
-LOG_DIR="$HOME/.telos_logs"
+CONFIG_FILE="$HOME/.telos/config.toml"
+OLD_CONFIG_FILE="$HOME/.telos_config.toml"
+LOG_DIR="$HOME/.telos/logs"
 mkdir -p "$LOG_DIR"
 
 # Configure auto-start files
@@ -85,7 +131,7 @@ WantedBy=default.target
 EOF
 fi
 
-if [ -f "$CONFIG_FILE" ]; then
+if [ -f "$CONFIG_FILE" ] || [ -f "$OLD_CONFIG_FILE" ]; then
     echo "Configuration found. Starting telos_daemon..."
     if [ "$OS" = "Darwin" ]; then
         launchctl load -w "$PLIST_PATH"

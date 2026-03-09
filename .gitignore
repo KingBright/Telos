@@ -2,3 +2,6 @@
 .fastembed_cache
 .fastembed_cache/
 crates/telos_tooling/.fastembed_cache/
+/tests
+/reports
+/test_traces

@@ -19,7 +19,30 @@ pub struct RedbGraphStore {
 
 impl RedbGraphStore {
     pub fn new(path: &str) -> Result<Self, String> {
-        let db = Database::create(path).map_err(|e| e.to_string())?;
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let mut base_delay_ms = 100;
+
+        let db = loop {
+            match Database::create(path) {
+                Ok(db) => break db,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= max_attempts {
+                        return Err(format!(
+                            "Failed to initialize MemoryOS database at {} after {} attempts: {}",
+                            path, max_attempts, e
+                        ));
+                    }
+                    eprintln!(
+                        "[telos_memory] Database lock at `{}` busy (attempt {}/{}). Retrying in {}ms...",
+                        path, attempts, max_attempts, base_delay_ms
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(base_delay_ms));
+                    base_delay_ms *= 2; // Exponential backoff
+                }
+            }
+        };
 
         let write_txn = db.begin_write().map_err(|e| e.to_string())?;
         {

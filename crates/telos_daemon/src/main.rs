@@ -1,7 +1,7 @@
-use telos_context::ContextManager;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
+        Query,
         State,
     },
     response::IntoResponse,
@@ -12,23 +12,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use telos_context::ContextManager;
 use tokio::sync::Mutex as TokioMutex;
+use tracing::{debug, info, warn, error};
 use uuid::Uuid;
+mod agents;
+pub use agents::*;
 
 // Core Traits and Primitives
 use async_trait::async_trait;
 use telos_context::providers::OpenAiProvider;
-use telos_context::{RaptorContextManager, ScopedContext};
+use telos_context::RaptorContextManager;
 use telos_core::config::TelosConfig;
-use telos_core::{NodeError, NodeResult, SystemRegistry};
-use telos_dag::{ExecutionEngine, NodeMetadata};
-use telos_dag::{ExecutableNode, GraphState, TaskGraph};
+use telos_core::{AgentInput, AgentOutput, SystemRegistry};
+use telos_dag::{ExecutableNode, ExecutionEngine, GraphState, NodeMetadata, TaskGraph};
 use telos_hci::{
-    global_log_level, AgentEvent, AgentFeedback, EventBroker, LogLevel, PlanInfo, PlanNodeInfo,
+    global_log_level, AgentEvent, AgentFeedback, EventBroker, LogLevel,
     TaskSummary, TokioEventBroker,
 };
 use telos_memory::engine::RedbGraphStore;
-use telos_memory::integration::MemoryIntegration;
 use telos_model_gateway::gateway::{GatewayManager, ModelProvider};
 use telos_model_gateway::{Capability, GatewayError, LlmRequest, LlmResponse, ModelGateway};
 use telos_tooling::ToolRegistry;
@@ -41,35 +43,68 @@ struct GatewayAdapter {
 #[async_trait]
 impl ModelProvider for GatewayAdapter {
     async fn generate(&self, req: &LlmRequest) -> Result<LlmResponse, GatewayError> {
-        let prompt = req
-            .messages
-            .last()
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
+        let messages: Vec<serde_json::Value> = req.messages.iter().map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content": m.content
+            })
+        }).collect();
 
-        match self.inner.chat_completion(prompt).await {
-            Ok(content) => Ok(LlmResponse {
-                content,
-                tokens_used: req.budget_limit,
-            }),
+        if let Some(last) = req.messages.last() {
+             info!(
+                "[GatewayAdapter] Calling LLM with {} messages, last message length: {} bytes",
+                messages.len(),
+                last.content.len()
+            );
+        }
+
+        match self.inner.generate_chat(messages).await {
+            Ok(content) => {
+                // Approximate tokens: ~4 chars per token
+                let mut total_len = 0;
+                for m in &req.messages {
+                    total_len += m.content.len();
+                }
+                let estimated_tokens = (total_len + content.len()) / 4;
+                Ok(LlmResponse {
+                    content,
+                    tokens_used: std::cmp::min(estimated_tokens, req.budget_limit),
+                })
+            }
             Err(e) => {
-                let error_msg = e.0.to_lowercase();
+                let error_msg = e.message.to_lowercase();
+
+                // Detect Zhipu API rate limit error (code 1302)
+                if error_msg.contains("\"code\":1302")
+                    || error_msg.contains("rate limit")
+                    || error_msg.contains("频率限制")
+                    || error_msg.contains("429")
+                {
+                    warn!("[GatewayAdapter] API Rate Limit detected: {}", e.message);
+                    Err(GatewayError::TooManyRequests { retry_after_ms: None })
+                }
                 // Detect network-related errors for retry
-                if error_msg.contains("error sending request")
+                else if error_msg.contains("error sending request")
                     || error_msg.contains("connection")
                     || error_msg.contains("timeout")
+                    || error_msg.contains("timedout")  // Rust's TimedOut variant
                     || error_msg.contains("dns")
                     || error_msg.contains("network")
                     || error_msg.contains("socket")
                     || error_msg.contains("http error")
                 {
-                    Err(GatewayError::NetworkError(e.0))
-                } else if error_msg.contains("429") || error_msg.contains("rate limit") {
-                    Err(GatewayError::TooManyRequests)
+                    warn!("[GatewayAdapter] Network error, retrying: {}", e.message);
+                    Err(GatewayError::from_network_error(&e.message))
                 } else if error_msg.contains("503") || error_msg.contains("service unavailable") {
-                    Err(GatewayError::ServiceUnavailable)
+                    warn!("[GatewayAdapter] Service unavailable: {}", e.message);
+                    Err(GatewayError::ServiceUnavailable { estimated_recovery_ms: None })
                 } else {
-                    Err(GatewayError::Other(e.0))
+                    error!("[GatewayAdapter] Other error: {}", e.message);
+                    let is_retryable = e.is_retryable();
+                    Err(GatewayError::Other {
+                        message: e.message,
+                        is_retryable,
+                    })
                 }
             }
         }
@@ -80,6 +115,7 @@ impl ModelProvider for GatewayAdapter {
 struct DaemonRegistry {
     gateway: Arc<GatewayManager>,
     memory_os: Arc<RedbGraphStore>,
+    system_context: Arc<tokio::sync::RwLock<telos_core::SystemContext>>,
 }
 
 impl SystemRegistry for DaemonRegistry {
@@ -90,36 +126,65 @@ impl SystemRegistry for DaemonRegistry {
     fn get_model_gateway(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         Some(self.gateway.clone() as Arc<dyn std::any::Any + Send + Sync>)
     }
+
+    fn get_system_context(&self) -> Option<telos_core::SystemContext> {
+        if let Ok(ctx) = self.system_context.try_read() {
+            Some(telos_core::SystemContext {
+                current_time: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string(),
+                location: ctx.location.clone(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+// 2.5 Node Factory
+struct DaemonNodeFactory {
+    gateway: Arc<GatewayManager>,
+    tool_registry:
+        std::sync::Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
+    tools_dir: String,
+}
+
+impl telos_dag::engine::NodeFactory for DaemonNodeFactory {
+    fn create_node(&self, agent_type: &str, _task: &str) -> Option<Box<dyn ExecutableNode>> {
+        match agent_type {
+            "architect" => Some(Box::new(ArchitectAgent::new(self.gateway.clone())) as Box<dyn ExecutableNode>),
+            "coder" => Some(Box::new(CoderAgent::new(
+                self.gateway.clone(),
+                self.tools_dir.clone(),
+            )) as Box<dyn ExecutableNode>),
+            "reviewer" => Some(Box::new(ReviewAgent::new(self.gateway.clone())) as Box<dyn ExecutableNode>),
+            "tester" => Some(Box::new(TestingAgent::new(self.gateway.clone())) as Box<dyn ExecutableNode>),
+            "researcher" => Some(Box::new(DeepResearchAgent::new(
+                self.gateway.clone(),
+                self.tool_registry.clone(),
+            )) as Box<dyn ExecutableNode>),
+            "general" => Some(Box::new(GeneralAgent::new(
+                self.gateway.clone(),
+                self.tool_registry.clone(),
+                self.tools_dir.clone(),
+            )) as Box<dyn ExecutableNode>),
+            "tool" => Some(Box::new(ToolNode {
+                tool_name: _task.to_string(),
+                tool_registry: self.tool_registry.clone(),
+            }) as Box<dyn ExecutableNode>),
+            _ => None,
+        }
+    }
 }
 
 // 3. Real Executable Node that calls the LLM dynamically
 
 // --- Dynamic DAG Deserialization structs ---
-#[derive(serde::Deserialize, Debug)]
-struct DagEdge {
-    from: String,
-    to: String,
-}
 
-#[derive(serde::Deserialize, Debug)]
-struct DagNode {
-    id: String,
-    task_type: String, // "LLM" or "TOOL"
-    prompt: String,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct DagPlan {
-    tier: Option<String>,
-    reply: Option<String>,
-    nodes: Vec<DagNode>,
-    edges: Vec<DagEdge>,
-}
 
 /// Helper to truncate strings for preview
 fn truncate_for_preview(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len])
+    if s.chars().count() > max_len {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}...", truncated)
     } else {
         s.to_string()
     }
@@ -132,18 +197,34 @@ struct LlmPromptNode {
 
 #[async_trait]
 impl ExecutableNode for LlmPromptNode {
-    async fn execute(
-        &self,
-        _ctx: &ScopedContext,
-        _registry: &dyn SystemRegistry,
-    ) -> Result<NodeResult, NodeError> {
-        let gateway = self.gateway.clone();
+    async fn execute(&self, input: AgentInput, _registry: &dyn SystemRegistry) -> AgentOutput {
+        // Build context with dependencies if any
+        let deps_context = if !input.dependencies.is_empty() {
+            let deps_str = input
+                .dependencies
+                .iter()
+                .map(|(id, out)| {
+                    let output_str = out
+                        .output
+                        .as_ref()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "No output".to_string());
+                    format!("- {}: {}", id, output_str)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\n\nContext from previous steps:\n{}", deps_str)
+        } else {
+            String::new()
+        };
+
+        let full_prompt = format!("{}{}", self.prompt, deps_context);
 
         let request = LlmRequest {
-            session_id: "daemon_session".to_string(),
+            session_id: format!("node_{}", input.node_id),
             messages: vec![telos_model_gateway::Message {
                 role: "user".to_string(),
-                content: self.prompt.clone(),
+                content: full_prompt,
             }],
             required_capabilities: Capability {
                 requires_vision: false,
@@ -152,457 +233,108 @@ impl ExecutableNode for LlmPromptNode {
             budget_limit: 1000,
         };
 
-        match gateway.generate(request).await {
-            Ok(res) => Ok(NodeResult {
-                output_data: res.content.into_bytes(),
-                extracted_knowledge: None,
-                next_routing_hint: None,
-            }),
-            Err(e) => Err(NodeError::ExecutionFailed(format!("{:?}", e))),
-        }
-    }
-}
-
-
-struct ReactNode {
-    prompt: String,
-    gateway: Arc<GatewayManager>,
-    tool_registry: std::sync::Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
-    _tools_dir: String,
-}
-
-#[async_trait]
-impl ExecutableNode for ReactNode {
-    async fn execute(
-        &self,
-        _ctx: &ScopedContext,
-        registry: &dyn SystemRegistry,
-    ) -> Result<NodeResult, NodeError> {
-        let mut loop_count = 0;
-        let mut session_messages = vec![telos_model_gateway::Message {
-            role: "user".to_string(),
-            content: format!("Use ReAct to solve this task. You must output a JSON with either {{ \"action\": \"TOOL_NAME\", \"params\": {{...}} }} to call a tool, or {{ \"final_answer\": \"YOUR_ANSWER\" }}. Task: {}", self.prompt),
-        }];
-
-        while loop_count < 5 {
-            loop_count += 1;
-
-            let req = telos_model_gateway::LlmRequest {
-                session_id: "daemon_react_session".to_string(),
-                messages: session_messages.clone(),
-                required_capabilities: telos_model_gateway::Capability {
-                    requires_vision: false,
-                    strong_reasoning: false,
-                },
-                budget_limit: 1000,
-            };
-
-            let llm_reply = match self.gateway.generate(req).await {
-                Ok(res) => res.content.trim().to_string(),
-                Err(e) => return Err(NodeError::ExecutionFailed(format!("LLM Error: {:?}", e))),
-            };
-
-            let clean_reply = llm_reply.trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```");
-
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(clean_reply) {
-                if let Some(final_ans) = json.get("final_answer").and_then(|v| v.as_str()) {
-                    return Ok(NodeResult {
-                        output_data: final_ans.as_bytes().to_vec(),
-                        extracted_knowledge: None,
-                        next_routing_hint: None,
-                    });
-                } else if let (Some(action), Some(params)) = (json.get("action").and_then(|v| v.as_str()), json.get("params")) {
-                    session_messages.push(telos_model_gateway::Message {
-                        role: "assistant".to_string(),
-                        content: llm_reply.clone(),
-                    });
-
-                    let registry_guard = self.tool_registry.read().await;
-                    let executor = match registry_guard.get_executor(action) {
-                        Some(e) => e,
-                        None => {
-                            session_messages.push(telos_model_gateway::Message {
-                                role: "user".to_string(),
-                                content: format!("Tool {} not found.", action),
-                            });
-                            continue;
-                        }
-                    };
-
-                    match executor.call(params.clone()).await {
-                        Ok(tool_output) => {
-                            // Handle memory tool macros
-                            let tool_output_str = String::from_utf8_lossy(&tool_output).to_string();
-                            let response_content = if let Ok(json_res) = serde_json::from_str::<serde_json::Value>(&tool_output_str) {
-                                if let Some(macro_type) = json_res.get("__macro__").and_then(|m| m.as_str()) {
-                                    match macro_type {
-                                        "memory_recall" => {
-                                            let query = json_res.get("query").and_then(|q| q.as_str()).unwrap_or("");
-                                            if let Some(memory_os_any) = registry.get_memory_os() {
-                                                if let Ok(memory_integration) = memory_os_any.clone().downcast::<telos_memory::engine::RedbGraphStore>() {
-                                                    match memory_integration.retrieve_semantic_facts(query.to_string()).await {
-                                                        Ok(facts) => {
-                                                            if facts.is_empty() {
-                                                                format!("Memory recall: No relevant memories found for '{}'", query)
-                                                            } else {
-                                                                format!("Memory recall for '{}':\n{}", query, facts.join("\n"))
-                                                            }
-                                                        }
-                                                        Err(e) => format!("Memory recall failed: {:?}", e),
-                                                    }
-                                                } else {
-                                                    "Memory system downcast failed".to_string()
-                                                }
-                                            } else {
-                                                "Memory system not available".to_string()
-                                            }
-                                        }
-                                        "memory_store" => {
-                                            let content = json_res.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                                            if let Some(memory_os_any) = registry.get_memory_os() {
-                                                if let Ok(memory_integration) = memory_os_any.clone().downcast::<telos_memory::engine::RedbGraphStore>() {
-                                                    match memory_integration.store_semantic_fact(content.to_string()).await {
-                                                        Ok(_) => format!("Successfully stored in memory: {}", content),
-                                                        Err(e) => format!("Failed to store in memory: {:?}", e),
-                                                    }
-                                                } else {
-                                                    "Memory system downcast failed".to_string()
-                                                }
-                                            } else {
-                                                "Memory system not available".to_string()
-                                            }
-                                        }
-                                        _ => tool_output_str.clone(),
-                                    }
-                                } else {
-                                    tool_output_str.clone()
-                                }
-                            } else {
-                                tool_output_str.clone()
-                            };
-
-                            session_messages.push(telos_model_gateway::Message {
-                                role: "user".to_string(),
-                                content: format!("Tool output: {}", response_content),
-                            });
-                        }
-                        Err(e) => {
-                            session_messages.push(telos_model_gateway::Message {
-                                role: "user".to_string(),
-                                content: format!("Tool execution failed: {:?}", e),
-                            });
-                        }
-                    }
-                } else {
-                    return Ok(NodeResult {
-                        output_data: clean_reply.as_bytes().to_vec(),
-                        extracted_knowledge: None,
-                        next_routing_hint: None,
-                    });
-                }
-            } else {
-                return Ok(NodeResult {
-                    output_data: clean_reply.as_bytes().to_vec(),
-                    extracted_knowledge: None,
-                    next_routing_hint: None,
-                });
-            }
-        }
-
-        Ok(NodeResult {
-            output_data: b"Max ReAct loop reached".to_vec(),
-            extracted_knowledge: None,
-            next_routing_hint: None,
-        })
-    }
-}
-
-struct WasmToolNode {
-    tool_name: String,
-    tool_registry:
-        std::sync::Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
-    _tools_dir: String,
-}
-
-#[async_trait]
-impl ExecutableNode for WasmToolNode {
-    async fn execute(
-        &self,
-        _ctx: &ScopedContext,
-        _registry: &dyn SystemRegistry,
-    ) -> Result<NodeResult, NodeError> {
-        let registry_guard = self.tool_registry.read().await;
-
-        let discovered_tools = registry_guard.discover_tools(&self.tool_name, 1);
-        if discovered_tools.is_empty() {
-            return Err(NodeError::ExecutionFailed(format!(
-                "No suitable tool found for intent: {}",
-                self.tool_name
-            )));
-        }
-
-        let tool_schema = &discovered_tools[0];
-        let tool_name = &tool_schema.name;
-        println!("[Daemon] Selected tool: {}", tool_name);
-
-        let executor = registry_guard.get_executor(tool_name).ok_or_else(|| {
-            NodeError::ExecutionFailed(format!("Tool executor not found for {}", tool_name))
-        })?;
-
-        // Extract parameters from LLM dynamically based on the tool schema and the node's prompt
-        let system_registry = _registry;
-        let gateway = system_registry
-            .get_model_gateway()
-            .and_then(|g| {
-                g.downcast::<telos_model_gateway::gateway::GatewayManager>()
-                    .ok()
-            })
-            .ok_or_else(|| {
-                NodeError::ExecutionFailed(
-                    "Failed to get GatewayManager for tool parameter extraction".into(),
-                )
-            })?;
-
-        let prompt = format!(
-            "You are a tool execution planner. Extract the necessary parameters for the tool '{}' based on the following task.\n\
-            Task: {}\n\
-            Tool Schema: {}\n\n\
-            Respond strictly with a JSON object containing the parameters. Do not include markdown blocks.",
-            tool_name,
-            self.tool_name,
-            serde_json::to_string_pretty(&tool_schema.parameters_schema.raw_schema).unwrap()
-        );
-
-        let req = telos_model_gateway::LlmRequest {
-            session_id: "daemon_tool_param_extractor".to_string(),
-            messages: vec![telos_model_gateway::Message {
-                role: "user".to_string(),
-                content: prompt,
-            }],
-            required_capabilities: telos_model_gateway::Capability {
-                requires_vision: false,
-                strong_reasoning: false,
+        match self.gateway.generate(request.clone()).await {
+            Ok(res) => {
+                let trace = telos_core::TraceLog::LlmCall {
+                    request: serde_json::to_value(&request).unwrap_or_else(|_| serde_json::json!({ "error": "failed to serialize request" })),
+                    response: serde_json::to_value(&res).unwrap_or_else(|_| serde_json::json!({ "error": "failed to serialize response" })),
+                };
+                AgentOutput::success(serde_json::json!({
+                    "text": res.content
+                })).with_trace(trace)
             },
-            budget_limit: 1000,
-        };
-
-        let params_json_str = match gateway.generate(req).await {
-            Ok(res) => res
-                .content
-                .trim()
-                .trim_start_matches("```json")
-                .trim_start_matches("```")
-                .trim_end_matches("```")
-                .to_string(),
             Err(e) => {
-                return Err(NodeError::ExecutionFailed(format!(
-                    "Failed to extract tool parameters via LLM: {:?}",
-                    e
-                )))
+                // 使用用户友好的错误消息
+                AgentOutput::from_gateway_error(
+                    "LLMError",
+                    &e.to_user_message(),
+                    &format!("{:?}", e),
+                    e.is_retryable(),
+                )
             }
-        };
-
-        let params: serde_json::Value = serde_json::from_str(&params_json_str).map_err(|e| {
-            NodeError::ExecutionFailed(format!(
-                "LLM returned invalid JSON for tool parameters: {}",
-                e
-            ))
-        })?;
-
-        println!("[Daemon] Extracted Tool Parameters: {}", params);
-
-        match executor.call(params).await {
-            Ok(output_data) => {
-                // Intercept __macro__: register_tool to fully support self-upgrading
-                if let Ok(json_res) = serde_json::from_slice::<serde_json::Value>(&output_data) {
-                    if json_res.get("__macro__").and_then(|m| m.as_str()) == Some("register_tool") {
-                        if let (Some(wasm_path), Some(schema_val)) = (
-                            json_res.get("wasm_path").and_then(|p| p.as_str()),
-                            json_res.get("schema"),
-                        ) {
-                            if let Ok(wasm_bytes) = std::fs::read(wasm_path) {
-                                let config_sb = telos_tooling::sandbox::SandboxConfig::default();
-                                // We spawn blocking to compile the new Wasm safely
-                                let wasm_bytes_clone = wasm_bytes.clone();
-                                let executor_res = tokio::task::spawn_blocking(move || {
-                                    telos_tooling::sandbox::WasmExecutor::new(
-                                        wasm_bytes_clone,
-                                        config_sb,
-                                    )
-                                })
-                                .await
-                                .unwrap();
-
-                                match executor_res {
-                                    Ok(wasm_executor) => {
-                                        if let Ok(schema) =
-                                            serde_json::from_value::<telos_tooling::ToolSchema>(
-                                                schema_val.clone(),
-                                            )
-                                        {
-                                            // Persist the tool to disk for future runs
-                                            let target_dir = std::path::Path::new(&self._tools_dir);
-                                            if !target_dir.exists() {
-                                                let _ = std::fs::create_dir_all(target_dir);
-                                            }
-                                            let safe_name = schema
-                                                .name
-                                                .replace(|c: char| !c.is_alphanumeric(), "_");
-                                            let dest_wasm =
-                                                target_dir.join(format!("{}.wasm", safe_name));
-                                            let dest_json =
-                                                target_dir.join(format!("{}.json", safe_name));
-
-                                            if let Err(e) = std::fs::copy(wasm_path, &dest_wasm) {
-                                                println!("[Daemon] Warning: Failed to persist Wasm binary: {}", e);
-                                            }
-                                            if let Ok(schema_str) =
-                                                serde_json::to_string_pretty(&schema)
-                                            {
-                                                if let Err(e) =
-                                                    std::fs::write(&dest_json, schema_str)
-                                                {
-                                                    println!("[Daemon] Warning: Failed to persist Wasm Schema JSON: {}", e);
-                                                }
-                                            }
-
-                                            // Drop read lock
-                                            drop(registry_guard);
-                                            let mut write_guard = self.tool_registry.write().await;
-                                            write_guard.register_tool(
-                                                schema,
-                                                Some(std::sync::Arc::new(wasm_executor)),
-                                            );
-                                            println!("[Daemon] Successfully registered new Wasm Tool from path: {}", wasm_path);
-                                            return Ok(NodeResult {
-                                                output_data: format!(
-                                                    "Tool Registration Successful: {}",
-                                                    wasm_path
-                                                )
-                                                .into_bytes(),
-                                                extracted_knowledge: None,
-                                                next_routing_hint: None,
-                                            });
-                                        }
-                                    }
-                                    Err(e) => {
-                                        return Err(NodeError::ExecutionFailed(format!(
-                                            "Failed to compile newly registered Wasm tool: {}",
-                                            e
-                                        )))
-                                    }
-                                }
-                            } else {
-                                return Err(NodeError::ExecutionFailed(format!(
-                                    "Failed to read newly generated Wasm file at path: {}",
-                                    wasm_path
-                                )));
-                            }
-                        }
-                    } else if json_res.get("__macro__").and_then(|m| m.as_str()) == Some("memory_recall") {
-                        // Handle memory_recall macro
-                        let query = json_res.get("query").and_then(|q| q.as_str()).unwrap_or("");
-                        let system_registry = _registry;
-                        if let Some(memory_os_any) = system_registry.get_memory_os() {
-                            if let Ok(memory_integration) = memory_os_any.clone().downcast::<telos_memory::engine::RedbGraphStore>() {
-                                match memory_integration.retrieve_semantic_facts(query.to_string()).await {
-                                    Ok(facts) => {
-                                        let result = if facts.is_empty() {
-                                            format!("No relevant memories found for '{}'", query)
-                                        } else {
-                                            format!("Memories for '{}':\n{}", query, facts.join("\n"))
-                                        };
-                                        return Ok(NodeResult {
-                                            output_data: result.into_bytes(),
-                                            extracted_knowledge: None,
-                                            next_routing_hint: None,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        return Ok(NodeResult {
-                                            output_data: format!("Memory recall failed: {:?}", e).into_bytes(),
-                                            extracted_knowledge: None,
-                                            next_routing_hint: None,
-                                        });
-                                    }
-                                }
-                            } else {
-                                return Ok(NodeResult {
-                                    output_data: b"Memory system downcast failed".to_vec(),
-                                    extracted_knowledge: None,
-                                    next_routing_hint: None,
-                                });
-                            }
-                        } else {
-                            return Ok(NodeResult {
-                                output_data: b"Memory system not available".to_vec(),
-                                extracted_knowledge: None,
-                                next_routing_hint: None,
-                            });
-                        }
-                    } else if json_res.get("__macro__").and_then(|m| m.as_str()) == Some("memory_store") {
-                        // Handle memory_store macro
-                        let content = json_res.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        let system_registry = _registry;
-                        if let Some(memory_os_any) = system_registry.get_memory_os() {
-                            if let Ok(memory_integration) = memory_os_any.clone().downcast::<telos_memory::engine::RedbGraphStore>() {
-                                match memory_integration.store_semantic_fact(content.to_string()).await {
-                                    Ok(_) => {
-                                        return Ok(NodeResult {
-                                            output_data: format!("Successfully stored in memory: {}", content).into_bytes(),
-                                            extracted_knowledge: None,
-                                            next_routing_hint: None,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        return Ok(NodeResult {
-                                            output_data: format!("Failed to store in memory: {:?}", e).into_bytes(),
-                                            extracted_knowledge: None,
-                                            next_routing_hint: None,
-                                        });
-                                    }
-                                }
-                            } else {
-                                return Ok(NodeResult {
-                                    output_data: b"Memory system downcast failed".to_vec(),
-                                    extracted_knowledge: None,
-                                    next_routing_hint: None,
-                                });
-                            }
-                        } else {
-                            return Ok(NodeResult {
-                                output_data: b"Memory system not available".to_vec(),
-                                extracted_knowledge: None,
-                                next_routing_hint: None,
-                            });
-                        }
-                    }
-                }
-
-                Ok(NodeResult {
-                    output_data,
-                    extracted_knowledge: None,
-                    next_routing_hint: None,
-                })
-            }
-            Err(e) => Err(NodeError::ExecutionFailed(format!(
-                "Tool Execution failed: {:?}",
-                e
-            ))),
         }
     }
 }
+
+
+
+struct ToolNode {
+    tool_name: String,
+    tool_registry: Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
+}
+
+#[async_trait]
+impl ExecutableNode for ToolNode {
+    async fn execute(&self, input: AgentInput, _registry: &dyn SystemRegistry) -> AgentOutput {
+        let registry_guard = self.tool_registry.read().await;
+        let executor = match registry_guard.get_executor(&self.tool_name) {
+            Some(e) => e,
+            None => {
+                return AgentOutput::failure(
+                    "ToolNotFoundError",
+                    &format!("Tool '{}' not found in registry", self.tool_name),
+                );
+            }
+        };
+        drop(registry_guard);
+
+        // Tool input is expected to be a JSON object in schema_payload
+        let params: serde_json::Value = if let Some(ref payload) = input.schema_payload {
+            match serde_json::from_str(payload) {
+                Ok(p) => p,
+                Err(e) => {
+                    return AgentOutput::failure(
+                        "PayloadParseError",
+                        &format!("Failed to parse tool payload: {}", e),
+                    );
+                }
+            }
+        } else {
+            serde_json::json!({})
+        };
+
+        info!("[ToolNode] 🛠️  Executing tool: {} with params: {}", self.tool_name, params);
+
+        match executor.call(params.clone()).await {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                let (json_result, is_json) = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    (json, true)
+                } else {
+                    (serde_json::json!({ "text": text.clone() }), false)
+                };
+
+                let trace = telos_core::TraceLog::ToolCall {
+                    name: self.tool_name.clone(),
+                    params: params.clone(),
+                    result: json_result.clone(),
+                };
+
+                if is_json {
+                    AgentOutput::success(json_result).with_trace(trace)
+                } else {
+                    AgentOutput::success(serde_json::json!({ "text": text })).with_trace(trace)
+                }
+            }
+            Err(e) => AgentOutput::failure("ToolExecutionError", &format!("{:?}", e)),
+        }
+    }
+}
+
+
 
 // 4. Server App State
 #[derive(Clone)]
 struct AppState {
     broker: Arc<TokioEventBroker>,
+    recent_traces: Arc<tokio::sync::RwLock<std::collections::VecDeque<telos_hci::AgentFeedback>>>,
 }
 
 #[derive(Deserialize)]
 struct RunRequest {
     payload: String,
     project_id: Option<String>,
+    trace_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -641,11 +373,35 @@ struct SetLogLevelResponse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Initializing Telos Daemon...");
+    // 1. Initialize logging with timestamps, rotation, and size limits
+    let log_dir = TelosConfig::logs_dir();
+    let log_dir_str = log_dir.to_string_lossy();
+    
+    let _guard = telos_telemetry::init_standard_logging(
+        "info", // Default level, will be filtered by EnvFilter if TELOS_LOG_LEVEL is set
+        Some(&log_dir_str),
+        Some("daemon.log")
+    );
+
+    debug!("Initializing Telos Daemon...");
 
     let config = TelosConfig::load().expect(
         "Failed to load configuration. Please run `telos cli` first to complete initialization.",
     );
+
+    // cleanup orphaned memory files from previous PID-suffix fallbacks
+    let _ = TelosConfig::cleanup_orphaned_memory_files();
+
+    // Set proxy environment variable from config if configured
+    if let Some(ref proxy) = config.proxy {
+        std::env::set_var("TELOS_PROXY", proxy);
+        info!("[Daemon] Proxy configured: {}", proxy);
+    }
+
+    // Initialize global log level from config
+    let initial_log_level = LogLevel::from_string(&config.log_level);
+    global_log_level().set(initial_log_level);
+    debug!("Log level set to: {:?}", initial_log_level);
 
     // --- WIRING ---
     let (broker, mut event_rx) = TokioEventBroker::new(1000, 1000, 1024);
@@ -660,7 +416,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway_adapter = Arc::new(GatewayAdapter {
         inner: openai_provider.clone(),
     });
-    let gateway = Arc::new(GatewayManager::new(gateway_adapter, 10000, 10.0));
+    // Use max_concurrent_requests from config (0 = unlimited, default 20)
+    let gateway = Arc::new(GatewayManager::new(
+        gateway_adapter,
+        config.max_concurrent_requests,
+    ));
 
     // Initialize VectorToolRegistry with Native Tools
     let mut tool_registry = telos_tooling::retrieval::VectorToolRegistry::new_keyword_only();
@@ -716,11 +476,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         telos_tooling::native::WebSearchTool::schema(),
         Some(std::sync::Arc::new(telos_tooling::native::WebSearchTool)),
     );
+    tool_registry.register_tool(
+        telos_tooling::native::WebScrapeTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::WebScrapeTool)),
+    );
+    // Register utility tools
+    tool_registry.register_tool(
+        telos_tooling::native::GetTimeTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::GetTimeTool)),
+    );
     // Register LSP tool for code navigation
     tool_registry.register_tool(
         telos_tooling::native::LspTool::schema(),
         Some(std::sync::Arc::new(telos_tooling::native::LspTool)),
     );
+    // Register Web Search tool
+    tool_registry.register_tool(
+        telos_tooling::native::WebSearchTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::WebSearchTool)),
+    );
+
+    // Wrap registry in Arc<RwLock<...>> early so we can pass it to WASM executors
+    let tool_registry = std::sync::Arc::new(tokio::sync::RwLock::new(tool_registry));
 
     // --- Auto-Load Persisted Tools on Startup ---
     let target_dir = std::path::Path::new(&config.tools_dir);
@@ -733,32 +510,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Ok(schema) =
                             serde_json::from_str::<telos_tooling::ToolSchema>(&json_content)
                         {
-                            let wasm_path = path.with_extension("wasm");
-                            if wasm_path.exists() {
-                                if let Ok(wasm_bytes) = std::fs::read(&wasm_path) {
-                                    let sb_config =
-                                        telos_tooling::sandbox::SandboxConfig::default();
-                                    let executor_res = tokio::task::block_in_place(|| {
-                                        telos_tooling::sandbox::WasmExecutor::new(
-                                            wasm_bytes, sb_config,
-                                        )
-                                    });
+                            let script_path = path.with_extension("rhai");
+                            if script_path.exists() {
+                                if let Ok(script_code) = std::fs::read_to_string(&script_path) {
+                                    let sandbox = std::sync::Arc::new(telos_tooling::ScriptSandbox::new());
+                                    let native_registry = telos_tooling::wrap_tool_registry(tool_registry.clone());
+                                    let script_executor = telos_tooling::ScriptExecutor::new(script_code, sandbox)
+                                        .with_native_tools(native_registry);
 
-                                    if let Ok(wasm_executor) = executor_res {
-                                        tool_registry.register_tool(
-                                            schema,
-                                            Some(std::sync::Arc::new(wasm_executor)),
-                                        );
-                                        println!(
-                                            "[Daemon] Auto-loaded persisted tool from {:?}",
-                                            wasm_path.file_name().unwrap()
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "[Daemon] Failed to compile persisted tool at {:?}",
-                                            wasm_path
-                                        );
-                                    }
+                                    let mut guard = tool_registry.write().await;
+                                    guard.register_tool(
+                                        schema,
+                                        Some(std::sync::Arc::new(script_executor)),
+                                    );
+                                    drop(guard);
+                                    debug!(
+                                        "[Daemon] Auto-loaded persisted Rhai tool from {:?}",
+                                        script_path.file_name().unwrap()
+                                    );
                                 }
                             }
                         }
@@ -768,21 +537,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let tool_registry = std::sync::Arc::new(tokio::sync::RwLock::new(tool_registry));
+    // Initialize MemoryOS - we no longer use PID-suffix fallbacks to avoid file sprawl.
+    let memory_os_instance = match RedbGraphStore::new(&config.db_path) {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            error!("[Daemon] Failed to initialize MemoryOS database at {}: {}. If the database is locked by another instance, please close it first.", config.db_path, e);
+            panic!("MemoryOS initialization failed");
+        }
+    };
+    let system_context = Arc::new(tokio::sync::RwLock::new(telos_core::SystemContext {
+        current_time: String::new(),
+        location: "Unknown Location".to_string(),
+    }));
 
-    let memory_os_instance = Arc::new(RedbGraphStore::new(&config.db_path).expect("Failed to init MemoryOS database"));
+    let sys_ctx_clone = system_context.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok(resp) = reqwest::get("http://ip-api.com/json/").await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let loc = format!("{}, {}, {}", 
+                        json.get("city").and_then(|v| v.as_str()).unwrap_or("Unknown City"),
+                        json.get("regionName").and_then(|v| v.as_str()).unwrap_or("Unknown Region"),
+                        json.get("country").and_then(|v| v.as_str()).unwrap_or("Unknown Country")
+                    );
+                    let mut w = sys_ctx_clone.write().await;
+                    w.location = loc;
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+        }
+    });
+
     let registry = Arc::new(DaemonRegistry {
         gateway: gateway.clone(),
         memory_os: memory_os_instance.clone(),
+        system_context,
     });
-    let _memory =
-        Arc::new(RedbGraphStore::new(&config.db_path).expect("Failed to init MemoryOS database"));
+    // Reuse the same memory instance instead of creating a duplicate
+    let _memory = memory_os_instance.clone();
     // Using cloud embeddings as configured
     let context_manager = Arc::new(RaptorContextManager::new(
         Arc::new(openai_provider.clone()),
         Arc::new(openai_provider.clone()),
         Some(memory_os_instance.clone() as Arc<dyn telos_memory::integration::MemoryIntegration>),
     ));
+
+    // Initialize Evolution Evaluator
+    let evaluator = Arc::new(
+        telos_evolution::evaluator::ActorCriticEvaluator::new()
+            .expect("Failed to initialize ActorCriticEvaluator"),
+    );
 
     // --- BACKGROUND EVENT LOOP ---
     let broker_bg = Arc::clone(&broker);
@@ -793,9 +597,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paused_tasks: Arc<TokioMutex<HashMap<String, String>>> =
         Arc::new(TokioMutex::new(HashMap::new()));
     let paused_tasks_bg = paused_tasks.clone();
+    let wakeup_map: Arc<
+        TokioMutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<(String, String, String)>>>,
+    > = Arc::new(TokioMutex::new(HashMap::new()));
+    let wakeup_map_bg = wakeup_map.clone();
+
+    // --- EVOLUTION EVALUATION WORKER ---
+    let (distillation_tx, mut distillation_rx) = tokio::sync::mpsc::unbounded_channel::<telos_evolution::ExecutionTrace>();
+    let evaluator_worker = evaluator.clone();
+    let registry_worker = registry.clone();
+    
+    tokio::spawn(async move {
+        debug!("[Daemon] 🧵 Evolution worker thread started, listening for traces...");
+        use telos_evolution::Evaluator;
+        use telos_memory::integration::MemoryIntegration;
+
+        while let Some(trace) = distillation_rx.recv().await {
+            let trace_id = trace.task_id.clone();
+            
+            // Log extraction attempt
+            debug!("[Daemon] 🧠 Evolution worker processing trace {}...", trace_id);
+            
+            // Distill Experience asynchronously (CPU/Network bound)
+            if let Some(skill) = evaluator_worker.distill_experience(&trace).await {
+                info!("[Daemon] 🧠 Telos distilled a new SynthesizedSkill from task {}!", trace_id);
+                
+                let skill_string = format!(
+                    "Distilled Skill for task '{}':\nTrigger: {}\nCode:\n{}",
+                    trace.steps.first().map(|s| s.input_data.as_str()).unwrap_or("Unknown"),
+                    skill.trigger_condition,
+                    skill.executable_code
+                );
+                
+                // Save to Long Term Memory
+                let _ = registry_worker.memory_os.store_semantic_fact(skill_string).await;
+                debug!("[Daemon] 📥 Distilled skill securely archived in Long-Term Memory.");
+            }
+        }
+    });
+
+    let distillation_tx_bg = distillation_tx.clone();
 
     tokio::spawn(async move {
-        println!("[Daemon] Event loop started.");
+        debug!("[Daemon] Event loop started.");
         while let Some(event) = event_rx.recv().await {
             match event {
                 AgentEvent::SetLogLevel { level } => {
@@ -805,10 +649,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         old_level,
                         new_level: level,
                     });
-                    println!(
-                        "[Daemon] Log level changed: {:?} -> {:?}",
-                        old_level, level
-                    );
+                    debug!("[Daemon] Log level changed: {:?} -> {:?}", old_level, level);
                 }
                 AgentEvent::UserInput {
                     session_id,
@@ -822,421 +663,597 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let tool_registry = tool_registry.clone();
                     let config = loop_config.clone();
                     let paused_tasks_bg = paused_tasks_bg.clone();
-                    let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new();
+                    let distillation_tx_spawn = distillation_tx_bg.clone();
+
+                    let node_factory = std::sync::Arc::new(DaemonNodeFactory {
+                        gateway: gateway_clone.clone(),
+                        tool_registry: tool_registry.clone(),
+                        tools_dir: config.tools_dir.clone(),
+                    });
+
+                    let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new()
+                        .with_node_factory(node_factory);
 
                     let context_manager_spawn = context_manager.clone();
                     tokio::spawn(async move {
                         let task_start_time = Instant::now();
-                        println!(
+                        debug!(
                             "[Daemon] Received UserInput: {} (trace: {})",
                             payload, trace_id
                         );
 
-                        let mut enriched_payload = payload.clone();
+                        // --- CONTEXTUAL BYPASS ---
+                        let is_resume = paused_tasks_bg
+                            .lock()
+                            .await
+                            .contains_key(&trace_id.to_string());
 
-                        if let Some(pid) = &project_id {
-                            println!("[Daemon] Active Project ID: {}", pid);
-                            if let Ok(Some(project)) =
-                                telos_project::manager::ProjectRegistry::new().get_project(pid)
-                            {
-                                let working_dir = project.path.clone();
-                                println!("[Daemon] Project working directory: {:?}", working_dir);
+                        if is_resume {
+                            debug!("[Daemon] Contextual Bypass: Task {} is active, injecting Architect for replan.", trace_id);
+                            let _original_payload =
+                                paused_tasks_bg.lock().await.remove(&trace_id.to_string());
 
-                                // Load custom project instructions
-                                let project_config =
-                                    telos_core::project::ProjectConfig::load(&working_dir);
-
-                                // Dynamically inject project context into the payload for the agent
-                                enriched_payload = format!(
-                                    "Context:\n- Active Project: {}\n- Description: {}\n- Working Directory: {:?}\n- Custom Instructions: {}\n\nTask:\n{}",
-                                    project.name,
-                                    project.description.unwrap_or_else(|| "None".to_string()),
-                                    working_dir,
-                                    project_config.custom_instructions.unwrap_or_else(|| "None".to_string()),
-                                    payload
-                                );
-
-                                println!(
-                                    "[Daemon] Dynamically injected project context into payload."
-                                );
-                            }
-                        }
-
-                        broker_bg.publish_feedback(AgentFeedback::StateChanged {
-                            task_id: trace_id.to_string(),
-                            current_node: "planning".into(),
-                            status: telos_core::NodeStatus::Running,
-                        });
-
-                        if payload.contains("sudo") {
-                            broker_bg.publish_feedback(AgentFeedback::RequireHumanIntervention {
+                            broker_bg.publish_feedback(AgentFeedback::StateChanged {
                                 task_id: trace_id.to_string(),
-                                prompt: format!("Task '{}' requires elevated privileges.", payload),
-                                risk_level: telos_core::RiskLevel::HighRisk,
+                                current_node: "replan_architect".into(),
+                                status: telos_core::NodeStatus::Running,
                             });
-                            paused_tasks_bg
-                                .lock()
-                                .await
-                                .insert(trace_id.to_string(), payload.clone());
-                            return;
-                        }
 
-                        // --- DYNAMIC DAG GENERATION VIA LLM ---
-                        let prompt = format!(
-                            r#"You are an expert planner. First classify the task complexity, then break it down appropriately.
-
-## Tier Classification Rules:
-1. "Simple" - Single LLM call is enough:
-   - Simple questions, explanations, summaries
-   - Basic math (2+2), creative writing
-   - Code explanation, knowledge retrieval
-   → nodes: empty (single LLM call will be used automatically)
-
-2. "Medium" - Requires tool usage in a loop (ReAct pattern):
-   - Tasks needing file reads, web searches
-   - Multi-step reasoning with tool calls
-   - Code tasks requiring multiple file operations
-   → nodes: empty (ReAct loop will be used automatically)
-
-3. "Complex" - Requires explicit DAG with multiple parallel/sequential nodes:
-   - Multi-stage workflows with dependencies
-   - Parallel task execution needed
-   - Complex orchestration between different components
-   → nodes: explicit DAG nodes required
-
-## Available Tools (for Medium/Complex tiers):
-- fs_read, fs_write: File operations
-- shell_exec: Shell commands
-- calculator: Math calculations
-- memory_recall, memory_store: Memory operations
-- file_edit: Edit files by search/replace
-- glob, grep: File/code search
-- http_get, web_search: Web operations
-- lsp_symbol_search: Code navigation
-
-## Instructions:
-1. Classify the task tier (Simple/Medium/Complex)
-2. For Simple/Medium: no nodes needed (automatic handling)
-3. For Complex: create DAG nodes with proper edges
-
-Task: {}
-
-Respond strictly with a JSON object matching this schema:
-{{
-    "tier": "Simple" or "Medium" or "Complex",
-    "reply": "string (friendly acknowledgment of the task)",
-    "nodes": [ {{ "id": "string", "task_type": "LLM" or "TOOL", "prompt": "Detailed execution instruction" }} ],
-    "edges": [ {{ "from": "node_id_1", "to": "node_id_2" }} ]
-}}
-Do not include markdown blocks, only raw JSON."#,
-                            payload
-                        );
-
-                        let classification_req = LlmRequest {
-                            session_id: "daemon_planner".to_string(),
-                            messages: vec![telos_model_gateway::Message {
-                                role: "user".to_string(),
-                                content: prompt,
-                            }],
-                            required_capabilities: Capability {
-                                requires_vision: false,
-                                strong_reasoning: false,
-                            },
-                            budget_limit: 2000,
-                        };
-
-                        let plan_json = match gateway_clone.generate(classification_req).await {
-                            Ok(res) => res
-                                .content
-                                .trim()
-                                .trim_start_matches("```json")
-                                .trim_start_matches("```")
-                                .trim_end_matches("```")
-                                .to_string(),
-                            Err(e) => {
-                                broker_bg.publish_feedback(AgentFeedback::Output {
-                                    task_id: trace_id.to_string(),
-                                    session_id: session_id.clone(),
-                                    content: format!("Planning Failed: {:?}", e),
-                                    is_final: true,
-                                });
-                                return;
-                            }
-                        };
-
-                        println!("LLM Plan JSON: {}", plan_json);
-
-                        let dag_plan: DagPlan = match serde_json::from_str(&plan_json) {
-                            Ok(plan) => plan,
-                            Err(e) => {
-                                // Fallback if LLM fails to return valid JSON
-                                println!(
-                                    "Failed to parse DAG plan: {}. Using fallback single node.",
-                                    e
-                                );
-                                DagPlan {
-                                    tier: Some("Complex".to_string()),
-                                    reply: Some("I will handle that.".to_string()),
-                                    nodes: vec![DagNode {
-                                        id: "main".to_string(),
-                                        task_type: "LLM".to_string(),
-                                        prompt: enriched_payload.clone(),
-                                    }],
-                                    edges: vec![],
-                                }
-                            }
-                        };
-
-                        let mut graph = TaskGraph::new(trace_id.to_string());
-                        let mut terminal_nodes = vec![];
-
-                        // Build plan info for PlanCreated feedback
-                        let mut plan_node_infos: Vec<PlanNodeInfo> = Vec::new();
-
-                        let tier = dag_plan.tier.clone().unwrap_or("Complex".to_string());
-
-                        let mut _plan_node_infos: Vec<PlanNodeInfo> = Vec::new();
-
-                        if tier == "Simple" {
-                            terminal_nodes.push("simple_node".to_string());
+                            let mut graph = TaskGraph::new(trace_id.to_string());
                             graph.add_node_with_metadata(
-                                "simple_node".to_string(),
-                                Box::new(LlmPromptNode {
-                                    prompt: enriched_payload.clone(),
-                                    gateway: gateway_clone.clone(),
-                                }),
+                                "replan_architect".to_string(),
+                                Box::new(agents::architect::ArchitectAgent::new(
+                                    gateway_clone.clone(),
+                                )),
                                 NodeMetadata {
-                                    task_type: "LLM".to_string(),
-                                    prompt_preview: truncate_for_preview(&enriched_payload, 100),
+                                    task_type: "architect".to_string(),
+                                    prompt_preview: truncate_for_preview(&payload, 100),
                                     tool_name: None,
+                                    schema_payload: None,
                                 },
                             );
-                            graph.current_state = GraphState { is_running: true, completed: false };
-                        } else if tier == "Medium" {
-                            terminal_nodes.push("react_node".to_string());
-                            graph.add_node_with_metadata(
-                                "react_node".to_string(),
-                                Box::new(ReactNode {
-                                    prompt: enriched_payload.clone(),
-                                    gateway: gateway_clone.clone(),
-                                    tool_registry: tool_registry.clone(),
-                                    _tools_dir: config.tools_dir.clone(),
-                                }),
-                                NodeMetadata {
-                                    task_type: "LLM".to_string(),
-                                    prompt_preview: truncate_for_preview(&enriched_payload, 100),
-                                    tool_name: Some("ReactLoop".to_string()),
-                                },
-                            );
-                            graph.current_state = GraphState { is_running: true, completed: false };
-                        } else {
-                            // Build plan info for PlanCreated feedback
-                            for node in &dag_plan.nodes {
-                                terminal_nodes.push(node.id.clone());
-
-                                // Build node metadata
-                                let metadata = NodeMetadata {
-                                    task_type: node.task_type.clone(),
-                                    prompt_preview: truncate_for_preview(&node.prompt, 100),
-                                    tool_name: if node.task_type == "TOOL" {
-                                        Some(node.prompt.clone())
-                                    } else {
-                                        None
-                                    },
-                                };
-
-                                let node_info = PlanNodeInfo {
-                                    id: node.id.clone(),
-                                    task_type: node.task_type.clone(),
-                                    prompt_preview: truncate_for_preview(&node.prompt, 150),
-                                    dependencies: vec![],
-                                };
-                                plan_node_infos.push(node_info);
-
-                                if node.task_type.to_uppercase() == "TOOL" {
-                                    graph.add_node_with_metadata(
-                                        node.id.clone(),
-                                        Box::new(WasmToolNode {
-                                            tool_name: node.prompt.clone(),
-                                            tool_registry: tool_registry.clone(),
-                                            _tools_dir: config.tools_dir.clone(),
-                                        }),
-                                        metadata,
-                                    );
-                                } else {
-                                    graph.add_node_with_metadata(
-                                        node.id.clone(),
-                                        Box::new(LlmPromptNode {
-                                            prompt: node.prompt.clone(),
-                                            gateway: gateway_clone.clone(),
-                                        }),
-                                        metadata,
-                                    );
-                                }
-                            }
-
-                            for edge in &dag_plan.edges {
-                                terminal_nodes.retain(|id| id != &edge.from);
-                                let _ = graph.add_edge(&edge.from, &edge.to);
-
-                                // Update dependencies in plan info
-                                if let Some(node_info) =
-                                    plan_node_infos.iter_mut().find(|n| n.id == edge.to)
-                                {
-                                    node_info.dependencies.push(edge.from.clone());
-                                }
-                            }
-
-                            if terminal_nodes.is_empty() && !dag_plan.nodes.is_empty() {
-                                terminal_nodes.push(dag_plan.nodes.last().unwrap().id.clone());
-                            }
-
-                            // Publish PlanCreated feedback
-                            let plan_info = PlanInfo {
-                                reply: dag_plan.reply.clone(),
-                                nodes: plan_node_infos.clone(),
-                                total_steps: dag_plan.nodes.len(),
-                                estimated_complexity: if dag_plan.nodes.len() <= 2 {
-                                    Some("low".to_string())
-                                } else if dag_plan.nodes.len() <= 5 {
-                                    Some("medium".to_string())
-                                } else {
-                                    Some("high".to_string())
-                                },
-                            };
-
-                            broker_bg.publish_feedback(AgentFeedback::PlanCreated {
-                                task_id: trace_id.to_string(),
-                                plan: plan_info,
-                            });
 
                             graph.current_state = GraphState {
                                 is_running: true,
                                 completed: false,
                             };
-                        }
 
-                        // Build context using the context manager with memory integration
-                        let raw_ctx = telos_context::RawContext {
-                            history_logs: vec![],  // Could include session history here
-                            retrieved_docs: vec![],
-                        };
-                        let ctx_req = telos_context::NodeRequirement {
-                            required_tokens: 2000,
-                            query: enriched_payload.clone(),
-                        };
-                        let actual_ctx = context_manager_spawn.compress_for_node(&raw_ctx, &ctx_req).await
+                            let scoped_ctx = telos_context::ScopedContext {
+                                budget_tokens: 128_000,
+                                summary_tree: vec![],
+                                precise_facts: vec![],
+                            };
+
+                            execution_engine
+                                .run_graph(
+                                    &mut graph,
+                                    &scoped_ctx,
+                                    registry_clone.as_ref(),
+                                    broker_bg.as_ref(),
+                                )
+                                .await;
+
+                            let mut completed_nodes = 0;
+                            let mut failed_nodes = 0;
+                            let mut failed_node_ids = Vec::new();
+                            for (id, status) in &graph.node_statuses {
+                                if *status == telos_core::NodeStatus::Completed {
+                                    completed_nodes += 1;
+                                } else if *status == telos_core::NodeStatus::Failed {
+                                    failed_nodes += 1;
+                                    failed_node_ids.push(id.clone());
+                                }
+                            }
+                            let task_success = failed_nodes == 0;
+                            let summary = if task_success {
+                                "Task Replan Completed".to_string()
+                            } else {
+                                "Task Replan Failed".to_string()
+                            };
+
+                            broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                                task_id: trace_id.to_string(),
+                                summary: TaskSummary {
+                                    success: task_success,
+                                    total_nodes: graph.node_statuses.len(),
+                                    completed_nodes,
+                                    failed_nodes,
+                                    total_time_ms: task_start_time.elapsed().as_millis() as u64,
+                                    summary: summary.clone(),
+                                    failed_node_ids,
+                                },
+                            });
+
+                            let combined_result = graph
+                                .node_results
+                                .iter()
+                                .filter_map(|(id, out)| {
+                                    out.output.as_ref().map(|v| format!("{}:\n{}", id, v))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n\n");
+
+                            broker_bg.publish_feedback(AgentFeedback::Output {
+                                task_id: trace_id.to_string(),
+                                session_id: session_id.clone(),
+                                content: format!("{}\n\n{}", summary, combined_result),
+                                is_final: true,
+                            });
+                        } else {
+                            // --- NORMAL PLANNING & EXECUTION ---
+                            let mut enriched_payload = payload.clone();
+
+                            if let Some(pid) = &project_id {
+                                debug!("[Daemon] Active Project ID: {}", pid);
+                                if let Ok(Some(project)) =
+                                    telos_project::manager::ProjectRegistry::new().get_project(pid)
+                                {
+                                    let working_dir = project.path.clone();
+                                    debug!("[Daemon] Project working directory: {:?}", working_dir);
+
+                                    // Load custom project instructions
+                                    let project_config =
+                                        telos_core::project::ProjectConfig::load(&working_dir);
+
+                                    // Dynamically inject project context into the payload for the agent
+                                    enriched_payload = format!(
+                                        "Context:\n- Active Project: {}\n- Description: {}\n- Working Directory: {:?}\n- Custom Instructions: {}\n\nTask:\n{}",
+                                        project.name,
+                                        project.description.unwrap_or_else(|| "None".to_string()),
+                                        working_dir,
+                                        project_config.custom_instructions.unwrap_or_else(|| "None".to_string()),
+                                        payload
+                                    );
+
+                                    debug!(
+                                        "[Daemon] Dynamically injected project context into payload."
+                                    );
+                                }
+                            }
+
+                            // --- TIER 1: ROUTER AGENT DISPATCH ---
+                            broker_bg.publish_feedback(AgentFeedback::StateChanged {
+                                task_id: trace_id.to_string(),
+                                current_node: "routing".into(),
+                                status: telos_core::NodeStatus::Running,
+                            });
+
+                            let router = agents::router::RouterAgent::new(gateway_clone.clone());
+                            let router_input = telos_core::AgentInput {
+                                node_id: "router_main".to_string(),
+                                task: enriched_payload.clone(),
+                                dependencies: Default::default(),
+                                schema_payload: None,
+                                memory_context: None,
+                            };
+
+                            let route_result = router.execute(router_input, registry_clone.as_ref()).await;
+                            
+                            if !route_result.success {
+                                let error_msg = route_result.error.map(|e| e.message).unwrap_or_else(|| "Unknown routing error".to_string());
+                                broker_bg.publish_feedback(AgentFeedback::Output {
+                                    task_id: trace_id.to_string(),
+                                    session_id: session_id.clone(),
+                                    content: format!("Routing Failed: {}", error_msg),
+                                    is_final: true,
+                                });
+                                return;
+                            }
+
+                            // Parse router output
+                            let route_data = route_result.output.unwrap_or_default();
+                            let expert_route = route_data.get("route").and_then(|v| v.as_str()).unwrap_or("general_expert");
+                            let route_reason = route_data.get("reason").and_then(|v| v.as_str()).unwrap_or("Fallback to general expert.");
+
+                            broker_bg.publish_feedback(AgentFeedback::Output {
+                                task_id: trace_id.to_string(),
+                                session_id: session_id.clone(),
+                                content: format!("Router Decision: Dispatching to `{}`. Reason: {}", expert_route, route_reason),
+                                is_final: false, // Not final, we are just starting
+                            });
+
+                            // Build context using the context manager with memory integration for the Expert
+                            let raw_ctx = telos_context::RawContext {
+                                history_logs: vec![], // Could include session history here
+                                retrieved_docs: vec![],
+                            };
+                            let ctx_req = telos_context::NodeRequirement {
+                                required_tokens: 2000,
+                                query: enriched_payload.clone(),
+                            };
+                            let actual_ctx = context_manager_spawn.compress_for_node(&raw_ctx, &ctx_req).await
                             .unwrap_or_else(|e| {
-                                println!("[Daemon] Context compression failed: {:?}, using empty context", e);
+                                debug!("[Daemon] Context compression failed: {:?}, using empty context", e);
                                 telos_context::ScopedContext {
-                                    budget_tokens: 1000,
+                                    budget_tokens: 2000,
                                     summary_tree: vec![],
                                     precise_facts: vec![],
                                 }
                             });
 
-                        println!("[Daemon] Context prepared with {} summary nodes and {} precise facts",
-                            actual_ctx.summary_tree.len(),
-                            actual_ctx.precise_facts.len());
+                            debug!(
+                                "[Daemon] Context prepared with {} summary nodes and {} precise facts",
+                                actual_ctx.summary_tree.len(),
+                                actual_ctx.precise_facts.len()
+                            );
 
-                        execution_engine
-                            .run_graph(
-                                &mut graph,
-                                &actual_ctx,
-                                registry_clone.as_ref(),
-                                broker_bg.as_ref(),
-                            )
-                            .await;
+                            // --- TIER 1: ROUTER AGENT DISPATCH ---
+                            broker_bg.publish_feedback(AgentFeedback::StateChanged {
+                                task_id: trace_id.to_string(),
+                                current_node: "planning".into(),
+                                status: telos_core::NodeStatus::Running,
+                            });
+                            
+                            let router_agent = RouterAgent::new(gateway_clone.clone());
+                            let router_input = AgentInput {
+                                node_id: "router".to_string(),
+                                task: enriched_payload.clone(),
+                                dependencies: Default::default(),
+                                schema_payload: None,
+                                memory_context: None,
+                            };
+                            
+                            let router_output = router_agent.execute(router_input, registry_clone.as_ref()).await;
+                            
+                            let expert_route = if router_output.success {
+                                router_output.output.as_ref()
+                                    .and_then(|json| json.get("route"))
+                                    .and_then(|route| route.as_str())
+                                    .unwrap_or("general_expert")
+                                    .to_string()
+                            } else {
+                                debug!("[Daemon] RouterAgent failed: {:?}, falling back to general_expert", router_output.error);
+                                "general_expert".to_string()
+                            };
 
-                        // Calculate task summary
-                        let total_time_ms = task_start_time.elapsed().as_millis() as u64;
-                        let mut completed_nodes = 0;
-                        let mut failed_nodes = 0;
-                        let mut failed_node_ids: Vec<String> = Vec::new();
+                            debug!("[Daemon] Router selected expert route: {}", expert_route);
 
-                        for (node_id, status) in &graph.node_statuses {
-                            if *status == telos_core::NodeStatus::Completed {
-                                completed_nodes += 1;
-                            } else if *status == telos_core::NodeStatus::Failed {
-                                failed_nodes += 1;
-                                failed_node_ids.push(node_id.clone());
+                            // --- TIER 2: EXPERT AGENT PLANNING & DAG EXECUTION ---
+                            let mut attempt = 0;
+                            const MAX_ATTEMPTS: usize = 3;
+                            let mut loop_final_response = String::new();
+                            let mut loop_task_success = false;
+                            let mut loop_completed_nodes = 0;
+                            let mut loop_failed_nodes = 0;
+                            let mut loop_failed_node_ids = vec![];
+                            let mut loop_summary = String::new();
+                            let mut total_time_ms = 0;
+                            let mut loop_final_trace_steps = Vec::new();
+
+                            while attempt < MAX_ATTEMPTS {
+                                attempt += 1;
+                                debug!("[Daemon] Starting execution attempt {}/{}", attempt, MAX_ATTEMPTS);
+
+                                let mut graph = TaskGraph::new(trace_id.to_string());
+                                let mut terminal_nodes = vec![];
+
+                                // Instantiate the specific expert dynamically.
+                                let expert_node: Box<dyn ExecutableNode> = match expert_route.as_str() {
+                                    "software_expert" => Box::new(agents::architect::ArchitectAgent::new(gateway_clone.clone())) as Box<dyn ExecutableNode>,
+                                    "research_expert" => Box::new(agents::researcher::DeepResearchAgent::new(gateway_clone.clone(), tool_registry.clone())) as Box<dyn ExecutableNode>,
+                                    "qa_expert" => Box::new(agents::tester::TestingAgent::new(gateway_clone.clone())) as Box<dyn ExecutableNode>,
+                                    _ => Box::new(agents::general::GeneralAgent::new(
+                                        gateway_clone.clone(),
+                                        tool_registry.clone(),
+                                        config.tools_dir.clone(),
+                                    )) as Box<dyn ExecutableNode>,
+                                };
+
+                                graph.add_node_with_metadata(
+                                    "expert_execution".to_string(),
+                                    expert_node,
+                                    NodeMetadata {
+                                        task_type: expert_route.clone(),
+                                        prompt_preview: truncate_for_preview(&enriched_payload, 100),
+                                        tool_name: None,
+                                        schema_payload: None,
+                                    },
+                                );
+                                graph.current_state = GraphState {
+                                    is_running: true,
+                                    completed: false,
+                                };
+                                terminal_nodes.push("expert_execution".to_string());
+
+
+                                // Build context using the context manager with memory integration
+                                let raw_ctx = telos_context::RawContext {
+                                    history_logs: vec![], // Could include session history here
+                                    retrieved_docs: vec![],
+                                };
+                                let ctx_req = telos_context::NodeRequirement {
+                                    required_tokens: 2000,
+                                    query: enriched_payload.clone(),
+                                };
+                                let actual_ctx = context_manager_spawn.compress_for_node(&raw_ctx, &ctx_req).await
+                                .unwrap_or_else(|e| {
+                                    debug!("[Daemon] Context compression failed: {:?}, using empty context", e);
+                                    telos_context::ScopedContext {
+                                        budget_tokens: 1000,
+                                        summary_tree: vec![],
+                                        precise_facts: vec![],
+                                    }
+                                });
+
+                                debug!(
+                                    "[Daemon] Context prepared with {} summary nodes and {} precise facts",
+                                    actual_ctx.summary_tree.len(),
+                                    actual_ctx.precise_facts.len()
+                                );
+
+                                execution_engine
+                                    .run_graph(
+                                        &mut graph,
+                                        &actual_ctx,
+                                        registry_clone.as_ref(),
+                                        broker_bg.as_ref(),
+                                    )
+                                    .await;
+
+                                // Calculate task summary
+                                total_time_ms = task_start_time.elapsed().as_millis() as u64;
+                                let mut completed_nodes = 0;
+                                let mut failed_nodes = 0;
+                                let mut failed_node_ids: Vec<String> = Vec::new();
+
+                                for (node_id, status) in &graph.node_statuses {
+                                    if *status == telos_core::NodeStatus::Completed {
+                                        completed_nodes += 1;
+                                    } else if *status == telos_core::NodeStatus::Failed {
+                                        failed_nodes += 1;
+                                        failed_node_ids.push(node_id.clone());
+                                    }
+                                }
+
+                                // Fetch the results from the terminal nodes dynamically
+                                let mut final_results = Vec::new();
+                                use petgraph::Direction;
+                                
+                                for (node_id, &node_idx) in &graph.node_indices {
+                                    // A terminal node has no outgoing edges
+                                    if graph.edges.neighbors_directed(node_idx, Direction::Outgoing).count() == 0 {
+                                        // Ignore dummy nodes whose output is just "Research plan generated" if they spawned a subgraph
+                                        if let Some(res) = graph.node_results.get(node_id) {
+                                            let output_str = res
+                                                .output
+                                                .as_ref()
+                                                .map(|v| v.to_string())
+                                                .unwrap_or_else(|| "No output".to_string());
+                                                
+                                            if !output_str.contains("Research plan generated") {
+                                                if res.success {
+                                                    final_results.push(format!("[{}] {}", node_id, output_str));
+                                                } else {
+                                                    let error_str = res
+                                                        .error
+                                                        .as_ref()
+                                                        .map(|e| format!("{}: {}", e.error_type, e.message))
+                                                        .unwrap_or_else(|| "Unknown error".to_string());
+                                                    final_results
+                                                        .push(format!("[{}] Failed: {}", node_id, error_str));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let combined_result = if final_results.is_empty() {
+                                    "No result generated by graph".to_string()
+                                } else {
+                                    final_results.join("\n")
+                                };
+
+                                // Detect if the result actually contains error messages
+                                let result_has_error = combined_result.to_lowercase().contains("error")
+                                    || combined_result.to_lowercase().contains("failed")
+                                    || combined_result.to_lowercase().contains("not found")
+                                    || combined_result.to_lowercase().contains("unavailable")
+                                    || combined_result.contains("失败");
+
+                                let task_success = failed_nodes == 0 && !result_has_error;
+
+                                // Build summary message
+                                let summary = if task_success {
+                                    format!(
+                                        "Task completed successfully. {} node(s) executed in {:.1}s.",
+                                        completed_nodes,
+                                        total_time_ms as f64 / 1000.0
+                                    )
+                                } else {
+                                    format!(
+                                        "Task finished with errors. {} succeeded, {} failed. Node(s) failed: {}",
+                                        completed_nodes,
+                                        failed_nodes,
+                                        failed_node_ids.join(", ")
+                                    )
+                                };
+
+                                // --- ROUTE AGENT SYNTHESIS ---
+                                // Delegate the final summary to the ExpertAgent that planned the execution
+                                let expert_agent_for_summary: Box<dyn telos_core::agent_traits::ExpertAgent> = match expert_route.as_str() {
+                                    "software_expert" => Box::new(agents::architect::ArchitectAgent::new(gateway_clone.clone())) as Box<dyn telos_core::agent_traits::ExpertAgent>,
+                                    "research_expert" => Box::new(agents::researcher::DeepResearchAgent::new(gateway_clone.clone(), tool_registry.clone())) as Box<dyn telos_core::agent_traits::ExpertAgent>,
+                                    "qa_expert" => Box::new(agents::tester::TestingAgent::new(gateway_clone.clone())) as Box<dyn telos_core::agent_traits::ExpertAgent>,
+                                    _ => Box::new(agents::general::GeneralAgent::new(
+                                        gateway_clone.clone(),
+                                        tool_registry.clone(),
+                                        config.tools_dir.clone(),
+                                    )) as Box<dyn telos_core::agent_traits::ExpertAgent>,
+                                };
+
+                                let summary_input = telos_core::AgentInput {
+                                    node_id: "expert_summary".to_string(),
+                                    task: format!(
+                                        "Original request: {}\n\nExecution Results:\n{}",
+                                        payload, combined_result
+                                    ),
+                                    dependencies: std::collections::HashMap::new(),
+                                    schema_payload: None,
+                                    memory_context: None,
+                                };
+
+                                let summary_output = expert_agent_for_summary
+                                    .summarize(&summary_input, registry_clone.as_ref())
+                                    .await;
+
+                                let final_response = if summary_output.success {
+                                    summary_output
+                                        .output
+                                        .as_ref()
+                                        .and_then(|json| json.get("text").and_then(|t| t.as_str()))
+                                        .unwrap_or("No summary provided by expert.")
+                                        .to_string()
+                                } else {
+                                    format!(
+                                        "{}\n\n(Note: Failed to generate final summary: {:?})",
+                                        combined_result, summary_output.error
+                                    )
+                                };
+
+                                loop_final_response = final_response.clone();
+                                loop_task_success = task_success;
+                                loop_completed_nodes = completed_nodes;
+                                loop_failed_nodes = failed_nodes;
+                                loop_failed_node_ids = failed_node_ids.clone();
+                                loop_summary = summary.clone();
+
+                                loop_final_trace_steps.clear();
+                                for (node_id, output) in &graph.node_results {
+                                    let input_data = graph.node_metadata.get(node_id).map(|m| m.prompt_preview.clone()).unwrap_or_default();
+                                    let error_opt = output.error.as_ref().map(|e| telos_core::NodeError::ExecutionFailed(e.message.clone()));
+                                    loop_final_trace_steps.push(telos_evolution::TraceStep {
+                                        node_id: node_id.clone(),
+                                        input_data,
+                                        output_data: output.output.as_ref().map(|v| v.to_string()),
+                                        error: error_opt,
+                                    });
+                                }
+
+                                // --- ROUTER EVALUATION ---
+                                let eval_output = router_agent.evaluate(&payload, &final_response, registry_clone.as_ref()).await;
+                                if eval_output.success {
+                                    if let Some(json) = eval_output.output {
+                                        let is_acceptable = json.get("is_acceptable").and_then(|v| v.as_bool()).unwrap_or(false);
+                                        let critique = json.get("critique").and_then(|v| v.as_str()).unwrap_or("");
+                                        
+                                        if is_acceptable || attempt == MAX_ATTEMPTS {
+                                            if !is_acceptable {
+                                                debug!("[Daemon] Max attempts reached despite router rejection. Proceeding anyway.");
+                                            } else {
+                                                debug!("[Daemon] Router evaluated result as acceptable.");
+                                            }
+                                            break;
+                                        } else {
+                                            debug!("[Daemon] Router rejected the output. Critique: {}", critique);
+                                            broker_bg.publish_feedback(AgentFeedback::Output {
+                                                task_id: trace_id.to_string(),
+                                                session_id: session_id.clone(),
+                                                content: format!("🔄 Router QA rejected output.\nCritique: {}", critique),
+                                                is_final: false,
+                                            });
+                                            enriched_payload = format!(
+                                                "Task:\n{}\n\n[Previous attempt was rejected. Fix the following issue: {}]",
+                                                payload, critique
+                                            );
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    debug!("[Daemon] Router evaluation failed, continuing with generated output.");
+                                    break;
+                                }
+                            }
+
+                            // Send Output FIRST (is_final: false) so CLI prints it but doesn't exit yet
+                            broker_bg.publish_feedback(AgentFeedback::Output {
+                                task_id: trace_id.to_string(),
+                                session_id: session_id.clone(),
+                                content: loop_final_response,
+                                is_final: false,
+                            });
+
+                            // Publish TaskCompleted feedback LAST, which breaks the CLI stream
+                            broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                                task_id: trace_id.to_string(),
+                                summary: TaskSummary {
+                                    success: loop_task_success,
+                                    total_nodes: loop_completed_nodes + loop_failed_nodes,
+                                    completed_nodes: loop_completed_nodes,
+                                    failed_nodes: loop_failed_nodes,
+                                    total_time_ms,
+                                    summary: loop_summary,
+                                    failed_node_ids: loop_failed_node_ids,
+                                },
+                            });
+
+                            // --- EVOLUTION & MEMORY INTEGRATION LOOP ---
+                            let trace = telos_evolution::ExecutionTrace {
+                                task_id: trace_id.to_string(),
+                                steps: loop_final_trace_steps,
+                                errors_encountered: vec![],
+                                success: loop_task_success,
+                            };
+                            
+                            // Send trace to asynchronous Evolution worker for Skill Distillation
+                            if let Err(e) = distillation_tx_spawn.send(trace) {
+                                debug!("[Daemon] ⚠️ Failed to send trace {} to evolution queue: {}", trace_id, e);
+                            } else {
+                                debug!("[Daemon] 📦 Trace {} queued for Evolution distillation.", trace_id);
                             }
                         }
-
-                        // Fetch the results from the terminal nodes
-                        let mut final_results = Vec::new();
-                        for node_id in &terminal_nodes {
-                            if let Some(Ok(res)) = graph.node_results.get(node_id) {
-                                final_results.push(format!(
-                                    "[{}] {}",
-                                    node_id,
-                                    String::from_utf8_lossy(&res.output_data)
-                                ));
-                            } else if let Some(Err(e)) = graph.node_results.get(node_id) {
-                                final_results.push(format!("[{}] Failed: {:?}", node_id, e));
-                            }
-                        }
-
-                        let combined_result = if final_results.is_empty() {
-                            "No result generated by graph".to_string()
-                        } else {
-                            final_results.join("\n")
-                        };
-
-                        let task_success = failed_nodes == 0;
-
-                        // Build summary message
-                        let summary = if task_success {
-                            format!(
-                                "Task completed successfully. {} node(s) executed in {:.1}s.",
-                                completed_nodes,
-                                total_time_ms as f64 / 1000.0
-                            )
-                        } else {
-                            format!(
-                                "Task finished with errors. {} succeeded, {} failed. Node(s) failed: {}",
-                                completed_nodes,
-                                failed_nodes,
-                                failed_node_ids.join(", ")
-                            )
-                        };
-
-                        // Publish TaskCompleted feedback
-                        broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
-                            task_id: trace_id.to_string(),
-                            summary: TaskSummary {
-                                success: task_success,
-                                total_nodes: graph.node_statuses.len(),
-                                completed_nodes,
-                                failed_nodes,
-                                total_time_ms,
-                                summary: summary.clone(),
-                                failed_node_ids: failed_node_ids.clone(),
-                            },
-                        });
-
-                        // Also send Output for backward compatibility
-                        broker_bg.publish_feedback(AgentFeedback::Output {
-                            task_id: trace_id.to_string(),
-                            session_id,
-                            content: format!("{}\n\n{}", summary, combined_result),
-                            is_final: true,
-                        });
                     });
                 }
+                AgentEvent::UserIntervention {
+                    task_id,
+                    node_id,
+                    instruction,
+                    trace_id: _,
+                } => {
+                    debug!(
+                        "[Daemon] UserIntervention for task {}: {}",
+                        task_id, instruction
+                    );
+                    if let Some(node) = node_id {
+                        let lock = wakeup_map_bg.lock().await;
+                        if let Some(tx) = lock.get(&task_id) {
+                            let _ = tx.send((task_id.clone(), node, instruction));
+                        }
+                    } else {
+                        // Default to first waiting node if we can't be sure, but usually targeted.
+                        debug!(
+                            "[Daemon] Warning: Targeted intervention missing node_id for task {}",
+                            task_id
+                        );
+                    }
+                }
                 AgentEvent::UserApproval {
-                    task_id, approved, ..
+                    task_id,
+                    node_id: _,
+                    approved,
+                    supplement_info: _,
+                    trace_id: _,
                 } => {
                     let broker_bg = broker_bg.clone();
                     let gateway_clone = gateway_clone.clone();
                     let registry_clone = registry_clone.clone();
                     let paused_tasks_bg = paused_tasks_bg.clone();
-                    let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new();
+                    let tool_registry = tool_registry.clone();
+                    let config = loop_config.clone();
+
+                    let node_factory = std::sync::Arc::new(DaemonNodeFactory {
+                        gateway: gateway_clone.clone(),
+                        tool_registry: tool_registry.clone(),
+                        tools_dir: config.tools_dir.clone(),
+                    });
+
+                    let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new()
+                        .with_node_factory(node_factory);
 
                     let context_manager_approval = context_manager.clone();
                     tokio::spawn(async move {
                         let task_start_time = Instant::now();
-                        println!(
+                        debug!(
                             "[Daemon] Received UserApproval for task {} (approved: {})",
                             task_id, approved
                         );
@@ -1290,6 +1307,7 @@ Do not include markdown blocks, only raw JSON."#,
                                     task_type: "LLM".to_string(),
                                     prompt_preview: truncate_for_preview(&payload, 100),
                                     tool_name: None,
+                                    schema_payload: None,
                                 },
                             );
                             graph.current_state = GraphState {
@@ -1299,22 +1317,23 @@ Do not include markdown blocks, only raw JSON."#,
 
                             let raw_ctx = telos_context::RawContext {
                                 history_logs: vec![],
-                                retrieved_docs: vec![
-                                    telos_context::Document {
-                                        doc_id: "user_input".to_string(),
-                                        content: payload.clone(),
-                                    }
-                                ],
+                                retrieved_docs: vec![telos_context::Document {
+                                    doc_id: "user_input".to_string(),
+                                    content: payload.clone(),
+                                }],
                             };
                             let req = telos_context::NodeRequirement {
                                 required_tokens: 1000,
                                 query: payload.clone(),
                             };
-                            let actual_ctx = context_manager_approval.compress_for_node(&raw_ctx, &req).await.unwrap_or_else(|_e| telos_context::ScopedContext {
-                                budget_tokens: 1000,
-                                summary_tree: vec![],
-                                precise_facts: vec![],
-                            });
+                            let actual_ctx = context_manager_approval
+                                .compress_for_node(&raw_ctx, &req)
+                                .await
+                                .unwrap_or_else(|_e| telos_context::ScopedContext {
+                                    budget_tokens: 1000,
+                                    summary_tree: vec![],
+                                    precise_facts: vec![],
+                                });
 
                             execution_engine
                                 .run_graph(
@@ -1326,10 +1345,16 @@ Do not include markdown blocks, only raw JSON."#,
                                 .await;
 
                             let final_result = match graph.node_results.get("llm_node") {
-                                Some(Ok(res)) => {
-                                    String::from_utf8_lossy(&res.output_data).to_string()
-                                }
-                                Some(Err(e)) => format!("Error executing node: {:?}", e),
+                                Some(res) if res.success => res
+                                    .output
+                                    .as_ref()
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "No output".to_string()),
+                                Some(res) => res
+                                    .error
+                                    .as_ref()
+                                    .map(|e| format!("Error: {}", e.message))
+                                    .unwrap_or_else(|| "Unknown error".to_string()),
                                 None => "No result generated by node".to_string(),
                             };
 
@@ -1402,7 +1427,7 @@ Do not include markdown blocks, only raw JSON."#,
 
     // Start Bot Provider in background if configured
     if let Some(bot_token) = config.telegram_bot_token.clone() {
-        println!("Starting Telegram Bot Provider from Daemon...");
+        info!("Starting Telegram Bot Provider from Daemon...");
         let daemon_url = "http://127.0.0.1:3000".to_string();
         let daemon_ws_url = "ws://127.0.0.1:3000/api/v1/stream".to_string();
         let send_state_changes = config.bot_send_state_changes;
@@ -1415,36 +1440,67 @@ Do not include markdown blocks, only raw JSON."#,
                 send_state_changes,
             );
             if let Err(e) = telos_bot::traits::ChatBotProvider::start(&provider).await {
-                eprintln!("Failed to start bot provider: {}", e);
+                error!("Failed to start bot provider: {}", e);
             }
         });
     }
 
+    let recent_traces = Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::with_capacity(100)));
+    let mut rx = broker.subscribe_feedback();
+    let traces_bg = recent_traces.clone();
+    tokio::spawn(async move {
+        while let Ok(feedback) = rx.recv().await {
+            if let telos_hci::AgentFeedback::Trace { .. } = &feedback {
+                let mut q = traces_bg.write().await;
+                if q.len() >= 100 {
+                    q.pop_front();
+                }
+                q.push_back(feedback);
+            }
+        }
+    });
+
     // --- API SERVER ---
     let state = AppState {
         broker: broker.clone(),
+        recent_traces,
     };
 
     let app = Router::new()
         .route("/api/v1/run", post(handle_run))
         .route("/api/v1/approve", post(handle_approve))
+        .route("/api/v1/intervention", post(handle_intervention))
         .route("/api/v1/stream", get(ws_handler))
         .route("/api/v1/log-level", get(get_log_level).post(set_log_level))
+        .route("/api/v1/traces", get(get_traces))
+        .route("/ui", get(serve_ui))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    println!("Telos Daemon listening on ws://0.0.0.0:3000/api/v1/stream");
+    info!("Telos Daemon listening on ws://0.0.0.0:3000/api/v1/stream");
 
     axum::serve(listener, app).await?;
 
     Ok(())
 }
 
+async fn get_traces(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let q = state.recent_traces.read().await;
+    let traces: Vec<_> = q.iter().cloned().collect();
+    Json(serde_json::json!({
+        "traces": traces
+    }))
+}
+
+async fn serve_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../static/index.html"))
+}
+
 async fn handle_run(
     State(state): State<AppState>,
     Json(req): Json<RunRequest>,
 ) -> Json<RunResponse> {
-    let trace_id = Uuid::new_v4();
+    let trace_id = req.trace_id.and_then(|id| Uuid::parse_str(&id).ok()).unwrap_or_else(Uuid::new_v4);
     let _ = state
         .broker
         .publish_event(AgentEvent::UserInput {
@@ -1470,6 +1526,7 @@ async fn handle_approve(
         .broker
         .publish_event(AgentEvent::UserApproval {
             task_id: req.task_id,
+            node_id: None,
             approved: req.approved,
             supplement_info: None,
             trace_id,
@@ -1478,6 +1535,38 @@ async fn handle_approve(
 
     Json(ApproveResponse {
         status: "approval received".into(),
+    })
+}
+
+#[derive(serde::Deserialize)]
+pub struct InterventionRequest {
+    pub task_id: String,
+    pub node_id: Option<String>,
+    pub instruction: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct InterventionResponse {
+    pub status: String,
+}
+
+async fn handle_intervention(
+    State(state): State<AppState>,
+    Json(req): Json<InterventionRequest>,
+) -> Json<InterventionResponse> {
+    let trace_id = Uuid::new_v4();
+    let _ = state
+        .broker
+        .publish_event(AgentEvent::UserIntervention {
+            task_id: req.task_id,
+            node_id: req.node_id,
+            instruction: req.instruction,
+            trace_id,
+        })
+        .await;
+
+    Json(InterventionResponse {
+        status: "intervention received".into(),
     })
 }
 
@@ -1497,6 +1586,14 @@ async fn set_log_level(
 
     global_log_level().set(new_level);
 
+    // Persist to config file
+    if let Ok(mut config) = TelosConfig::load() {
+        config.log_level = format!("{:?}", new_level).to_lowercase();
+        if let Err(e) = config.save() {
+            error!("Failed to persist log level to config: {}", e);
+        }
+    }
+
     // Publish LogLevelChanged feedback via broker
     state
         .broker
@@ -1512,17 +1609,128 @@ async fn set_log_level(
     })
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+#[derive(serde::Deserialize)]
+pub struct WsQuery {
+    pub trace_id: Option<String>,
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    let mut rx = state.broker.subscribe_feedback();
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(query): Query<WsQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state, query.trace_id))
+}
 
-    while let Ok(feedback) = rx.recv().await {
-        let msg_str = serde_json::to_string(&feedback).unwrap_or_else(|_| "{}".to_string());
-        if socket.send(Message::Text(msg_str)).await.is_err() {
-            break;
+/// 创建系统取消通知（当通道关闭时发送）
+fn create_cancellation_feedback(task_id: &str) -> AgentFeedback {
+    AgentFeedback::TaskCompleted {
+        task_id: task_id.to_string(),
+        summary: telos_hci::TaskSummary {
+            success: false,
+            total_nodes: 0,
+            completed_nodes: 0,
+            failed_nodes: 0,
+            total_time_ms: 0,
+            summary: "任务已取消：系统连接断开".to_string(),
+            failed_node_ids: vec![],
+        },
+    }
+}
+
+async fn handle_socket(mut socket: WebSocket, state: AppState, filter_trace_id: Option<String>) {
+    let mut rx = state.broker.subscribe_feedback();
+    let mut current_task_id: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            // 处理来自 broker 的反馈
+            result = rx.recv() => {
+                match result {
+                    Ok(feedback) => {
+                        // 跟踪当前任务ID
+                        if let Some(task_id) = feedback.task_id() {
+                            current_task_id = Some(task_id.to_string());
+                        }
+
+                        // Apply trace_id filter if it was requested via query parameter
+                        if let Some(expected_trace_id) = &filter_trace_id {
+                            // Since task_id is identical to trace_id for CLI runs, we filter on task_id
+                            if let Some(t_id) = feedback.task_id() {
+                                if t_id != expected_trace_id {
+                                    continue;
+                                }
+                            } else {
+                                // If a message has no task_id, we probably don't want to blindly forward it 
+                                // to a trace-specific socket, except maybe LogLevelChanged which is global.
+                                if !matches!(feedback, telos_hci::AgentFeedback::LogLevelChanged { .. }) {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let msg_str = serde_json::to_string(&feedback).unwrap_or_else(|_| "{}".to_string());
+
+                        if socket.send(Message::Text(msg_str)).await.is_err() {
+                            debug!("[WebSocket] Failed to send message, client disconnected");
+                            break;
+                        }
+
+                        // 如果是最终消息，正常退出
+                        if feedback.is_final() {
+                            debug!("[WebSocket] Task completed, closing connection");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // 通道关闭，发送系统通知
+                        debug!("[WebSocket] Broker channel closed, sending cancellation notice");
+                        if let Some(task_id) = &current_task_id {
+                            let cancellation = create_cancellation_feedback(task_id);
+                            let msg_str = serde_json::to_string(&cancellation).unwrap_or_else(|_| "{}".to_string());
+                            let _ = socket.send(Message::Text(msg_str)).await;
+                        }
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // 消息积压，继续运行但记录警告
+                        warn!("[WebSocket] Warning: Lagged {} messages, continuing...", n);
+                        continue;
+                    }
+                }
+            }
+            // 处理来自客户端的消息（心跳、关闭请求等）
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Ping(data))) => {
+                        if socket.send(Message::Pong(data)).await.is_err() {
+                            debug!("[WebSocket] Failed to send pong");
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        // Pong received, continue
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        debug!("[WebSocket] Client requested close");
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        debug!("[WebSocket] WebSocket error: {:?}", e);
+                        break;
+                    }
+                    None => {
+                        debug!("[WebSocket] WebSocket stream ended");
+                        break;
+                    }
+                    _ => {
+                        // Ignore other message types
+                    }
+                }
+            }
         }
     }
+
+    // 清理：发送关闭帧
+    let _ = socket.close().await;
 }

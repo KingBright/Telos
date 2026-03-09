@@ -4,7 +4,30 @@
       "Read(//Users/jinliang/.cargo/**)",
       "Bash(~/.cargo/bin/telos:*)",
       "Bash(lsof:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(./install.sh:*)",
+      "Bash(killall:*)",
+      "Bash(telos run:*)",
+      "Bash(~/.telos_config.toml:*)",
+      "Bash(curl:*)",
+      "Bash(do:*)",
+      "Bash(telos_daemon:*)",
+      "Bash(580)",
+      "Bash(/Users/jinliang/rust-target/release/telos_cli What's the weather in Beijing?:*)",
+      "Bash(/Users/jinliang/rust-target/release/telos_cli:*)",
+      "Bash(source:*)",
+      "Read(//Users/jinliang/.telos_logs/**)",
+      "Bash(perl:*)",
+      "Read(//Users/jinliang/.telos/**)",
+      "Read(//Users/jinliang/rust-target/**)",
+      "Bash(telos-daemon:*)",
+      "Bash(~/.telos/bin/telos run:*)",
+      "Bash(for file:*)",
+      "Read(//Users/jinliang/Workspace/Telos/**)",
+      "Bash(done)",
+      "Bash(cargo fetch:*)",
+      "mcp__web-search-prime__web_search_prime",
+      "mcp__web-reader__webReader"
     ]
   }
 }

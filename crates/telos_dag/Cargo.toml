@@ -10,10 +10,11 @@ telos_context = { path = "../telos_context" }
 async-trait.workspace = true
 petgraph.workspace = true
 redb.workspace = true
+lru = "0.16.3"
 tokio.workspace = true
 futures.workspace = true
-uuid.workspace = true
+uuid = { version = "1.21.0", features = ["v4"] }
 telos_model_gateway = { path = "../telos_model_gateway" }
 serde_json.workspace = true
 telos_telemetry = { path = "../telos_telemetry" }
-tracing = "0.1"
+tracing.workspace = true

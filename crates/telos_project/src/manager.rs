@@ -21,8 +21,7 @@ impl Default for ProjectRegistry {
 
 impl ProjectRegistry {
     pub fn new() -> Self {
-        let mut path = dirs::home_dir().expect("Could not find home directory");
-        path.push(".telos");
+        let mut path = TelosConfig::telos_home();
         if !path.exists() {
             let _ = fs::create_dir_all(&path);
         }

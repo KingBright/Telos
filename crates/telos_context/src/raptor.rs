@@ -35,7 +35,7 @@ impl RaptorTree {
             let emb = embedding_provider
                 .embed(&edu.text)
                 .await
-                .map_err(|e| format!("Embedding failed: {}", e.0))?;
+                .map_err(|e| format!("Embedding failed: {}", e.message))?;
             edu.embedding = Some(emb);
 
             self.nodes.push(RaptorNode {
@@ -75,13 +75,13 @@ impl RaptorTree {
                 let summary = llm_provider
                     .summarize(&cluster_text)
                     .await
-                    .map_err(|e| format!("Summarization failed: {}", e.0))?;
+                    .map_err(|e| format!("Summarization failed: {}", e.message))?;
 
                 // Embed the summary
                 let summary_embedding = embedding_provider
                     .embed(&summary)
                     .await
-                    .map_err(|e| format!("Embedding failed: {}", e.0))?;
+                    .map_err(|e| format!("Embedding failed: {}", e.message))?;
 
                 let new_node_id = format!("level_{}_cluster_{}", current_level, cluster_id);
 
@@ -118,7 +118,7 @@ impl RaptorTree {
         let query_embedding = embedding_provider
             .embed(query)
             .await
-            .map_err(|e| format!("Query embedding failed: {}", e.0))?;
+            .map_err(|e| format!("Query embedding failed: {}", e.message))?;
 
         let mut retrieved_nodes = Vec::new();
         let mut current_tokens = 0;

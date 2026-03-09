@@ -1,23 +1,102 @@
-use crate::{ExecutionEngine, StorageError, TaskGraph};
+use crate::{ExecutableNode, ExecutionEngine, StorageError, TaskGraph};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use petgraph::Direction;
 use std::collections::HashMap;
 use std::time::Instant;
 use telos_context::ScopedContext;
-use telos_core::{NodeStatus, SystemRegistry};
-use telos_hci::{
-    AgentFeedback, EventBroker, ErrorDetail, NodeExecutionDetail, ProgressInfo,
-};
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
-use tracing::{info_span, Instrument};
+use telos_core::{AgentInput, AgentOutput, DependencyType, ErrorSeverity, NodeStatus, SystemRegistry};
+use telos_hci::{AgentFeedback, ErrorDetail, EventBroker, ProgressInfo, TaskSummary};
+use tracing::{info_span, Instrument, info, warn, error};
+
+pub trait NodeFactory: Send + Sync {
+    fn create_node(&self, agent_type: &str, task: &str) -> Option<Box<dyn ExecutableNode>>;
+}
+
+/// 任务最终状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskFinalState {
+    /// 成功完成
+    Success,
+    /// 部分完成（有些节点失败但非关键）
+    PartialSuccess,
+    /// 熔断停止（失败率过高）
+    CircuitBroken,
+    /// 致命错误
+    FatalError,
+    /// 用户取消
+    Cancelled,
+    /// 未知状态
+    Unknown,
+}
+
+impl TaskFinalState {
+    pub fn to_user_message(&self) -> &'static str {
+        match self {
+            Self::Success => "任务完成",
+            Self::PartialSuccess => "任务部分完成",
+            Self::CircuitBroken => "任务因故障熔断停止",
+            Self::FatalError => "任务遇到致命错误",
+            Self::Cancelled => "任务已取消",
+            Self::Unknown => "任务状态未知",
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success | Self::PartialSuccess)
+    }
+}
+
+/// 熔断器配置
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerConfig {
+    /// 触发熔断的失败率阈值（0.0 - 1.0）
+    pub failure_rate_threshold: f32,
+    /// 最小执行节点数才开始计算失败率
+    pub min_nodes_for_circuit_break: usize,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_rate_threshold: 0.5, // 50% 失败率触发熔断
+            min_nodes_for_circuit_break: 3, // 至少执行 3 个节点
+        }
+    }
+}
 
 pub struct TokioExecutionEngine {
-    // Standard settings
+    node_factory: Option<std::sync::Arc<dyn NodeFactory>>,
+    wakeup_tx: tokio::sync::mpsc::UnboundedSender<(String, String, String)>, // (task_id, node_id, instruction)
+    wakeup_rx: tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>,
+    circuit_breaker_config: CircuitBreakerConfig,
 }
 
 impl TokioExecutionEngine {
     pub fn new() -> Self {
-        Self {}
+        let (wakeup_tx, wakeup_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            node_factory: None,
+            wakeup_tx,
+            wakeup_rx,
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+        }
+    }
+
+    pub fn with_node_factory(mut self, factory: std::sync::Arc<dyn NodeFactory>) -> Self {
+        self.node_factory = Some(factory);
+        self
+    }
+
+    /// 配置熔断器
+    pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
+        self.circuit_breaker_config = config;
+        self
+    }
+
+    /// Get a sender to wake up nodes waiting for input
+    pub fn get_wakeup_tx(&self) -> tokio::sync::mpsc::UnboundedSender<(String, String, String)> {
+        self.wakeup_tx.clone()
     }
 
     /// Calculate progress info from the graph state
@@ -33,6 +112,7 @@ impl TokioExecutionEngine {
                 NodeStatus::Running => running += 1,
                 NodeStatus::Failed => failed += 1,
                 NodeStatus::Pending => pending += 1,
+                NodeStatus::WaitingForInput => pending += 1, // Treat as pending for progress
             }
         }
 
@@ -40,13 +120,95 @@ impl TokioExecutionEngine {
         ProgressInfo::new(completed, total, running, failed, pending)
     }
 
-    /// Truncate a string for display purposes
+    /// Truncate a string for display purposes (UTF-8 safe)
     fn truncate(s: &str, max_len: usize) -> String {
         if s.len() > max_len {
-            format!("{}...", &s[..max_len])
+            // Use char_indices to find a safe boundary
+            let mut result = String::new();
+            let mut byte_count = 0;
+            for ch in s.chars() {
+                if byte_count + ch.len_utf8() > max_len {
+                    break;
+                }
+                result.push(ch);
+                byte_count += ch.len_utf8();
+            }
+            format!("{}...", result)
         } else {
             s.to_string()
         }
+    }
+
+    /// Collect dependency outputs for a node
+    fn collect_dependency_outputs(
+        graph: &TaskGraph,
+        node_id: &str,
+    ) -> HashMap<String, AgentOutput> {
+        let mut deps = HashMap::new();
+        for (from_id, dep_type) in graph.get_dependencies(node_id) {
+            if dep_type == DependencyType::Data {
+                if let Some(output) = graph.node_results.get(&from_id) {
+                    deps.insert(from_id, output.clone());
+                }
+            }
+        }
+        deps
+    }
+
+    /// 检查是否应该熔断
+    fn should_circuit_break(
+        completed_nodes: usize,
+        failed_nodes: usize,
+        config: &CircuitBreakerConfig,
+    ) -> bool {
+        if completed_nodes < config.min_nodes_for_circuit_break {
+            return false;
+        }
+
+        let failure_rate = failed_nodes as f32 / completed_nodes as f32;
+        failure_rate >= config.failure_rate_threshold
+    }
+
+    /// 收集失败的节点ID
+    fn collect_failed_node_ids(graph: &TaskGraph) -> Vec<String> {
+        graph
+            .node_statuses
+            .iter()
+            .filter(|(_, status)| **status == NodeStatus::Failed)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// 发送任务完成通知
+    fn send_task_completed(
+        broker: &dyn EventBroker,
+        task_id: &str,
+        final_state: TaskFinalState,
+        total_nodes: usize,
+        completed_nodes: usize,
+        failed_nodes: usize,
+        start_time: Instant,
+        failed_node_ids: Vec<String>,
+    ) {
+        let summary = TaskSummary {
+            success: final_state.is_success(),
+            total_nodes,
+            completed_nodes,
+            failed_nodes,
+            total_time_ms: start_time.elapsed().as_millis() as u64,
+            summary: format!(
+                "{} - 完成 {} 个节点，失败 {} 个",
+                final_state.to_user_message(),
+                completed_nodes,
+                failed_nodes
+            ),
+            failed_node_ids,
+        };
+
+        broker.publish_feedback(AgentFeedback::TaskCompleted {
+            task_id: task_id.to_string(),
+            summary,
+        });
     }
 }
 
@@ -60,6 +222,7 @@ impl ExecutionEngine for TokioExecutionEngine {
         broker: &dyn EventBroker,
     ) {
         graph.current_state.is_running = true;
+        let _start_time = Instant::now();
 
         let mut in_degrees: HashMap<String, usize> = HashMap::new();
         for (id, idx) in &graph.node_indices {
@@ -78,162 +241,342 @@ impl ExecutionEngine for TokioExecutionEngine {
         }
 
         let mut active_tasks = 0;
+        let mut waiting_for_input_count = 0;
         let mut completed_nodes = 0;
         let mut failed_nodes = 0;
-        let total_nodes = graph.nodes.len();
+        let mut total_nodes = graph.nodes.len();
+
+        // 跟踪最终状态
+        let mut final_state = TaskFinalState::Unknown;
+        let mut fatal_error_encountered = false;
 
         let mut futures = FuturesUnordered::new();
+        let graph_id = graph.graph_id.clone();
+        let graph_span = info_span!("run_graph", trace_id = %graph_id);
+        let circuit_config = self.circuit_breaker_config.clone();
 
-        let graph_span = info_span!("run_graph", trace_id = %graph.graph_id);
-
-        // We cannot hold a span enter guard across await points in async Rust.
-        // Instead, we instrument the inner async block that we await.
-        async {
-            // Track progress update frequency
+        async move {
             let mut last_progress_update = Instant::now();
             let progress_update_interval = std::time::Duration::from_millis(500);
 
             while completed_nodes < total_nodes {
-                while let Some(node_id) = ready_queue.pop() {
-                    graph.node_statuses.insert(node_id.clone(), NodeStatus::Running);
+                // 1. 熔断检查：失败率 > 阈值时停止
+                if Self::should_circuit_break(completed_nodes, failed_nodes, &circuit_config) {
+                    error!(
+                        "[DAG Engine] 🔴 Circuit breaker triggered! Failure rate: {:.1}% ({}/{}). Stopping execution.",
+                        (failed_nodes as f32 / completed_nodes as f32) * 100.0,
+                        failed_nodes,
+                        completed_nodes
+                    );
+                    final_state = TaskFinalState::CircuitBroken;
+                    break;
+                }
 
-                    // Get node metadata
+                // 2. 检查致命错误
+                if fatal_error_encountered {
+                    final_state = TaskFinalState::FatalError;
+                    break;
+                }
+
+                // Queue ready nodes
+                while let Some(node_id) = ready_queue.pop() {
                     let metadata = graph.node_metadata.get(&node_id).cloned().unwrap_or_default();
                     let task_type = metadata.task_type.clone();
                     let prompt_preview = metadata.prompt_preview.clone();
 
-                    // Publish StateChanged feedback (for backward compatibility)
+                    graph.node_statuses.insert(node_id.clone(), NodeStatus::Running);
+                    let dependencies = Self::collect_dependency_outputs(graph, &node_id);
+
+                    // Centralized AOP-style logging & feedback
+                    match task_type.to_lowercase().as_str() {
+                        "architect" => info!("[Architect] 🏗️  Planning decomposition for: \"{}\"", Self::truncate(&prompt_preview, 100)),
+                        "coder" => info!("[Coder] 💻 Implementing: \"{}\"", node_id),
+                        "reviewer" => info!("[Reviewer] 🔍 Critiquing: \"{}\"", node_id),
+                        "researcher" => info!("[Researcher] 📚 Validating: \"{}\"", node_id),
+                        "tool" => info!("[Tool] 🛠️  Executing: {} for \"{}\"", metadata.tool_name.as_deref().unwrap_or("Unknown"), node_id),
+                        _ => info!("[Agent] 🤖 Executing: {} (\"{}\")", task_type, node_id),
+                    }
+
                     broker.publish_feedback(AgentFeedback::StateChanged {
-                        task_id: graph.graph_id.clone(),
+                        task_id: graph_id.clone(),
                         current_node: node_id.clone(),
                         status: NodeStatus::Running,
                     });
 
-                    // Publish NodeStarted feedback (Verbose+)
-                    let input_preview = Self::truncate(&prompt_preview, 200);
                     broker.publish_feedback(AgentFeedback::NodeStarted {
-                        task_id: graph.graph_id.clone(),
+                        task_id: graph_id.clone(),
                         node_id: node_id.clone(),
-                        detail: NodeExecutionDetail {
+                        detail: telos_hci::NodeExecutionDetail {
                             node_id: node_id.clone(),
                             task_type: task_type.clone(),
-                            input_preview: input_preview.clone(),
-                            started_at: Some(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64
-                            ),
+                            input_preview: Self::truncate(&prompt_preview, 100),
+                            started_at: Some(std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64),
                         },
+                    });
+
+                    broker.publish_feedback(AgentFeedback::ProgressUpdate {
+                        task_id: graph_id.clone(),
+                        progress: Self::calculate_progress(graph),
                     });
 
                     if let Some(node) = graph.nodes.remove(&node_id) {
                         let id_clone = node_id.clone();
-                        let start_time = Instant::now();
-
+                        let node_start_time = Instant::now();
                         let node_span = info_span!("execute_node", node_id = %id_clone);
+                        let memory_context = if !ctx.precise_facts.is_empty() {
+                            let mut facts_str = String::from("[MEMORY CONTEXT]\nThe following semantic memories might be relevant to your task:\n");
+                            for fact in &ctx.precise_facts {
+                                facts_str.push_str(&format!("- {}\n", fact.target));
+                            }
+                            facts_str.push_str("\n");
+                            Some(facts_str)
+                        } else {
+                            None
+                        };
+
+                        let agent_input = AgentInput {
+                            node_id: id_clone.clone(),
+                            task: prompt_preview.clone(),
+                            dependencies,
+                            schema_payload: graph.node_metadata.get(&node_id).and_then(|m| m.schema_payload.clone()),
+                            memory_context,
+                        };
 
                         futures.push(async move {
-                            let res = node.execute(ctx, registry).instrument(node_span).await;
-                            (id_clone, res, node, start_time)
+                            let output = node.execute(agent_input, registry).instrument(node_span).await;
+                            (id_clone, output, node, node_start_time)
                         });
                         active_tasks += 1;
                     }
                 }
 
-                if active_tasks == 0 {
-                    // Deadlock or disconnected graph components
+                if active_tasks == 0 && ready_queue.is_empty() && waiting_for_input_count == 0 {
                     break;
                 }
 
-                if let Some((node_id, result, node_box, start_time)) = futures.next().await {
-                    active_tasks -= 1;
-                    completed_nodes += 1;
+                tokio::select! {
+                    result = futures.next(), if active_tasks > 0 => {
+                        if let Some((node_id, mut output, node_box, node_start_time)) = result {
+                            active_tasks -= 1;
+                            let execution_time_ms = node_start_time.elapsed().as_millis() as u64;
 
-                    let execution_time_ms = start_time.elapsed().as_millis() as u64;
+                            graph.nodes.insert(node_id.clone(), node_box);
+                            graph.node_results.insert(node_id.clone(), output.clone());
 
-                    graph.nodes.insert(node_id.clone(), node_box);
+                            // Publish TraceLogs
+                            for trace in &output.trace_logs {
+                                broker.publish_feedback(AgentFeedback::Trace {
+                                    task_id: graph_id.clone(),
+                                    node_id: node_id.clone(),
+                                    trace: trace.clone(),
+                                });
+                            }
 
-                    match &result {
-                        Ok(res) => {
-                            graph.node_statuses.insert(node_id.clone(), NodeStatus::Completed);
-                            graph.node_results.insert(node_id.clone(), Ok(res.clone()));
+                            // Handle Help Request (Interaction Pause)
+                            if let Some(ref help) = &output.needs_help {
+                                graph.node_statuses.insert(node_id.clone(), NodeStatus::WaitingForInput);
+                                waiting_for_input_count += 1;
+                                warn!("[DAG Engine] ⏳ Node \"{}\" waiting for input: {}", node_id, help.detail);
 
-                            // Publish StateChanged feedback
-                            broker.publish_feedback(AgentFeedback::StateChanged {
-                                task_id: graph.graph_id.clone(),
-                                current_node: node_id.clone(),
-                                status: NodeStatus::Completed,
-                            });
+                                broker.publish_feedback(AgentFeedback::NodeNeedsHelp {
+                                    task_id: graph_id.clone(),
+                                    node_id: node_id.clone(),
+                                    help: help.clone(),
+                                });
 
-                            // Publish NodeCompleted feedback (Normal+)
-                            let result_preview = Self::truncate(
-                                &String::from_utf8_lossy(&res.output_data),
-                                200,
-                            );
-                            broker.publish_feedback(AgentFeedback::NodeCompleted {
-                                task_id: graph.graph_id.clone(),
-                                node_id: node_id.clone(),
-                                result_preview,
-                                execution_time_ms,
-                            });
+                                broker.publish_feedback(AgentFeedback::StateChanged {
+                                    task_id: graph_id.clone(),
+                                    current_node: node_id.clone(),
+                                    status: NodeStatus::WaitingForInput,
+                                });
 
-                            let node_idx = graph.node_indices.get(&node_id).unwrap();
-                            let mut outgoing = graph.edges.neighbors_directed(*node_idx, Direction::Outgoing).detach();
+                                broker.publish_feedback(AgentFeedback::ProgressUpdate {
+                                    task_id: graph_id.clone(),
+                                    progress: Self::calculate_progress(graph),
+                                });
+                                continue;
+                            }
 
-                            while let Some(neighbor_idx) = outgoing.next_node(&graph.edges) {
-                                if let Some(neighbor_id) = graph.edges.node_weight(neighbor_idx) {
-                                    if let Some(deg) = in_degrees.get_mut(neighbor_id) {
-                                        *deg -= 1;
-                                        if *deg == 0 && graph.node_statuses.get(neighbor_id) == Some(&NodeStatus::Pending) {
-                                            ready_queue.push(neighbor_id.clone());
+                            // Dynamic SubGraph Injection
+                            if let Some(sub_graph) = output.sub_graph.take() {
+                                if let Some(factory) = &self.node_factory {
+                                    let mut added_nodes = Vec::new();
+                                    for sg_node in &sub_graph.nodes {
+                                        let full_id = format!("{}__{}", node_id, sg_node.id);
+                                        if let Some(executable) = factory.create_node(&sg_node.agent_type, &sg_node.task) {
+                                            let combined_task = if sg_node.schema_payload.is_empty() {
+                                                sg_node.task.clone()
+                                            } else {
+                                                format!("{}\n\nStrict Output Requirements:\n{}", sg_node.task, sg_node.schema_payload)
+                                            };
+                                            
+                                            graph.add_node_with_metadata(
+                                                full_id.clone(),
+                                                executable,
+                                                crate::NodeMetadata {
+                                                    task_type: sg_node.agent_type.clone(),
+                                                    prompt_preview: combined_task,
+                                                    tool_name: None,
+                                                    schema_payload: if sg_node.schema_payload.is_empty() { None } else { Some(sg_node.schema_payload.clone()) },
+                                                },
+                                            );
+                                            in_degrees.insert(full_id.clone(), 0);
+                                            added_nodes.push(full_id);
+                                            total_nodes += 1;
+                                        }
+                                    }
+                                    for sg_edge in &sub_graph.edges {
+                                        let from_id = format!("{}__{}", node_id, sg_edge.from);
+                                        let to_id = format!("{}__{}", node_id, sg_edge.to);
+                                        if graph.add_edge_with_type(&from_id, &to_id, sg_edge.dep_type).is_ok() {
+                                            if let Some(deg) = in_degrees.get_mut(&to_id) {
+                                                *deg += 1;
+                                            }
+                                        }
+                                    }
+                                    for full_id in added_nodes {
+                                        if in_degrees.get(&full_id) == Some(&0) {
+                                            ready_queue.push(full_id);
                                         }
                                     }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            graph.node_statuses.insert(node_id.clone(), NodeStatus::Failed);
-                            graph.node_results.insert(node_id.clone(), Err(e.clone()));
-                            failed_nodes += 1;
 
-                            // Publish StateChanged feedback
-                            broker.publish_feedback(AgentFeedback::StateChanged {
-                                task_id: graph.graph_id.clone(),
-                                current_node: node_id.clone(),
-                                status: NodeStatus::Failed,
-                            });
+                            if output.success {
+                                graph.node_statuses.insert(node_id.clone(), NodeStatus::Completed);
+                                info!("[DAG Engine] ✓ Node \"{}\" completed in {}ms", node_id, execution_time_ms);
 
-                            // Publish NodeFailed feedback (Normal+)
-                            broker.publish_feedback(AgentFeedback::NodeFailed {
-                                task_id: graph.graph_id.clone(),
-                                node_id: node_id.clone(),
-                                error: ErrorDetail::from_node_error(e),
-                            });
+                                broker.publish_feedback(AgentFeedback::StateChanged {
+                                    task_id: graph_id.clone(),
+                                    current_node: node_id.clone(),
+                                    status: NodeStatus::Completed,
+                                });
+
+                                broker.publish_feedback(AgentFeedback::NodeCompleted {
+                                    task_id: graph_id.clone(),
+                                    node_id: node_id.clone(),
+                                    result_preview: output.output.as_ref().map(|o| Self::truncate(&o.to_string(), 100)).unwrap_or_else(|| "No output".to_string()),
+                                    execution_time_ms,
+                                });
+
+                                let node_idx = graph.node_indices.get(&node_id).unwrap();
+                                let mut outgoing = graph.edges.neighbors_directed(*node_idx, Direction::Outgoing).detach();
+                                while let Some(neighbor_idx) = outgoing.next_node(&graph.edges) {
+                                    if let Some(neighbor_id) = graph.edges.node_weight(neighbor_idx) {
+                                        if let Some(deg) = in_degrees.get_mut(neighbor_id) {
+                                            *deg -= 1;
+                                            if *deg == 0 && graph.node_statuses.get(neighbor_id) == Some(&NodeStatus::Pending) {
+                                                ready_queue.push(neighbor_id.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                completed_nodes += 1;
+                            } else {
+                                graph.node_statuses.insert(node_id.clone(), NodeStatus::Failed);
+                                completed_nodes += 1;
+                                failed_nodes += 1;
+
+                                // 检查是否为致命错误
+                                if let Some(ref error) = output.error {
+                                    if error.severity == ErrorSeverity::Fatal {
+                                        fatal_error_encountered = true;
+                                        error!(
+                                            "[DAG Engine] 💀 Fatal error encountered in node \"{}\": {}",
+                                            node_id, error.message
+                                        );
+                                    }
+                                }
+
+                                broker.publish_feedback(AgentFeedback::StateChanged {
+                                    task_id: graph_id.clone(),
+                                    current_node: node_id.clone(),
+                                    status: NodeStatus::Failed,
+                                });
+
+                                broker.publish_feedback(AgentFeedback::NodeFailed {
+                                    task_id: graph_id.clone(),
+                                    node_id: node_id.clone(),
+                                    error: output.error.as_ref().map(|e| ErrorDetail {
+                                        error_type: e.error_type.clone(),
+                                        message: e.message.clone(),
+                                        stack_trace: e.technical_detail.clone(),
+                                        retry_suggested: e.retry_suggested,
+                                    }).unwrap_or(ErrorDetail {
+                                        error_type: "Unknown".to_string(),
+                                        message: "Node execution failed".to_string(),
+                                        stack_trace: None,
+                                        retry_suggested: false,
+                                    }),
+                                });
+                            }
+
+                            // Regular progress update (if didn't update already)
+                            if last_progress_update.elapsed() >= progress_update_interval {
+                                broker.publish_feedback(AgentFeedback::ProgressUpdate {
+                                    task_id: graph_id.clone(),
+                                    progress: Self::calculate_progress(graph),
+                                });
+                                last_progress_update = Instant::now();
+                            }
                         }
                     }
+                    Some((wake_task_id, wake_node_id, instruction)) = self.wakeup_rx.recv() => {
+                        if wake_task_id == graph_id {
+                            if let Some(status) = graph.node_statuses.get_mut(&wake_node_id) {
+                                if *status == NodeStatus::WaitingForInput {
+                                    *status = NodeStatus::Pending;
+                                    if waiting_for_input_count > 0 {
+                                        waiting_for_input_count -= 1;
+                                    }
+                                    
+                                    // Inject the user instruction into the node's task metadata
+                                    if let Some(metadata) = graph.node_metadata.get_mut(&wake_node_id) {
+                                        metadata.prompt_preview.push_str(&format!("\n\n[Human Intervention / Expert Help]:\n{}", instruction));
+                                    }
+                                    
+                                    ready_queue.push(wake_node_id.clone());
+                                    info!("[DAG Engine] ⚡ Node \"{}\" woken up by user input", wake_node_id);
 
-                    // Publish ProgressUpdate periodically (Normal+)
-                    if last_progress_update.elapsed() >= progress_update_interval {
-                        let progress = Self::calculate_progress(graph);
-                        broker.publish_feedback(AgentFeedback::ProgressUpdate {
-                            task_id: graph.graph_id.clone(),
-                            progress,
-                        });
-                        last_progress_update = Instant::now();
+                                    broker.publish_feedback(AgentFeedback::StateChanged {
+                                        task_id: graph_id.clone(),
+                                        current_node: wake_node_id.clone(),
+                                        status: NodeStatus::Pending,
+                                    });
+
+                                    broker.publish_feedback(AgentFeedback::ProgressUpdate {
+                                        task_id: graph_id.clone(),
+                                        progress: Self::calculate_progress(graph),
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            // Final progress update
-            let final_progress = Self::calculate_progress(graph);
-            broker.publish_feedback(AgentFeedback::ProgressUpdate {
-                task_id: graph.graph_id.clone(),
-                progress: final_progress,
-            });
+            // 确定最终状态
+            if final_state == TaskFinalState::Unknown {
+                if completed_nodes == total_nodes && failed_nodes == 0 {
+                    final_state = TaskFinalState::Success;
+                } else if failed_nodes == 0 {
+                    final_state = TaskFinalState::Success;
+                } else if completed_nodes > failed_nodes {
+                    final_state = TaskFinalState::PartialSuccess;
+                } else {
+                    final_state = TaskFinalState::Unknown;
+                }
+            }
 
             graph.current_state.is_running = false;
-            graph.current_state.completed = completed_nodes == total_nodes;
+            graph.current_state.completed = final_state.is_success();
+
+            // 4. Removed duplicate send_task_completed.
+            // The caller (main.rs daemon loop) is responsible for emitting TaskCompleted 
+            // after performing the Router evaluation and outputting final responses.
         }
         .instrument(graph_span)
         .await;

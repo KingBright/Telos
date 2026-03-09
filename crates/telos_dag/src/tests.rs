@@ -4,8 +4,7 @@ use crate::{ExecutableNode, ExecutionEngine, TaskGraph};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use telos_context::ScopedContext;
-use telos_core::{NodeError, NodeResult, SystemRegistry};
+use telos_core::{AgentInput, AgentOutput, SystemRegistry, DependencyType};
 use telos_hci::{AgentEvent, AgentFeedback, EventBroker, EventBrokerError};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -49,9 +48,6 @@ struct GatewayRegistry {
 
 impl SystemRegistry for GatewayRegistry {
     fn get_model_gateway(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-        // Need to wrap the trait object Arc into another Arc<Any> layer to safely downcast
-        // Or rather, box the Arc itself into Any. Since `Arc<T>: Any` if `T: 'static`.
-        // Let's return Arc::new(self.gateway.clone())
         let arc_gateway: std::sync::Arc<dyn telos_model_gateway::ModelGateway> = self.gateway.clone();
         Some(std::sync::Arc::new(arc_gateway))
     }
@@ -79,14 +75,18 @@ struct LlmTestNode {
 impl ExecutableNode for LlmTestNode {
     async fn execute(
         &self,
-        _ctx: &ScopedContext,
+        input: AgentInput,
         registry: &dyn SystemRegistry,
-    ) -> Result<NodeResult, NodeError> {
-        let gateway_any = registry.get_model_gateway()
-            .ok_or_else(|| NodeError::ExecutionFailed("Gateway not found".to_string()))?;
+    ) -> AgentOutput {
+        let gateway_any = match registry.get_model_gateway() {
+            Some(g) => g,
+            None => return AgentOutput::failure("GatewayNotFound", "Gateway not found"),
+        };
 
-        let gateway = gateway_any.downcast_ref::<std::sync::Arc<dyn telos_model_gateway::ModelGateway>>()
-            .ok_or_else(|| NodeError::ExecutionFailed("Downcast failed".to_string()))?;
+        let gateway = match gateway_any.downcast_ref::<std::sync::Arc<dyn telos_model_gateway::ModelGateway>>() {
+            Some(g) => g,
+            None => return AgentOutput::failure("DowncastFailed", "Downcast failed"),
+        };
 
         let req = telos_model_gateway::LlmRequest {
             session_id: "test".to_string(),
@@ -95,14 +95,13 @@ impl ExecutableNode for LlmTestNode {
             budget_limit: 100,
         };
 
-        let response = gateway.generate(req).await
-            .map_err(|_| NodeError::ExecutionFailed("LLM generation failed".to_string()))?;
-
-        Ok(NodeResult {
-            output_data: response.content.into_bytes(),
-            extracted_knowledge: None,
-            next_routing_hint: None,
-        })
+        match gateway.generate(req).await {
+            Ok(response) => AgentOutput::success(serde_json::json!({
+                "text": response.content,
+                "node_id": input.node_id
+            })),
+            Err(_) => AgentOutput::failure("LLMGenerationFailed", "LLM generation failed"),
+        }
     }
 }
 
@@ -118,15 +117,15 @@ struct TestNode {
 impl ExecutableNode for TestNode {
     async fn execute(
         &self,
-        _ctx: &ScopedContext,
+        input: AgentInput,
         _registry: &dyn SystemRegistry,
-    ) -> Result<NodeResult, NodeError> {
+    ) -> AgentOutput {
         self.counter.fetch_add(1, Ordering::SeqCst);
-        Ok(NodeResult {
-            output_data: self.output.clone(),
-            extracted_knowledge: None,
-            next_routing_hint: None,
-        })
+        AgentOutput::success(serde_json::json!({
+            "text": String::from_utf8_lossy(&self.output).to_string(),
+            "node_id": input.node_id,
+            "dependencies": input.dependencies.keys().collect::<Vec<_>>()
+        }))
     }
 }
 
@@ -162,7 +161,7 @@ async fn test_dag_execution_order() {
     let mut engine = TokioExecutionEngine::new();
     let broker = DummyBroker::new();
     let registry = DummyRegistry;
-    let ctx = ScopedContext {
+    let ctx = telos_context::ScopedContext {
         budget_tokens: 1000,
         summary_tree: vec![],
         precise_facts: vec![],
@@ -172,10 +171,13 @@ async fn test_dag_execution_order() {
     assert!(graph.current_state.completed);
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 
-    // Check outputs
-    assert_eq!(graph.node_results.get("A").unwrap().as_ref().unwrap().output_data, vec![1]);
-    assert_eq!(graph.node_results.get("B").unwrap().as_ref().unwrap().output_data, vec![2]);
-    assert_eq!(graph.node_results.get("C").unwrap().as_ref().unwrap().output_data, vec![3]);
+    // Check outputs - now AgentOutput
+    let result_a = graph.node_results.get("A").unwrap();
+    assert!(result_a.success);
+    let result_b = graph.node_results.get("B").unwrap();
+    assert!(result_b.success);
+    let result_c = graph.node_results.get("C").unwrap();
+    assert!(result_c.success);
 }
 
 #[tokio::test]
@@ -195,7 +197,7 @@ async fn test_parallel_execution() {
     let mut engine = TokioExecutionEngine::new();
     let broker = DummyBroker::new();
     let registry = DummyRegistry;
-    let ctx = ScopedContext {
+    let ctx = telos_context::ScopedContext {
         budget_tokens: 1000,
         summary_tree: vec![],
         precise_facts: vec![],
@@ -226,7 +228,7 @@ async fn test_checkpoint_recovery() {
 #[tokio::test]
 async fn test_llm_node_integration() {
     let provider = Arc::new(DummyModelProvider);
-    let gateway = Arc::new(telos_model_gateway::gateway::GatewayManager::new(provider, 100, 10.0));
+    let gateway = Arc::new(telos_model_gateway::gateway::GatewayManager::new(provider, 100));
     let registry = GatewayRegistry { gateway: gateway.clone() };
 
     let mut graph = TaskGraph::new("llm_graph".into());
@@ -234,11 +236,66 @@ async fn test_llm_node_integration() {
 
     let mut engine = TokioExecutionEngine::new();
     let broker = DummyBroker::new();
-    let ctx = ScopedContext { budget_tokens: 1000, summary_tree: vec![], precise_facts: vec![] };
+    let ctx = telos_context::ScopedContext { budget_tokens: 1000, summary_tree: vec![], precise_facts: vec![] };
 
     engine.run_graph(&mut graph, &ctx, &registry, &broker).await;
 
     assert!(graph.current_state.completed);
-    let result = graph.node_results.get("LlmNode").unwrap().as_ref().unwrap();
-    assert_eq!(result.output_data, b"Mock LLM Response");
+    let result = graph.node_results.get("LlmNode").unwrap();
+    assert!(result.success);
+    assert_eq!(result.output.as_ref().unwrap()["text"], "Mock LLM Response");
+}
+
+#[tokio::test]
+async fn test_dependency_types() {
+    let mut graph = TaskGraph::new("test_dep_types".into());
+
+    graph.add_node("A".into(), Box::new(TestNode { _id: "A".into(), counter: Arc::new(AtomicUsize::new(0)), output: vec![1] }));
+    graph.add_node("B".into(), Box::new(TestNode { _id: "B".into(), counter: Arc::new(AtomicUsize::new(0)), output: vec![2] }));
+
+    // Add edge with Data dependency type
+    graph.add_edge_with_type("A", "B", DependencyType::Data).unwrap();
+
+    // Verify edge type was stored
+    assert_eq!(graph.edge_types.get(&("A".to_string(), "B".to_string())), Some(&DependencyType::Data));
+
+    // Verify get_dependencies works
+    let deps = graph.get_dependencies("B");
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0], ("A".to_string(), DependencyType::Data));
+}
+
+#[tokio::test]
+async fn test_control_vs_data_dependency() {
+    let mut graph = TaskGraph::new("test_control_vs_data".into());
+    let counter_a = Arc::new(AtomicUsize::new(0));
+    let counter_b = Arc::new(AtomicUsize::new(0));
+    let counter_c = Arc::new(AtomicUsize::new(0));
+
+    // A --data--> B
+    // A --control--> C
+    graph.add_node("A".into(), Box::new(TestNode { _id: "A".into(), counter: counter_a.clone(), output: b"data_from_a".to_vec() }));
+    graph.add_node("B".into(), Box::new(TestNode { _id: "B".into(), counter: counter_b.clone(), output: b"data_from_b".to_vec() }));
+    graph.add_node("C".into(), Box::new(TestNode { _id: "C".into(), counter: counter_c.clone(), output: b"data_from_c".to_vec() }));
+
+    graph.add_edge_with_type("A", "B", DependencyType::Data).unwrap();
+    graph.add_edge_with_type("A", "C", DependencyType::Control).unwrap();
+
+    let mut engine = TokioExecutionEngine::new();
+    let broker = DummyBroker::new();
+    let registry = DummyRegistry;
+    let ctx = telos_context::ScopedContext { budget_tokens: 1000, summary_tree: vec![], precise_facts: vec![] };
+
+    engine.run_graph(&mut graph, &ctx, &registry, &broker).await;
+
+    // All nodes should complete
+    assert!(graph.current_state.completed);
+
+    // Check that B received A's output (data dependency)
+    let result_b = graph.node_results.get("B").unwrap();
+    assert!(result_b.success);
+
+    // Check that C completed but did NOT receive A's output (control dependency)
+    let result_c = graph.node_results.get("C").unwrap();
+    assert!(result_c.success);
 }
