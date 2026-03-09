@@ -18,6 +18,10 @@ pub trait MemoryIntegration: Send + Sync {
     /// Designed for the HCI Event Bus (Module 1).
     /// Direct, high-priority user feedback triggers immediate write operations to Semantic Memory with maximum strength, ensuring user preferences override default behaviors.
     async fn ingest_user_feedback(&self, feedback: &str, strength: f32) -> Result<(), String>;
+
+    /// Designed for explicit memory storage via tools.
+    /// Allows the agent to explicitly store important facts or insights as semantic memories.
+    async fn store_semantic_fact(&self, content: String) -> Result<(), String>;
 }
 
 // Implement this trait for any system that implements `MemoryOS` (like RedbGraphStore).
@@ -68,6 +72,21 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
         // Force the specified strength to ensure high priority overrides
         entry.base_strength = strength;
         entry.current_strength = strength;
+
+        self.store(entry).await
+    }
+
+    async fn store_semantic_fact(&self, content: String) -> Result<(), String> {
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let entry_id = format!("semantic_{}", timestamp);
+
+        let entry = MemoryEntry::new(
+            entry_id,
+            MemoryType::Semantic,
+            content,
+            timestamp,
+            None,
+        );
 
         self.store(entry).await
     }

@@ -28,6 +28,7 @@ use telos_hci::{
     TaskSummary, TokioEventBroker,
 };
 use telos_memory::engine::RedbGraphStore;
+use telos_memory::integration::MemoryIntegration;
 use telos_model_gateway::gateway::{GatewayManager, ModelProvider};
 use telos_model_gateway::{Capability, GatewayError, LlmRequest, LlmResponse, ModelGateway};
 use telos_tooling::ToolRegistry;
@@ -175,7 +176,7 @@ impl ExecutableNode for ReactNode {
     async fn execute(
         &self,
         _ctx: &ScopedContext,
-        _registry: &dyn SystemRegistry,
+        registry: &dyn SystemRegistry,
     ) -> Result<NodeResult, NodeError> {
         let mut loop_count = 0;
         let mut session_messages = vec![telos_model_gateway::Message {
@@ -230,10 +231,59 @@ impl ExecutableNode for ReactNode {
 
                     match executor.call(params.clone()).await {
                         Ok(tool_output) => {
+                            // Handle memory tool macros
                             let tool_output_str = String::from_utf8_lossy(&tool_output).to_string();
+                            let response_content = if let Ok(json_res) = serde_json::from_str::<serde_json::Value>(&tool_output_str) {
+                                if let Some(macro_type) = json_res.get("__macro__").and_then(|m| m.as_str()) {
+                                    match macro_type {
+                                        "memory_recall" => {
+                                            let query = json_res.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                                            if let Some(memory_os_any) = registry.get_memory_os() {
+                                                if let Ok(memory_integration) = memory_os_any.clone().downcast::<telos_memory::engine::RedbGraphStore>() {
+                                                    match memory_integration.retrieve_semantic_facts(query.to_string()).await {
+                                                        Ok(facts) => {
+                                                            if facts.is_empty() {
+                                                                format!("Memory recall: No relevant memories found for '{}'", query)
+                                                            } else {
+                                                                format!("Memory recall for '{}':\n{}", query, facts.join("\n"))
+                                                            }
+                                                        }
+                                                        Err(e) => format!("Memory recall failed: {:?}", e),
+                                                    }
+                                                } else {
+                                                    "Memory system downcast failed".to_string()
+                                                }
+                                            } else {
+                                                "Memory system not available".to_string()
+                                            }
+                                        }
+                                        "memory_store" => {
+                                            let content = json_res.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                                            if let Some(memory_os_any) = registry.get_memory_os() {
+                                                if let Ok(memory_integration) = memory_os_any.clone().downcast::<telos_memory::engine::RedbGraphStore>() {
+                                                    match memory_integration.store_semantic_fact(content.to_string()).await {
+                                                        Ok(_) => format!("Successfully stored in memory: {}", content),
+                                                        Err(e) => format!("Failed to store in memory: {:?}", e),
+                                                    }
+                                                } else {
+                                                    "Memory system downcast failed".to_string()
+                                                }
+                                            } else {
+                                                "Memory system not available".to_string()
+                                            }
+                                        }
+                                        _ => tool_output_str.clone(),
+                                    }
+                                } else {
+                                    tool_output_str.clone()
+                                }
+                            } else {
+                                tool_output_str.clone()
+                            };
+
                             session_messages.push(telos_model_gateway::Message {
                                 role: "user".to_string(),
-                                content: format!("Tool output: {}", tool_output_str),
+                                content: format!("Tool output: {}", response_content),
                             });
                         }
                         Err(e) => {
@@ -449,6 +499,83 @@ impl ExecutableNode for WasmToolNode {
                                 )));
                             }
                         }
+                    } else if json_res.get("__macro__").and_then(|m| m.as_str()) == Some("memory_recall") {
+                        // Handle memory_recall macro
+                        let query = json_res.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                        let system_registry = _registry;
+                        if let Some(memory_os_any) = system_registry.get_memory_os() {
+                            if let Ok(memory_integration) = memory_os_any.clone().downcast::<telos_memory::engine::RedbGraphStore>() {
+                                match memory_integration.retrieve_semantic_facts(query.to_string()).await {
+                                    Ok(facts) => {
+                                        let result = if facts.is_empty() {
+                                            format!("No relevant memories found for '{}'", query)
+                                        } else {
+                                            format!("Memories for '{}':\n{}", query, facts.join("\n"))
+                                        };
+                                        return Ok(NodeResult {
+                                            output_data: result.into_bytes(),
+                                            extracted_knowledge: None,
+                                            next_routing_hint: None,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        return Ok(NodeResult {
+                                            output_data: format!("Memory recall failed: {:?}", e).into_bytes(),
+                                            extracted_knowledge: None,
+                                            next_routing_hint: None,
+                                        });
+                                    }
+                                }
+                            } else {
+                                return Ok(NodeResult {
+                                    output_data: b"Memory system downcast failed".to_vec(),
+                                    extracted_knowledge: None,
+                                    next_routing_hint: None,
+                                });
+                            }
+                        } else {
+                            return Ok(NodeResult {
+                                output_data: b"Memory system not available".to_vec(),
+                                extracted_knowledge: None,
+                                next_routing_hint: None,
+                            });
+                        }
+                    } else if json_res.get("__macro__").and_then(|m| m.as_str()) == Some("memory_store") {
+                        // Handle memory_store macro
+                        let content = json_res.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let system_registry = _registry;
+                        if let Some(memory_os_any) = system_registry.get_memory_os() {
+                            if let Ok(memory_integration) = memory_os_any.clone().downcast::<telos_memory::engine::RedbGraphStore>() {
+                                match memory_integration.store_semantic_fact(content.to_string()).await {
+                                    Ok(_) => {
+                                        return Ok(NodeResult {
+                                            output_data: format!("Successfully stored in memory: {}", content).into_bytes(),
+                                            extracted_knowledge: None,
+                                            next_routing_hint: None,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        return Ok(NodeResult {
+                                            output_data: format!("Failed to store in memory: {:?}", e).into_bytes(),
+                                            extracted_knowledge: None,
+                                            next_routing_hint: None,
+                                        });
+                                    }
+                                }
+                            } else {
+                                return Ok(NodeResult {
+                                    output_data: b"Memory system downcast failed".to_vec(),
+                                    extracted_knowledge: None,
+                                    next_routing_hint: None,
+                                });
+                            }
+                        } else {
+                            return Ok(NodeResult {
+                                output_data: b"Memory system not available".to_vec(),
+                                extracted_knowledge: None,
+                                next_routing_hint: None,
+                            });
+                        }
                     }
                 }
 
@@ -557,6 +684,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         telos_tooling::native::ToolRegisterTool::schema(),
         Some(std::sync::Arc::new(telos_tooling::native::ToolRegisterTool)),
     );
+    // Register memory tools for explicit memory operations
+    tool_registry.register_tool(
+        telos_tooling::native::MemoryRecallTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::MemoryRecallTool)),
+    );
+    tool_registry.register_tool(
+        telos_tooling::native::MemoryStoreTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::MemoryStoreTool)),
+    );
+    // Register code editing tools
+    tool_registry.register_tool(
+        telos_tooling::native::FileEditTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::FileEditTool)),
+    );
+    // Register file search tools
+    tool_registry.register_tool(
+        telos_tooling::native::GlobTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::GlobTool)),
+    );
+    tool_registry.register_tool(
+        telos_tooling::native::GrepTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::GrepTool)),
+    );
+    // Register web tools
+    tool_registry.register_tool(
+        telos_tooling::native::HttpTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::HttpTool)),
+    );
+    tool_registry.register_tool(
+        telos_tooling::native::WebSearchTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::WebSearchTool)),
+    );
+    // Register LSP tool for code navigation
+    tool_registry.register_tool(
+        telos_tooling::native::LspTool::schema(),
+        Some(std::sync::Arc::new(telos_tooling::native::LspTool)),
+    );
 
     // --- Auto-Load Persisted Tools on Startup ---
     let target_dir = std::path::Path::new(&config.tools_dir);
@@ -614,7 +778,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _memory =
         Arc::new(RedbGraphStore::new(&config.db_path).expect("Failed to init MemoryOS database"));
     // Using cloud embeddings as configured
-    let _context_manager = Arc::new(RaptorContextManager::new(
+    let context_manager = Arc::new(RaptorContextManager::new(
         Arc::new(openai_provider.clone()),
         Arc::new(openai_provider.clone()),
         Some(memory_os_instance.clone() as Arc<dyn telos_memory::integration::MemoryIntegration>),
@@ -660,7 +824,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let paused_tasks_bg = paused_tasks_bg.clone();
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new();
 
-                    let _context_manager_unused = _context_manager.clone();
+                    let context_manager_spawn = context_manager.clone();
                     tokio::spawn(async move {
                         let task_start_time = Instant::now();
                         println!(
@@ -719,45 +883,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // --- DYNAMIC DAG GENERATION VIA LLM ---
                         let prompt = format!(
-                            r#"You are an expert planner. Break down the following task into a directed acyclic graph (DAG) of sub-tasks.
+                            r#"You are an expert planner. First classify the task complexity, then break it down appropriately.
 
-## Available Tools (use task_type: "TOOL" for these):
-- fs_read: Read file contents (requires path parameter)
-- fs_write: Write content to file (requires path and content parameters)
-- shell_exec: Execute shell commands (requires command parameter)
-- calculator: Perform mathematical calculations (requires expression parameter)
+## Tier Classification Rules:
+1. "Simple" - Single LLM call is enough:
+   - Simple questions, explanations, summaries
+   - Basic math (2+2), creative writing
+   - Code explanation, knowledge retrieval
+   → nodes: empty (single LLM call will be used automatically)
 
-## Task Type Rules:
-1. Use "LLM" for:
-   - Answering questions, explanations, analysis, writing text
-   - Creative tasks (writing, brainstorming)
-   - Code analysis and explanation
-   - Simple arithmetic (2+2, basic math)
-   - Reasoning and logic tasks
+2. "Medium" - Requires tool usage in a loop (ReAct pattern):
+   - Tasks needing file reads, web searches
+   - Multi-step reasoning with tool calls
+   - Code tasks requiring multiple file operations
+   → nodes: empty (ReAct loop will be used automatically)
 
-2. Use "TOOL" ONLY when:
-   - Need to read/write files → fs_read or fs_write
-   - Need to run shell commands → shell_exec
-   - Need to evaluate complex math expressions → calculator
-   - **DO NOT use TOOL for simple questions or calculations**
+3. "Complex" - Requires explicit DAG with multiple parallel/sequential nodes:
+   - Multi-stage workflows with dependencies
+   - Parallel task execution needed
+   - Complex orchestration between different components
+   → nodes: explicit DAG nodes required
 
-3. Task Type Decision Examples:
-   - "calculate 2+2" → LLM (simple math)
-   - "calculate sqrt(pi * e^2)" → TOOL calculator (complex)
-   - "what is the capital of France" → LLM (knowledge)
-   - "read file /tmp/test.txt" → TOOL fs_read
-   - "analyze this code" → LLM (analysis)
+## Available Tools (for Medium/Complex tiers):
+- fs_read, fs_write: File operations
+- shell_exec: Shell commands
+- calculator: Math calculations
+- memory_recall, memory_store: Memory operations
+- file_edit: Edit files by search/replace
+- glob, grep: File/code search
+- http_get, web_search: Web operations
+- lsp_symbol_search: Code navigation
 
 ## Instructions:
-First, generate a friendly, conversational response in the `reply` field acknowledging the user's intent.
-Then create nodes for the task breakdown.
+1. Classify the task tier (Simple/Medium/Complex)
+2. For Simple/Medium: no nodes needed (automatic handling)
+3. For Complex: create DAG nodes with proper edges
 
 Task: {}
 
 Respond strictly with a JSON object matching this schema:
 {{
-    "reply": "string",
-    "nodes": [ {{ "id": "string", "task_type": "LLM" or "TOOL", "prompt": "Detailed execution instruction for this node" }} ],
+    "tier": "Simple" or "Medium" or "Complex",
+    "reply": "string (friendly acknowledgment of the task)",
+    "nodes": [ {{ "id": "string", "task_type": "LLM" or "TOOL", "prompt": "Detailed execution instruction" }} ],
     "edges": [ {{ "from": "node_id_1", "to": "node_id_2" }} ]
 }}
 Do not include markdown blocks, only raw JSON."#,
@@ -948,16 +1116,33 @@ Do not include markdown blocks, only raw JSON."#,
                             };
                         }
 
-                        let empty_ctx = telos_context::ScopedContext {
-                            budget_tokens: 1000,
-                            summary_tree: vec![],
-                            precise_facts: vec![],
+                        // Build context using the context manager with memory integration
+                        let raw_ctx = telos_context::RawContext {
+                            history_logs: vec![],  // Could include session history here
+                            retrieved_docs: vec![],
                         };
+                        let ctx_req = telos_context::NodeRequirement {
+                            required_tokens: 2000,
+                            query: enriched_payload.clone(),
+                        };
+                        let actual_ctx = context_manager_spawn.compress_for_node(&raw_ctx, &ctx_req).await
+                            .unwrap_or_else(|e| {
+                                println!("[Daemon] Context compression failed: {:?}, using empty context", e);
+                                telos_context::ScopedContext {
+                                    budget_tokens: 1000,
+                                    summary_tree: vec![],
+                                    precise_facts: vec![],
+                                }
+                            });
+
+                        println!("[Daemon] Context prepared with {} summary nodes and {} precise facts",
+                            actual_ctx.summary_tree.len(),
+                            actual_ctx.precise_facts.len());
 
                         execution_engine
                             .run_graph(
                                 &mut graph,
-                                &empty_ctx,
+                                &actual_ctx,
                                 registry_clone.as_ref(),
                                 broker_bg.as_ref(),
                             )
@@ -1048,7 +1233,7 @@ Do not include markdown blocks, only raw JSON."#,
                     let paused_tasks_bg = paused_tasks_bg.clone();
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new();
 
-                    let context_manager = _context_manager.clone();
+                    let context_manager_approval = context_manager.clone();
                     tokio::spawn(async move {
                         let task_start_time = Instant::now();
                         println!(
@@ -1125,7 +1310,7 @@ Do not include markdown blocks, only raw JSON."#,
                                 required_tokens: 1000,
                                 query: payload.clone(),
                             };
-                            let actual_ctx = context_manager.compress_for_node(&raw_ctx, &req).await.unwrap_or_else(|_e| telos_context::ScopedContext {
+                            let actual_ctx = context_manager_approval.compress_for_node(&raw_ctx, &req).await.unwrap_or_else(|_e| telos_context::ScopedContext {
                                 budget_tokens: 1000,
                                 summary_tree: vec![],
                                 precise_facts: vec![],
