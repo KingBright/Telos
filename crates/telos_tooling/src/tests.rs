@@ -1,5 +1,4 @@
 #[cfg(test)]
-mod tests {
     use crate::{JsonSchema, ToolError, ToolExecutor, ToolRegistry, ToolSchema};
     use crate::sandbox::{SandboxConfig, WasmExecutor};
     use crate::retrieval::VectorToolRegistry;
@@ -55,9 +54,10 @@ mod tests {
     #[tokio::test]
     async fn test_sandbox_isolation_infinite_loop() {
         let wasm_bytes = get_infinite_loop_wasm();
-        let mut config = SandboxConfig::default();
-        // Set a very low fuel limit so it traps quickly
-        config.max_fuel = 1000;
+        let config = SandboxConfig {
+            max_fuel: 1000,
+            ..Default::default()
+        };
         let executor = WasmExecutor::new(wasm_bytes, config).expect("Failed to create executor");
 
         let result: Result<Vec<u8>, ToolError> = executor.call(json!({})).await;
@@ -99,4 +99,3 @@ mod tests {
         assert_eq!(file_tools.len(), 1);
         assert_eq!(file_tools[0].name, "file_reader");
     }
-}

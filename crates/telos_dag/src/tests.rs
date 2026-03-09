@@ -61,7 +61,7 @@ impl SystemRegistry for GatewayRegistry {
 struct DummyModelProvider;
 #[async_trait]
 impl telos_model_gateway::gateway::ModelProvider for DummyModelProvider {
-    async fn generate(&self, req: &telos_model_gateway::LlmRequest) -> Result<telos_model_gateway::LlmResponse, telos_model_gateway::GatewayError> {
+    async fn generate(&self, _req: &telos_model_gateway::LlmRequest) -> Result<telos_model_gateway::LlmResponse, telos_model_gateway::GatewayError> {
         Ok(telos_model_gateway::LlmResponse {
             content: "Mock LLM Response".to_string(),
             tokens_used: 10,
@@ -72,7 +72,7 @@ impl telos_model_gateway::gateway::ModelProvider for DummyModelProvider {
 // A node that tests LLM invocation
 #[derive(Clone)]
 struct LlmTestNode {
-    id: String,
+    _id: String,
 }
 
 #[async_trait]
@@ -109,7 +109,7 @@ impl ExecutableNode for LlmTestNode {
 // A simple test node that just stores a completion count.
 #[derive(Clone)]
 struct TestNode {
-    id: String,
+    _id: String,
     counter: Arc<AtomicUsize>,
     output: Vec<u8>,
 }
@@ -136,17 +136,17 @@ async fn test_dag_execution_order() {
     let counter = Arc::new(AtomicUsize::new(0));
 
     let node_a = Box::new(TestNode {
-        id: "A".into(),
+        _id: "A".into(),
         counter: counter.clone(),
         output: vec![1],
     });
     let node_b = Box::new(TestNode {
-        id: "B".into(),
+        _id: "B".into(),
         counter: counter.clone(),
         output: vec![2],
     });
     let node_c = Box::new(TestNode {
-        id: "C".into(),
+        _id: "C".into(),
         counter: counter.clone(),
         output: vec![3],
     });
@@ -185,9 +185,9 @@ async fn test_parallel_execution() {
 
     // A and B have no dependencies, should run in parallel.
     // C depends on both A and B.
-    graph.add_node("A".into(), Box::new(TestNode { id: "A".into(), counter: counter.clone(), output: vec![1] }));
-    graph.add_node("B".into(), Box::new(TestNode { id: "B".into(), counter: counter.clone(), output: vec![2] }));
-    graph.add_node("C".into(), Box::new(TestNode { id: "C".into(), counter: counter.clone(), output: vec![3] }));
+    graph.add_node("A".into(), Box::new(TestNode { _id: "A".into(), counter: counter.clone(), output: vec![1] }));
+    graph.add_node("B".into(), Box::new(TestNode { _id: "B".into(), counter: counter.clone(), output: vec![2] }));
+    graph.add_node("C".into(), Box::new(TestNode { _id: "C".into(), counter: counter.clone(), output: vec![3] }));
 
     graph.add_edge("A", "C").unwrap();
     graph.add_edge("B", "C").unwrap();
@@ -230,7 +230,7 @@ async fn test_llm_node_integration() {
     let registry = GatewayRegistry { gateway: gateway.clone() };
 
     let mut graph = TaskGraph::new("llm_graph".into());
-    graph.add_node("LlmNode".into(), Box::new(LlmTestNode { id: "LlmNode".into() }));
+    graph.add_node("LlmNode".into(), Box::new(LlmTestNode { _id: "LlmNode".into() }));
 
     let mut engine = TokioExecutionEngine::new();
     let broker = DummyBroker::new();

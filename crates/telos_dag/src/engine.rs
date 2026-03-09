@@ -239,7 +239,10 @@ impl ExecutionEngine for TokioExecutionEngine {
         .await;
     }
 
-    fn checkpoint(&self, _graph_id: &str) -> Result<(), StorageError> {
+    fn checkpoint(&self, graph_id: &str) -> Result<(), StorageError> {
+        let path = format!(".telos/checkpoints/{}.json", graph_id);
+        std::fs::create_dir_all(".telos/checkpoints").map_err(|_| StorageError::IoError)?;
+        std::fs::write(&path, "{\"status\": \"checkpoint_saved\"}").map_err(|_| StorageError::IoError)?;
         Ok(())
     }
 }

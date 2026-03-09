@@ -12,12 +12,13 @@ use telos_core::{NodeResult, NodeStatus, RiskLevel};
 // ============================================================================
 
 /// Log level for controlling feedback verbosity
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     /// Only final results and human intervention prompts
     Quiet = 0,
     /// Plan summary, node status, errors, progress (default)
+    #[default]
     Normal = 1,
     /// Full Plan details, node execution content, intermediate results
     Verbose = 2,
@@ -25,11 +26,7 @@ pub enum LogLevel {
     Debug = 3,
 }
 
-impl Default for LogLevel {
-    fn default() -> Self {
-        LogLevel::Normal
-    }
-}
+
 
 impl LogLevel {
     /// Convert from u8 value
@@ -49,7 +46,7 @@ impl LogLevel {
     }
 
     /// Parse from string (case-insensitive)
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_string(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "quiet" => LogLevel::Quiet,
             "normal" => LogLevel::Normal,

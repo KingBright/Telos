@@ -44,6 +44,66 @@ impl ActorCriticEvaluator {
     }
 }
 
+#[async_trait]
+impl Evaluator for ActorCriticEvaluator {
+    async fn detect_drift(&self, trace: &ExecutionTrace) -> Result<(), DriftWarning> {
+        if trace.steps.len() < 2 {
+            return Ok(());
+        }
+
+        // Extract text representations of the last two steps
+        let steps_text: Vec<String> = trace.steps.iter().rev().take(2).map(|step| {
+            format!("Node: {}, Input: {}, Output: {:?}",
+                step.node_id,
+                step.input_data,
+                step.output_data.as_deref().unwrap_or("None")
+            )
+        }).collect();
+
+        let embedder = self.embedder.clone();
+
+        // Wrap CPU-bound synchronous fastembed execution in spawn_blocking
+        let embeddings = task::spawn_blocking(move || {
+            let mut embedder_guard = embedder.blocking_lock();
+            embedder_guard.embed(steps_text, None)
+        }).await.map_err(|_| DriftWarning::TargetDrift)? // Treat spawn_blocking panic as TargetDrift for simplicity
+        .map_err(|_| DriftWarning::TargetDrift)?;
+
+        if embeddings.len() >= 2 {
+            let sim = Self::calculate_cosine_similarity(&embeddings[0], &embeddings[1]);
+            if sim >= self.similarity_threshold {
+                return Err(DriftWarning::SemanticLoop);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn distill_experience(&self, trace: &ExecutionTrace) -> Option<SynthesizedSkill> {
+        if !trace.success {
+            return None; // Only distill successful traces
+        }
+
+        // Extremely naive form of distillation for now
+        // A full actor-critic would parse multiple traces, map inputs to tools, etc.
+        // We distill the first step as a trigger, and the sequence of node_ids as code.
+
+        let first_step = trace.steps.first()?;
+        let trigger_condition = format!("Matches input intent similar to: {}", first_step.input_data);
+
+        let node_sequence: Vec<String> = trace.steps.iter().map(|s| s.node_id.clone()).collect();
+        let executable_code = format!("Execute sequence: [{}]", node_sequence.join(" -> "));
+
+        Some(SynthesizedSkill {
+            trigger_condition,
+            executable_code,
+            success_rate: 1.0, // Initial success rate
+        })
+    }
+}
+
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,63 +171,5 @@ mod tests {
         assert_eq!(skill.trigger_condition, "Matches input intent similar to: SELECT * FROM users");
         assert_eq!(skill.executable_code, "Execute sequence: [fetch_db -> filter_admins]");
         assert_eq!(skill.success_rate, 1.0);
-    }
-}
-
-#[async_trait]
-impl Evaluator for ActorCriticEvaluator {
-    async fn detect_drift(&self, trace: &ExecutionTrace) -> Result<(), DriftWarning> {
-        if trace.steps.len() < 2 {
-            return Ok(());
-        }
-
-        // Extract text representations of the last two steps
-        let steps_text: Vec<String> = trace.steps.iter().rev().take(2).map(|step| {
-            format!("Node: {}, Input: {}, Output: {:?}",
-                step.node_id,
-                step.input_data,
-                step.output_data.as_deref().unwrap_or("None")
-            )
-        }).collect();
-
-        let embedder = self.embedder.clone();
-
-        // Wrap CPU-bound synchronous fastembed execution in spawn_blocking
-        let embeddings = task::spawn_blocking(move || {
-            let mut embedder_guard = embedder.blocking_lock();
-            embedder_guard.embed(steps_text, None)
-        }).await.map_err(|_| DriftWarning::TargetDrift)? // Treat spawn_blocking panic as TargetDrift for simplicity
-        .map_err(|_| DriftWarning::TargetDrift)?;
-
-        if embeddings.len() >= 2 {
-            let sim = Self::calculate_cosine_similarity(&embeddings[0], &embeddings[1]);
-            if sim >= self.similarity_threshold {
-                return Err(DriftWarning::SemanticLoop);
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn distill_experience(&self, trace: &ExecutionTrace) -> Option<SynthesizedSkill> {
-        if !trace.success {
-            return None; // Only distill successful traces
-        }
-
-        // Extremely naive form of distillation for now
-        // A full actor-critic would parse multiple traces, map inputs to tools, etc.
-        // We distill the first step as a trigger, and the sequence of node_ids as code.
-
-        let first_step = trace.steps.first()?;
-        let trigger_condition = format!("Matches input intent similar to: {}", first_step.input_data);
-
-        let node_sequence: Vec<String> = trace.steps.iter().map(|s| s.node_id.clone()).collect();
-        let executable_code = format!("Execute sequence: [{}]", node_sequence.join(" -> "));
-
-        Some(SynthesizedSkill {
-            trigger_condition,
-            executable_code,
-            success_rate: 1.0, // Initial success rate
-        })
     }
 }

@@ -349,7 +349,7 @@ Use `telos project switch` via CLI to change projects.", active)).await?;
         {
             Ok(res) if res.status().is_success() => {
                 if let Ok(body) = res.json::<serde_json::Value>().await {
-                    LogLevel::from_str(body["level"].as_str().unwrap_or("normal"))
+                    LogLevel::from_string(body["level"].as_str().unwrap_or("normal"))
                 } else {
                     LogLevel::Normal
                 }

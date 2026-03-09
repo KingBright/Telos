@@ -1,3 +1,4 @@
+use telos_context::ContextManager;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -77,9 +78,14 @@ impl ModelProvider for GatewayAdapter {
 // 2. System Registry
 struct DaemonRegistry {
     gateway: Arc<GatewayManager>,
+    memory_os: Arc<RedbGraphStore>,
 }
 
 impl SystemRegistry for DaemonRegistry {
+    fn get_memory_os(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        Some(self.memory_os.clone() as Arc<dyn std::any::Any + Send + Sync>)
+    }
+
     fn get_model_gateway(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         Some(self.gateway.clone() as Arc<dyn std::any::Any + Send + Sync>)
     }
@@ -103,6 +109,7 @@ struct DagNode {
 
 #[derive(serde::Deserialize, Debug)]
 struct DagPlan {
+    tier: Option<String>,
     reply: Option<String>,
     nodes: Vec<DagNode>,
     edges: Vec<DagEdge>,
@@ -155,11 +162,116 @@ impl ExecutableNode for LlmPromptNode {
     }
 }
 
+
+struct ReactNode {
+    prompt: String,
+    gateway: Arc<GatewayManager>,
+    tool_registry: std::sync::Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
+    _tools_dir: String,
+}
+
+#[async_trait]
+impl ExecutableNode for ReactNode {
+    async fn execute(
+        &self,
+        _ctx: &ScopedContext,
+        _registry: &dyn SystemRegistry,
+    ) -> Result<NodeResult, NodeError> {
+        let mut loop_count = 0;
+        let mut session_messages = vec![telos_model_gateway::Message {
+            role: "user".to_string(),
+            content: format!("Use ReAct to solve this task. You must output a JSON with either {{ \"action\": \"TOOL_NAME\", \"params\": {{...}} }} to call a tool, or {{ \"final_answer\": \"YOUR_ANSWER\" }}. Task: {}", self.prompt),
+        }];
+
+        while loop_count < 5 {
+            loop_count += 1;
+
+            let req = telos_model_gateway::LlmRequest {
+                session_id: "daemon_react_session".to_string(),
+                messages: session_messages.clone(),
+                required_capabilities: telos_model_gateway::Capability {
+                    requires_vision: false,
+                    strong_reasoning: false,
+                },
+                budget_limit: 1000,
+            };
+
+            let llm_reply = match self.gateway.generate(req).await {
+                Ok(res) => res.content.trim().to_string(),
+                Err(e) => return Err(NodeError::ExecutionFailed(format!("LLM Error: {:?}", e))),
+            };
+
+            let clean_reply = llm_reply.trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```");
+
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(clean_reply) {
+                if let Some(final_ans) = json.get("final_answer").and_then(|v| v.as_str()) {
+                    return Ok(NodeResult {
+                        output_data: final_ans.as_bytes().to_vec(),
+                        extracted_knowledge: None,
+                        next_routing_hint: None,
+                    });
+                } else if let (Some(action), Some(params)) = (json.get("action").and_then(|v| v.as_str()), json.get("params")) {
+                    session_messages.push(telos_model_gateway::Message {
+                        role: "assistant".to_string(),
+                        content: llm_reply.clone(),
+                    });
+
+                    let registry_guard = self.tool_registry.read().await;
+                    let executor = match registry_guard.get_executor(action) {
+                        Some(e) => e,
+                        None => {
+                            session_messages.push(telos_model_gateway::Message {
+                                role: "user".to_string(),
+                                content: format!("Tool {} not found.", action),
+                            });
+                            continue;
+                        }
+                    };
+
+                    match executor.call(params.clone()).await {
+                        Ok(tool_output) => {
+                            let tool_output_str = String::from_utf8_lossy(&tool_output).to_string();
+                            session_messages.push(telos_model_gateway::Message {
+                                role: "user".to_string(),
+                                content: format!("Tool output: {}", tool_output_str),
+                            });
+                        }
+                        Err(e) => {
+                            session_messages.push(telos_model_gateway::Message {
+                                role: "user".to_string(),
+                                content: format!("Tool execution failed: {:?}", e),
+                            });
+                        }
+                    }
+                } else {
+                    return Ok(NodeResult {
+                        output_data: clean_reply.as_bytes().to_vec(),
+                        extracted_knowledge: None,
+                        next_routing_hint: None,
+                    });
+                }
+            } else {
+                return Ok(NodeResult {
+                    output_data: clean_reply.as_bytes().to_vec(),
+                    extracted_knowledge: None,
+                    next_routing_hint: None,
+                });
+            }
+        }
+
+        Ok(NodeResult {
+            output_data: b"Max ReAct loop reached".to_vec(),
+            extracted_knowledge: None,
+            next_routing_hint: None,
+        })
+    }
+}
+
 struct WasmToolNode {
     tool_name: String,
     tool_registry:
         std::sync::Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
-    tools_dir: String,
+    _tools_dir: String,
 }
 
 #[async_trait]
@@ -279,7 +391,7 @@ impl ExecutableNode for WasmToolNode {
                                             )
                                         {
                                             // Persist the tool to disk for future runs
-                                            let target_dir = std::path::Path::new(&self.tools_dir);
+                                            let target_dir = std::path::Path::new(&self._tools_dir);
                                             if !target_dir.exists() {
                                                 let _ = std::fs::create_dir_all(target_dir);
                                             }
@@ -494,8 +606,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tool_registry = std::sync::Arc::new(tokio::sync::RwLock::new(tool_registry));
 
+    let memory_os_instance = Arc::new(RedbGraphStore::new(&config.db_path).expect("Failed to init MemoryOS database"));
     let registry = Arc::new(DaemonRegistry {
         gateway: gateway.clone(),
+        memory_os: memory_os_instance.clone(),
     });
     let _memory =
         Arc::new(RedbGraphStore::new(&config.db_path).expect("Failed to init MemoryOS database"));
@@ -503,6 +617,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _context_manager = Arc::new(RaptorContextManager::new(
         Arc::new(openai_provider.clone()),
         Arc::new(openai_provider.clone()),
+        Some(memory_os_instance.clone() as Arc<dyn telos_memory::integration::MemoryIntegration>),
     ));
 
     // --- BACKGROUND EVENT LOOP ---
@@ -545,6 +660,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let paused_tasks_bg = paused_tasks_bg.clone();
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new();
 
+                    let _context_manager_unused = _context_manager.clone();
                     tokio::spawn(async move {
                         let task_start_time = Instant::now();
                         println!(
@@ -691,6 +807,7 @@ Do not include markdown blocks, only raw JSON."#,
                                     e
                                 );
                                 DagPlan {
+                                    tier: Some("Complex".to_string()),
                                     reply: Some("I will handle that.".to_string()),
                                     nodes: vec![DagNode {
                                         id: "main".to_string(),
@@ -708,99 +825,128 @@ Do not include markdown blocks, only raw JSON."#,
                         // Build plan info for PlanCreated feedback
                         let mut plan_node_infos: Vec<PlanNodeInfo> = Vec::new();
 
-                        for node in &dag_plan.nodes {
-                            terminal_nodes.push(node.id.clone());
+                        let tier = dag_plan.tier.clone().unwrap_or("Complex".to_string());
 
-                            // Build node metadata
-                            let metadata = NodeMetadata {
-                                task_type: node.task_type.clone(),
-                                prompt_preview: truncate_for_preview(&node.prompt, 100),
-                                tool_name: if node.task_type == "TOOL" {
-                                    Some(node.prompt.clone())
+                        let mut _plan_node_infos: Vec<PlanNodeInfo> = Vec::new();
+
+                        if tier == "Simple" {
+                            terminal_nodes.push("simple_node".to_string());
+                            graph.add_node_with_metadata(
+                                "simple_node".to_string(),
+                                Box::new(LlmPromptNode {
+                                    prompt: enriched_payload.clone(),
+                                    gateway: gateway_clone.clone(),
+                                }),
+                                NodeMetadata {
+                                    task_type: "LLM".to_string(),
+                                    prompt_preview: truncate_for_preview(&enriched_payload, 100),
+                                    tool_name: None,
+                                },
+                            );
+                            graph.current_state = GraphState { is_running: true, completed: false };
+                        } else if tier == "Medium" {
+                            terminal_nodes.push("react_node".to_string());
+                            graph.add_node_with_metadata(
+                                "react_node".to_string(),
+                                Box::new(ReactNode {
+                                    prompt: enriched_payload.clone(),
+                                    gateway: gateway_clone.clone(),
+                                    tool_registry: tool_registry.clone(),
+                                    _tools_dir: config.tools_dir.clone(),
+                                }),
+                                NodeMetadata {
+                                    task_type: "LLM".to_string(),
+                                    prompt_preview: truncate_for_preview(&enriched_payload, 100),
+                                    tool_name: Some("ReactLoop".to_string()),
+                                },
+                            );
+                            graph.current_state = GraphState { is_running: true, completed: false };
+                        } else {
+                            // Build plan info for PlanCreated feedback
+                            for node in &dag_plan.nodes {
+                                terminal_nodes.push(node.id.clone());
+
+                                // Build node metadata
+                                let metadata = NodeMetadata {
+                                    task_type: node.task_type.clone(),
+                                    prompt_preview: truncate_for_preview(&node.prompt, 100),
+                                    tool_name: if node.task_type == "TOOL" {
+                                        Some(node.prompt.clone())
+                                    } else {
+                                        None
+                                    },
+                                };
+
+                                let node_info = PlanNodeInfo {
+                                    id: node.id.clone(),
+                                    task_type: node.task_type.clone(),
+                                    prompt_preview: truncate_for_preview(&node.prompt, 150),
+                                    dependencies: vec![],
+                                };
+                                plan_node_infos.push(node_info);
+
+                                if node.task_type.to_uppercase() == "TOOL" {
+                                    graph.add_node_with_metadata(
+                                        node.id.clone(),
+                                        Box::new(WasmToolNode {
+                                            tool_name: node.prompt.clone(),
+                                            tool_registry: tool_registry.clone(),
+                                            _tools_dir: config.tools_dir.clone(),
+                                        }),
+                                        metadata,
+                                    );
                                 } else {
-                                    None
+                                    graph.add_node_with_metadata(
+                                        node.id.clone(),
+                                        Box::new(LlmPromptNode {
+                                            prompt: node.prompt.clone(),
+                                            gateway: gateway_clone.clone(),
+                                        }),
+                                        metadata,
+                                    );
+                                }
+                            }
+
+                            for edge in &dag_plan.edges {
+                                terminal_nodes.retain(|id| id != &edge.from);
+                                let _ = graph.add_edge(&edge.from, &edge.to);
+
+                                // Update dependencies in plan info
+                                if let Some(node_info) =
+                                    plan_node_infos.iter_mut().find(|n| n.id == edge.to)
+                                {
+                                    node_info.dependencies.push(edge.from.clone());
+                                }
+                            }
+
+                            if terminal_nodes.is_empty() && !dag_plan.nodes.is_empty() {
+                                terminal_nodes.push(dag_plan.nodes.last().unwrap().id.clone());
+                            }
+
+                            // Publish PlanCreated feedback
+                            let plan_info = PlanInfo {
+                                reply: dag_plan.reply.clone(),
+                                nodes: plan_node_infos.clone(),
+                                total_steps: dag_plan.nodes.len(),
+                                estimated_complexity: if dag_plan.nodes.len() <= 2 {
+                                    Some("low".to_string())
+                                } else if dag_plan.nodes.len() <= 5 {
+                                    Some("medium".to_string())
+                                } else {
+                                    Some("high".to_string())
                                 },
                             };
 
-                            // Build PlanNodeInfo
-                            plan_node_infos.push(PlanNodeInfo {
-                                id: node.id.clone(),
-                                task_type: node.task_type.clone(),
-                                prompt_preview: truncate_for_preview(&node.prompt, 100),
-                                dependencies: Vec::new(), // Will be populated after edge processing
-                            });
-
-                            if node.task_type == "TOOL" {
-                                graph.add_node_with_metadata(
-                                    node.id.clone(),
-                                    Box::new(WasmToolNode {
-                                        tool_name: node.prompt.clone(),
-                                        tool_registry: tool_registry.clone(),
-                                        tools_dir: config.tools_dir.clone(),
-                                    }),
-                                    metadata,
-                                );
-                            } else {
-                                graph.add_node_with_metadata(
-                                    node.id.clone(),
-                                    Box::new(LlmPromptNode {
-                                        prompt: node.prompt.clone(),
-                                        gateway: gateway_clone.clone(),
-                                    }),
-                                    metadata,
-                                );
-                            }
-                        }
-
-                        // Process edges and update dependencies
-                        for edge in &dag_plan.edges {
-                            let _ = graph.add_edge(&edge.from, &edge.to);
-                            terminal_nodes.retain(|id| id != &edge.from);
-
-                            // Update dependencies in plan_node_infos
-                            if let Some(node_info) =
-                                plan_node_infos.iter_mut().find(|n| n.id == edge.to)
-                            {
-                                node_info.dependencies.push(edge.from.clone());
-                            }
-                        }
-
-                        if terminal_nodes.is_empty() && !dag_plan.nodes.is_empty() {
-                            terminal_nodes.push(dag_plan.nodes.last().unwrap().id.clone());
-                        }
-
-                        // Publish PlanCreated feedback
-                        let plan_info = PlanInfo {
-                            reply: dag_plan.reply.clone(),
-                            nodes: plan_node_infos.clone(),
-                            total_steps: dag_plan.nodes.len(),
-                            estimated_complexity: if dag_plan.nodes.len() <= 2 {
-                                Some("low".to_string())
-                            } else if dag_plan.nodes.len() <= 5 {
-                                Some("medium".to_string())
-                            } else {
-                                Some("high".to_string())
-                            },
-                        };
-                        broker_bg.publish_feedback(AgentFeedback::PlanCreated {
-                            task_id: trace_id.to_string(),
-                            plan: plan_info,
-                        });
-
-                        // Also send the reply as Output for backward compatibility
-                        if let Some(reply) = &dag_plan.reply {
-                            broker_bg.publish_feedback(AgentFeedback::Output {
+                            broker_bg.publish_feedback(AgentFeedback::PlanCreated {
                                 task_id: trace_id.to_string(),
-                                session_id: session_id.clone(),
-                                content: reply.clone(),
-                                is_final: false,
+                                plan: plan_info,
                             });
-                        }
 
-                        graph.current_state = GraphState {
-                            is_running: true,
-                            completed: false,
-                        };
+                            graph.current_state = GraphState {
+                                is_running: true,
+                                completed: false,
+                            };
+                        }
 
                         let empty_ctx = telos_context::ScopedContext {
                             budget_tokens: 1000,
@@ -902,6 +1048,7 @@ Do not include markdown blocks, only raw JSON."#,
                     let paused_tasks_bg = paused_tasks_bg.clone();
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new();
 
+                    let context_manager = _context_manager.clone();
                     tokio::spawn(async move {
                         let task_start_time = Instant::now();
                         println!(
@@ -965,16 +1112,29 @@ Do not include markdown blocks, only raw JSON."#,
                                 completed: false,
                             };
 
-                            let empty_ctx = telos_context::ScopedContext {
+                            let raw_ctx = telos_context::RawContext {
+                                history_logs: vec![],
+                                retrieved_docs: vec![
+                                    telos_context::Document {
+                                        doc_id: "user_input".to_string(),
+                                        content: payload.clone(),
+                                    }
+                                ],
+                            };
+                            let req = telos_context::NodeRequirement {
+                                required_tokens: 1000,
+                                query: payload.clone(),
+                            };
+                            let actual_ctx = context_manager.compress_for_node(&raw_ctx, &req).await.unwrap_or_else(|_e| telos_context::ScopedContext {
                                 budget_tokens: 1000,
                                 summary_tree: vec![],
                                 precise_facts: vec![],
-                            };
+                            });
 
                             execution_engine
                                 .run_graph(
                                     &mut graph,
-                                    &empty_ctx,
+                                    &actual_ctx,
                                     registry_clone.as_ref(),
                                     broker_bg.as_ref(),
                                 )
@@ -1148,7 +1308,7 @@ async fn set_log_level(
     Json(req): Json<SetLogLevelRequest>,
 ) -> Json<SetLogLevelResponse> {
     let old_level = global_log_level().get();
-    let new_level = LogLevel::from_str(&req.level);
+    let new_level = LogLevel::from_string(&req.level);
 
     global_log_level().set(new_level);
 

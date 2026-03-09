@@ -109,7 +109,7 @@ p, agent_beta, write_file, execute
         // Lease should succeed for authorized actions
         let token = vault.lease_temporary_credential("agent_alpha", "read_file").await;
         assert!(token.is_ok());
-        let token = token.unwrap();
+        let _token = token.unwrap();
 
         // Lease should fail for unauthorized actions
         let result = vault.lease_temporary_credential("agent_alpha", "write_file").await;
