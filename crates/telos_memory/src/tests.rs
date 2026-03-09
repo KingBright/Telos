@@ -1,5 +1,4 @@
 #[cfg(test)]
-mod tests {
     use crate::types::{MemoryEntry, MemoryQuery, MemoryType};
     use crate::engine::{MemoryOS, RedbGraphStore};
     use crate::decay::{apply_decay, get_current_timestamp};
@@ -142,4 +141,3 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path); // Cleanup
     }
-}

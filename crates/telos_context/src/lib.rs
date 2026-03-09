@@ -65,17 +65,20 @@ pub struct RaptorContextManager {
     tree: RwLock<RaptorTree>,
     embedding_provider: Arc<dyn EmbeddingProvider>,
     llm_provider: Arc<dyn LlmProvider>,
+    pub memory_integration: Option<Arc<dyn telos_memory::integration::MemoryIntegration>>,
 }
 
 impl RaptorContextManager {
     pub fn new(
         embedding_provider: Arc<dyn EmbeddingProvider>,
         llm_provider: Arc<dyn LlmProvider>,
+        memory_integration: Option<Arc<dyn telos_memory::integration::MemoryIntegration>>,
     ) -> Self {
         Self {
             tree: RwLock::new(RaptorTree::new()),
             embedding_provider,
             llm_provider,
+            memory_integration,
         }
     }
 }
@@ -85,16 +88,11 @@ impl ContextManager for RaptorContextManager {
     async fn compress_for_node(&self, raw: &RawContext, node_req: &NodeRequirement) -> Result<ScopedContext, String> {
         let tree_read = self.tree.read().await;
 
-        // 1. If the tree is empty, we must build it from the RawContext
-        // In a real system, the tree might be built asynchronously in the background.
-        // For this V1, we build/update it if it's empty.
-        // (A more robust version would check if the RawContext has new documents since the last build).
         let needs_build = tree_read.nodes.is_empty();
-        drop(tree_read); // Release read lock early
+        drop(tree_read);
 
         if needs_build {
             let mut tree_write = self.tree.write().await;
-            // Double-check pattern
             if tree_write.nodes.is_empty() {
                 let mut combined_text = String::new();
                 for log in &raw.history_logs {
@@ -116,7 +114,6 @@ impl ContextManager for RaptorContextManager {
             }
         }
 
-        // 2. Retrieve relevant nodes using the query
         let tree_read = self.tree.read().await;
         let retrieved_nodes = tree_read.retrieve(
             &node_req.query,
@@ -124,43 +121,44 @@ impl ContextManager for RaptorContextManager {
             self.embedding_provider.clone(),
         ).await?;
 
-        // 3. Map retrieved RAPTOR nodes to the expected SummaryNode output format
         let summary_tree = retrieved_nodes.into_iter().map(|n| SummaryNode {
             summary_text: n.text,
             children_ids: n.children_ids,
         }).collect();
 
+        let mut precise_facts = vec![];
+        if let Some(ref mem) = self.memory_integration {
+            if let Ok(facts) = mem.retrieve_semantic_facts(node_req.query.clone()).await {
+                for f in facts {
+                    precise_facts.push(Fact {
+                        entity: "Memory".into(),
+                        relation: "recalls".into(),
+                        target: f,
+                    });
+                }
+            }
+        }
+
         Ok(ScopedContext {
             budget_tokens: node_req.required_tokens,
             summary_tree,
-            precise_facts: vec![], // Facts extraction integration goes here
+            precise_facts,
         })
     }
 
     async fn ingest_new_info(&mut self, info: NodeResult) -> Result<(), String> {
-        // Here we handle integrating new information from a completed DAG node back into the context.
-
         let output_str = String::from_utf8(info.output_data).unwrap_or_default();
 
         if output_str.is_empty() {
             return Ok(());
         }
 
-        // We append this new information into the tree.
-        // For now, we rebuild the tree with the new text.
-        // A full implementation would append the nodes and trigger an incremental re-clustering.
-
         let mut tree_write = self.tree.write().await;
-        // In this MVP, we simply re-run the build on the new output data to add to the existing tree structure.
-        // Because `build` appends new base nodes and re-clusters, we can just call it with the new text.
         tree_write.build(
             &output_str,
             self.embedding_provider.clone(),
             self.llm_provider.clone(),
         ).await?;
-
-        // In the future (Module 4 Integration), we would also take `info.extracted_knowledge`
-        // and send it to the Memory OS via `MemoryManager::store(Semantic(...))`.
 
         Ok(())
     }
@@ -174,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn test_raptor_context_manager() {
         let mock_provider = Arc::new(MockApiProvider::new());
-        let mut manager = RaptorContextManager::new(mock_provider.clone(), mock_provider.clone());
+        let mut manager = RaptorContextManager::new(mock_provider.clone(), mock_provider.clone(), None);
 
         let raw_context = RawContext {
             history_logs: vec![
@@ -192,13 +190,11 @@ mod tests {
             query: "What is the weather like in New York?".to_string(),
         };
 
-        // Test compression (building tree and retrieving)
         let scoped_ctx = manager.compress_for_node(&raw_context, &req).await.unwrap();
 
-        assert!(scoped_ctx.summary_tree.len() > 0);
+        assert!(!scoped_ctx.summary_tree.is_empty());
         assert!(scoped_ctx.budget_tokens == 50);
 
-        // Test ingestion of new information
         let new_info = NodeResult {
             output_data: "The weather in Tokyo is cloudy.".as_bytes().to_vec(),
             extracted_knowledge: None,
@@ -208,7 +204,6 @@ mod tests {
         let ingest_result = manager.ingest_new_info(new_info).await;
         assert!(ingest_result.is_ok());
 
-        // Verify that the tree size increased
         let tree_read = manager.tree.read().await;
         assert!(tree_read.nodes.len() > scoped_ctx.summary_tree.len());
     }

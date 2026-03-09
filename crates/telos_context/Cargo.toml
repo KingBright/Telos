@@ -17,3 +17,4 @@ telos_core = { path = "../telos_core" }
 telos_model_gateway = { path = "../telos_model_gateway" }
 tokio = { workspace = true, features = ["sync"] }
 
+telos_memory = { path = "../telos_memory" }

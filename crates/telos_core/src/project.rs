@@ -41,6 +41,6 @@ impl ProjectConfig {
         std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|contents| toml::from_str(&contents).ok())
-            .unwrap_or_else(Self::default)
+            .unwrap_or_default()
     }
 }

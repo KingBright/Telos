@@ -375,3 +375,334 @@ impl ToolRegisterTool {
         }
     }
 }
+
+// 6. Memory Recall Tool
+#[derive(Clone)]
+pub struct MemoryRecallTool;
+
+#[async_trait]
+impl ToolExecutor for MemoryRecallTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let query = params.get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'query' parameter".into()))?;
+
+        let out = serde_json::json!({
+            "__macro__": "memory_recall",
+            "query": query
+        });
+
+        Ok(serde_json::to_vec(&out).unwrap())
+    }
+}
+
+impl MemoryRecallTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "memory_recall".into(),
+            description: "Retrieves important semantic facts and historical context from the agent's long-term memory. Requires a 'query' parameter.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "The concept or entity to search for in long-term memory" }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+}
+
+// 7. Memory Store Tool
+#[derive(Clone)]
+pub struct MemoryStoreTool;
+
+#[async_trait]
+impl ToolExecutor for MemoryStoreTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let content = params.get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'content' parameter".into()))?;
+
+        let out = serde_json::json!({
+            "__macro__": "memory_store",
+            "content": content
+        });
+
+        Ok(serde_json::to_vec(&out).unwrap())
+    }
+}
+
+impl MemoryStoreTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "memory_store".into(),
+            description: "Stores an important fact or insight into the agent's long-term semantic memory. Requires a 'content' parameter.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The exact fact, insight, or information to remember permanently" }
+                    },
+                    "required": ["content"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+}
+
+// 8. File Edit Tool
+#[derive(Clone)]
+pub struct FileEditTool;
+
+#[async_trait]
+impl ToolExecutor for FileEditTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let path = params.get("path").and_then(|v| v.as_str()).ok_or_else(|| ToolError::ExecutionFailed("Missing 'path'".into()))?;
+        let search = params.get("search").and_then(|v| v.as_str()).ok_or_else(|| ToolError::ExecutionFailed("Missing 'search'".into()))?;
+        let replace = params.get("replace").and_then(|v| v.as_str()).ok_or_else(|| ToolError::ExecutionFailed("Missing 'replace'".into()))?;
+
+        let mut content = std::fs::read_to_string(path).map_err(|e| ToolError::ExecutionFailed(format!("Failed to read {}: {}", path, e)))?;
+        if content.contains(search) {
+            content = content.replace(search, replace);
+            std::fs::write(path, content).map_err(|e| ToolError::ExecutionFailed(format!("Failed to write {}: {}", path, e)))?;
+            Ok(b"{\"status\": \"success\", \"message\": \"Replaced occurrences\"}".to_vec())
+        } else {
+            Err(ToolError::ExecutionFailed("Search string not found in file".into()))
+        }
+    }
+}
+
+impl FileEditTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "file_edit".into(),
+            description: "Edits a file by replacing a search string with a replacement string.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "search": { "type": "string" },
+                        "replace": { "type": "string" }
+                    },
+                    "required": ["path", "search", "replace"]
+                }),
+            },
+            risk_level: RiskLevel::HighRisk,
+        }
+    }
+}
+
+// 9. Glob Tool
+#[derive(Clone)]
+pub struct GlobTool;
+
+#[async_trait]
+impl ToolExecutor for GlobTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let pattern = params.get("pattern").and_then(|v| v.as_str()).ok_or_else(|| ToolError::ExecutionFailed("Missing 'pattern'".into()))?;
+
+        let output = std::process::Command::new("find")
+            .arg(".")
+            .arg("-name")
+            .arg(pattern)
+            .output()
+            .map_err(|e| ToolError::ExecutionFailed(format!("Command failed: {}", e)))?;
+
+        Ok(output.stdout)
+    }
+}
+
+impl GlobTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "glob".into(),
+            description: "Finds files matching a pattern using 'find . -name <pattern>'. Example: '*.rs'".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string" }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+}
+
+// 10. Grep Tool
+#[derive(Clone)]
+pub struct GrepTool;
+
+#[async_trait]
+impl ToolExecutor for GrepTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let pattern = params.get("pattern").and_then(|v| v.as_str()).ok_or_else(|| ToolError::ExecutionFailed("Missing 'pattern'".into()))?;
+        let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+        let output = std::process::Command::new("grep")
+            .arg("-rn")
+            .arg(pattern)
+            .arg(path)
+            .output()
+            .map_err(|e| ToolError::ExecutionFailed(format!("Command failed: {}", e)))?;
+
+        Ok(output.stdout)
+    }
+}
+
+impl GrepTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "grep".into(),
+            description: "Searches for a pattern in files using 'grep -rn <pattern> <path>'. Returns matches with line numbers.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string" },
+                        "path": { "type": "string", "description": "Defaults to '.'" }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+}
+
+// 11. Http Tool
+#[derive(Clone)]
+pub struct HttpTool;
+
+#[async_trait]
+impl ToolExecutor for HttpTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let url = params.get("url").and_then(|v| v.as_str()).ok_or_else(|| ToolError::ExecutionFailed("Missing 'url'".into()))?;
+
+        let output = std::process::Command::new("curl")
+            .arg("-sL")
+            .arg(url)
+            .output()
+            .map_err(|e| ToolError::ExecutionFailed(format!("Command failed: {}", e)))?;
+
+        Ok(output.stdout)
+    }
+}
+
+impl HttpTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "http_get".into(),
+            description: "Fetches the content of a URL using curl.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" }
+                    },
+                    "required": ["url"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+}
+
+// 12. WebSearch Tool
+#[derive(Clone)]
+pub struct WebSearchTool;
+
+#[async_trait]
+impl ToolExecutor for WebSearchTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let query = params.get("query").and_then(|v| v.as_str()).ok_or_else(|| ToolError::ExecutionFailed("Missing 'query'".into()))?;
+        let encoded_query = urlencoding::encode(query);
+        let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
+
+        let output = std::process::Command::new("curl")
+            .arg("-sL")
+            .arg("-H")
+            .arg("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .arg(&search_url)
+            .output()
+            .map_err(|e| ToolError::ExecutionFailed(format!("Command failed: {}", e)))?;
+
+        let html = String::from_utf8_lossy(&output.stdout);
+        let mut results = Vec::new();
+        for line in html.split('\n') {
+            if line.contains("class=\"result__snippet\"") {
+                let text = line.replace("<a", "").replace("</a>", "").replace("<b>", "").replace("</b>", "").replace("class=\"result__snippet\"", "");
+                let clean = text.split('>').map(|s| s.split('<').next().unwrap_or("")).collect::<Vec<&str>>().join("");
+                results.push(clean.trim().to_string());
+            }
+        }
+
+        Ok(serde_json::to_vec(&results).unwrap_or_default())
+    }
+}
+
+impl WebSearchTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "web_search".into(),
+            description: "Searches the web for a query and returns snippets.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+}
+
+// 13. Lsp Tool
+#[derive(Clone)]
+pub struct LspTool;
+
+#[async_trait]
+impl ToolExecutor for LspTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let symbol = params.get("symbol").and_then(|v| v.as_str()).ok_or_else(|| ToolError::ExecutionFailed("Missing 'symbol'".into()))?;
+
+        let pattern = format!("(fn|struct|enum|trait) {}", symbol);
+        let output = std::process::Command::new("grep")
+            .arg("-rnE")
+            .arg(&pattern)
+            .arg(".")
+            .output()
+            .map_err(|e| ToolError::ExecutionFailed(format!("Command failed: {}", e)))?;
+
+        Ok(output.stdout)
+    }
+}
+
+impl LspTool {
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "lsp_symbol_search".into(),
+            description: "Finds definitions of symbols (structs, fns, enums) across the repository.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string" }
+                    },
+                    "required": ["symbol"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+        }
+    }
+}

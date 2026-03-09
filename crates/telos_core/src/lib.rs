@@ -38,7 +38,9 @@ pub enum NodeError {
 }
 
 pub trait SystemRegistry: Send + Sync {
-    // Defines standard registry lookup mechanisms across the system
+    fn get_memory_os(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
 
     /// Dynamically retrieves a ModelGateway instance without causing circular dependencies.
     fn get_model_gateway(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
