@@ -93,21 +93,46 @@ pub fn init_telemetry(log_dir: &str, file_prefix: &str) -> tracing_appender::non
 /// - Human-readable console output with timestamps
 /// - (Optional) Persistent file logging
 /// - Automatic LogLevel filtering based on `TELOS_LOG_LEVEL` or provided level
+/// - Automatic OTLP distributed tracing export if `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 pub fn init_logging(log_level: &str) {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
 
-    // Create a formatter with timestamps
-    let fmt = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    // Create a base formatting layer for standard output
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
-        .with_thread_ids(false)
-        .with_thread_names(false)
+        .with_thread_ids(true)
+        .with_level(true)
         .with_file(true)
         .with_line_number(true);
 
-    // Default to plain text with timestamps
-    fmt.init();
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer);
+
+    // Conditionally start the OTLP pipeline if configured
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+        if let Ok(exporter) = opentelemetry_otlp::SpanExporter::builder().with_tonic().build() {
+            let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                .build();
+            
+            use opentelemetry::trace::TracerProvider as _;
+            let tracer = provider.tracer("telos_telemetry");
+            
+            let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+            
+            // Note: try_init allows us to not panic if tests call init_logging twice
+            let _ = registry.with(telemetry).try_init();
+            tracing::info!("[Telemetry] OTLP Distributed Tracing Export enabled.");
+            return;
+        }
+    }
+
+    let _ = registry.try_init();
+    tracing::info!("[Telemetry] Standard Logging initialized (OTLP disabled).");
 }
 
 /// A more advanced initialization that supports non-blocking file logging and custom formats.

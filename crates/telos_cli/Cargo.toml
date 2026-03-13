@@ -19,3 +19,6 @@ uuid = { version = "1.21.0", features = ["v4", "serde"] }
 telos_core = { path = "../telos_core" }
 telos_hci = { path = "../telos_hci" }
 telos_bot = { path = "../telos_bot" }
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"

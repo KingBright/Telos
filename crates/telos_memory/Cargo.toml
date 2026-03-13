@@ -11,3 +11,5 @@ tokio.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json.workspace = true
 telos_model_gateway = { path = "../telos_model_gateway" }
+fastembed = "5.12.0"
+tracing.workspace = true

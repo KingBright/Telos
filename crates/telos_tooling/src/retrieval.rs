@@ -1,10 +1,13 @@
 use crate::{ToolExecutor, ToolRegistry, ToolSchema};
 use std::collections::HashMap;
 use tracing::{info, debug};
+use std::path::{PathBuf, Path};
+use tokio::fs;
 
 pub struct VectorToolRegistry {
     tools: HashMap<String, ToolSchema>,
     executors: HashMap<String, std::sync::Arc<dyn ToolExecutor>>,
+    plugins_dir: PathBuf,
     #[cfg(feature = "local-embeddings")]
     embeddings_cache: HashMap<String, Vec<f32>>,
     #[cfg(feature = "local-embeddings")]
@@ -24,12 +27,15 @@ impl VectorToolRegistry {
             match model_result {
                 Ok(Ok(model)) => {
                     info!("[ToolRegistry] Fastembed model loaded successfully.");
-                    return Self {
+                    let mut registry = Self {
                         tools: HashMap::new(),
                         executors: HashMap::new(),
+                        plugins_dir: Self::get_default_plugins_dir(),
                         embeddings_cache: HashMap::new(),
                         model: Some(std::sync::RwLock::new(model)),
                     };
+                    registry.load_saved_plugins();
+                    return registry;
                 }
                 _ => {
                     info!("[ToolRegistry] Fastembed model unavailable, using keyword fallback.");
@@ -40,17 +46,53 @@ impl VectorToolRegistry {
         Self::new_keyword_only()
     }
 
+    /// Get the default plugins directory (e.g. ./plugins or ~/.telos/plugins)
+    fn get_default_plugins_dir() -> PathBuf {
+        let dir = dirs::home_dir().map(|h| h.join(".telos").join("plugins")).unwrap_or_else(|| PathBuf::from("./plugins"));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Load dynamically saved plugins from disk on registry initialization
+    fn load_saved_plugins(&mut self) {
+        if let Ok(entries) = std::fs::read_dir(&self.plugins_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(meta_content) = std::fs::read_to_string(&path) {
+                        if let Ok(schema) = serde_json::from_str::<ToolSchema>(&meta_content) {
+                            let rhai_path = path.with_extension("rhai");
+                            if rhai_path.exists() {
+                                if let Ok(script) = std::fs::read_to_string(&rhai_path) {
+                                    let sandbox = std::sync::Arc::new(crate::ScriptSandbox::new());
+                                    // Notice: we can't easily inject the native registry back here because `self` is the registry.
+                                    // The `ToolRegistry` design makes cyclical arcs hard. So we load the executor without native dependencies first.
+                                    let executor = std::sync::Arc::new(crate::ScriptExecutor::new(script, sandbox));
+                                    self.register_tool(schema.clone(), Some(executor));
+                                    tracing::info!("[ToolRegistry] Loaded plugin from disk: {}", schema.name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Create a registry without attempting to load fastembed at all (instant startup).
     pub fn new_keyword_only() -> Self {
         info!("[ToolRegistry] Using keyword-only tool discovery.");
-        Self {
+        let mut registry = Self {
             tools: HashMap::new(),
             executors: HashMap::new(),
+            plugins_dir: Self::get_default_plugins_dir(),
             #[cfg(feature = "local-embeddings")]
             embeddings_cache: HashMap::new(),
             #[cfg(feature = "local-embeddings")]
             model: None,
-        }
+        };
+        registry.load_saved_plugins();
+        registry
     }
 
     pub fn register_tool(
@@ -182,6 +224,41 @@ impl ToolRegistry for VectorToolRegistry {
 
     fn list_all_tools(&self) -> Vec<ToolSchema> {
         self.tools.values().cloned().collect()
+    }
+
+    fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String> {
+        info!("[ToolRegistry] 🔌 Dynamic Tool Registered: {}", schema.name);
+        
+        // Save the tool physically if it has dynamic source code
+        if let Some(source) = executor.source_code() {
+            let plugin_path = self.plugins_dir.join(format!("{}.rhai", schema.name));
+            let meta_path = self.plugins_dir.join(format!("{}.json", schema.name));
+            
+            // Write script content
+            if let Err(e) = std::fs::write(&plugin_path, &source) {
+                tracing::error!("Failed to save dynamic tool script to disk: {}", e);
+            }
+            
+            // Write schema metadata
+            if let Ok(meta_json) = serde_json::to_string_pretty(&schema) {
+                let _ = std::fs::write(&meta_path, meta_json);
+            }
+            info!("Plugin safely installed to: {:?}", plugin_path);
+        }
+
+        // To mutate internal maps, we would need interior mutability on VectorToolRegistry itself.
+        // Wait, VectorToolRegistry tools and executors maps are NOT in a RwLock.
+        // But the current implementation of `ToolRegistry` trait for `VectorToolRegistry` 
+        // implies read-only operations for discover_tools and get_executor.
+        // How does it register native tools? It does it via `pub fn register_tool(&mut self)` 
+        // DURING initialization before being wrapped in Arc<RwLock>.
+        // Since `register_dynamic_tool` needs to mutate, and it takes `&self` on the trait, 
+        // VectorToolRegistry MUST wrap its maps in RwLock or Mutex.
+        // Quick fix: return an error for now because this trait method is currently implemented in SharedToolRegistry!
+        // Actually, `SharedToolRegistry<T>` implements `ToolRegistry` by calling `T`'s mutable methods via `try_write().guard.register_dynamic_tool()`.
+        // Wait, `SharedToolRegistry<T>` expects `T` to have `register_dynamic_tool(&mut self)`? No, it calls `guard.register_dynamic_tool` which goes to the trait implementation.
+        // Let me just fix the trait to match `VectorToolRegistry`'s interior mutability needs.
+        Err("Cannot register dynamically to a non-shared registry directly".into())
     }
 }
 

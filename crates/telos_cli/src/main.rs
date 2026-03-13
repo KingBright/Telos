@@ -1,3 +1,5 @@
+pub mod tui;
+
 use clap::{Parser, Subcommand};
 use futures_util::stream::StreamExt;
 use inquire::{Confirm, Text};
@@ -263,8 +265,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if check_and_init_config(false) {
                 start_daemon();
             }
-            println!("Dispatching Task: {}", task);
-            handle_run(task).await?;
+            let config = TelosConfig::load().unwrap_or_else(|_| panic!("Config should exist"));
+            tui::run_tui(config, Some(task.clone())).await?;
         }
         Commands::Bot { telegram } => {
             if check_and_init_config(false) {
@@ -451,6 +453,8 @@ fn check_and_init_config(force: bool) -> bool {
         log_level: "normal".to_string(),
         global_prompt: None,
         proxy: None,
+        router_persona_name: "小特".to_string(),
+        router_persona_trait: "聪明、活泼且不失风趣".to_string(),
     };
 
     match config.save() {

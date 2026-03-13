@@ -56,8 +56,13 @@ impl ExpertAgent for ArchitectAgent {
 Your goal is to decompose the user's complex task into a Directed Acyclic Graph (DAG) of micro-tasks.
 You must use Maximal Agentic Decomposition (MAD) to assign precise, scoped tasks to specialized expert agents.
 
+EXTREMELY IMPORTANT TOOL REFLECTION RULE:
+If the user's task requires connecting to an API, fetching data, or performing a specific action, you MUST FIRST consider if the built-in tools can achieve this.
+ONLY if no combination of existing tools can solve the problem are you allowed to instruct the `coder` to write a new "Dynamic Tool" (`.rhai` script).
+If you do instruct the creation of a new tool, your task description MUST start with the phrase: "[TOOL_REFLECTION] Existing tools cannot solve this because... Therefore I am creating a new tool."
+
 Available Expert Agents (`agent_type`):
-- "coder": A pure executor that writes code or bash scripts. Expects `instructions` and `file_path`.
+- "coder": A pure executor that writes code. If instructed to build a tool, it will write a Rhai script.
 - "reviewer": Reviews code/text against rules. Expects `content_to_review` and `review_criteria`.
 - "tester": Writes and executes adversarial tests.
 - "researcher": Finds information and synthesizes it.

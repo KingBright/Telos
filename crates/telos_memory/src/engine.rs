@@ -15,6 +15,7 @@ pub trait MemoryOS: Send + Sync {
 
 pub struct RedbGraphStore {
     db: Arc<Database>,
+    model: Option<Arc<tokio::sync::RwLock<fastembed::TextEmbedding>>>,
 }
 
 impl RedbGraphStore {
@@ -49,16 +50,63 @@ impl RedbGraphStore {
             let _ = write_txn.open_table(MEMORY_TABLE).map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())?;
+        
+        // Initialize Embedding Model
+        let model = std::panic::catch_unwind(|| {
+            fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
+                fastembed::EmbeddingModel::AllMiniLML6V2,
+            ))
+        });
+        
+        let model_opt = match model {
+            Ok(Ok(m)) => {
+                tracing::info!("[MemoryOS] Fastembed local model initialized for vector search.");
+                Some(Arc::new(tokio::sync::RwLock::new(m)))
+            }
+            _ => {
+                tracing::warn!("[MemoryOS] Fastembed init failed. Vector search will fallback or fail.");
+                None
+            }
+        };
 
         Ok(Self {
             db: Arc::new(db),
+            model: model_opt,
         })
+    }
+
+    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot_product = 0.0;
+        let mut norm_a = 0.0;
+        let mut norm_b = 0.0;
+        for (x, y) in a.iter().zip(b.iter()) {
+            dot_product += x * y;
+            norm_a += x * x;
+            norm_b += y * y;
+        }
+        if norm_a == 0.0 || norm_b == 0.0 {
+            0.0
+        } else {
+            dot_product / (norm_a.sqrt() * norm_b.sqrt())
+        }
     }
 }
 
 #[async_trait]
 impl MemoryOS for RedbGraphStore {
-    async fn store(&self, entry: MemoryEntry) -> Result<(), String> {
+    async fn store(&self, mut entry: MemoryEntry) -> Result<(), String> {
+        // Automatically inject embedding if this is a Semantic, UserProfile, or InteractionEvent memory without one
+        if (entry.memory_type == MemoryType::Semantic || entry.memory_type == MemoryType::UserProfile || entry.memory_type == MemoryType::InteractionEvent) && entry.embedding.is_none() {
+            if let Some(ref model_arc) = self.model {
+                let mut m = model_arc.write().await;
+                if let Ok(embeddings) = m.embed(vec![entry.content.clone()], None) {
+                    if let Some(vec) = embeddings.into_iter().next() {
+                        entry.embedding = Some(vec);
+                    }
+                }
+            }
+        }
+        
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut table = write_txn.open_table(MEMORY_TABLE).map_err(|e| e.to_string())?;
@@ -80,19 +128,17 @@ impl MemoryOS for RedbGraphStore {
             let (_key, value) = result.map_err(|e| e.to_string())?;
             let entry: MemoryEntry = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
 
-            // Filter logic based on query type (very basic mock implementation for V1)
             let matches = match &query {
                 MemoryQuery::EntityLookup { entity } => {
                     // Search content or semantic type
-                    entry.memory_type == MemoryType::Semantic && entry.content.contains(entity)
+                    (entry.memory_type == MemoryType::Semantic || entry.memory_type == MemoryType::UserProfile || entry.memory_type == MemoryType::InteractionEvent) && entry.content.contains(entity)
                 },
                 MemoryQuery::TimeRange { start, end } => {
                     entry.created_at >= *start && entry.created_at <= *end
                 },
                 MemoryQuery::VectorSearch { query: search_vec, top_k: _ } => {
                     if let Some(ref doc_vec) = entry.embedding {
-                         // Basic cosine simmock
-                         let sim = doc_vec.iter().zip(search_vec).map(|(a, b)| a * b).sum::<f32>();
+                         let sim = Self::cosine_similarity(doc_vec, search_vec);
                          sim > 0.5 // Arbitrary threshold
                     } else {
                         false
@@ -108,8 +154,8 @@ impl MemoryOS for RedbGraphStore {
         if let MemoryQuery::VectorSearch { top_k, query: search_vec } = query {
              // In a real system, compute sim for all and sort
              results.sort_by(|a, b| {
-                let sim_a = a.embedding.as_ref().map(|v| v.iter().zip(&search_vec).map(|(x,y)| x*y).sum::<f32>()).unwrap_or(0.0);
-                let sim_b = b.embedding.as_ref().map(|v| v.iter().zip(&search_vec).map(|(x,y)| x*y).sum::<f32>()).unwrap_or(0.0);
+                let sim_a = a.embedding.as_ref().map(|v| Self::cosine_similarity(v, &search_vec)).unwrap_or(0.0);
+                let sim_b = b.embedding.as_ref().map(|v| Self::cosine_similarity(v, &search_vec)).unwrap_or(0.0);
                 sim_b.partial_cmp(&sim_a).unwrap_or(std::cmp::Ordering::Equal)
              });
              results.truncate(top_k);

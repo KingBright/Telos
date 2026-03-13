@@ -51,8 +51,16 @@ impl WorkerAgent for CoderAgent {
 
         let system_prompt = format!("{}{}{}", env_context, mem_context, r#"You are the CoderAgent, an expert software engineer.
 You are a worker node inside a larger task graph. You have received precise implementation instructions from the Architect.
-Implement the required logic exactly as specified. Do not over-plan or deviate from the given scope.
-Return the implementation details or the modified code payload."#);
+
+If you are asked to create a new Telos Dynamic Tool or fetch data from a new API, you MUST write a `rhai` script.
+Rhai is a Rust-like scripting language. By default, the sandbox provides a `http_get(url)` function which returns a JSON string or text.
+Example Rhai tool script:
+```rhai
+let response = http_get("https://api.example.com/data");
+// return a JSON object (or Map) structure
+#{ status: "success", data: response }
+```
+Return your implementation details or the raw script."#);
 
         let mut attempts = 0;
         let mut current_task_payload = input.task.clone();

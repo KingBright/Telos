@@ -7,11 +7,16 @@ edition = "2021"
 telos_evolution = { path = "../telos_evolution" }
 telos_core = { path = "../telos_core" }
 tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json", "time", "local-time", "chrono"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "registry", "json", "time", "local-time", "chrono"] }
 tracing-appender = "0.2.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 async-trait = "0.1.80"
+tracing-opentelemetry = "0.28.0"
+opentelemetry = { version = "0.27.1", features = ["trace"] }
+opentelemetry_sdk = { version = "0.27.1", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.27.0", features = ["tls", "tls-roots", "grpc-tonic", "trace"] }
+
 [dev-dependencies]
 tempfile = "3.10"

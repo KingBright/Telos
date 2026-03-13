@@ -39,6 +39,22 @@ pub struct TelosConfig {
     /// Example: "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
     #[serde(default)]
     pub proxy: Option<String>,
+
+    /// Router Persona Name
+    #[serde(default = "default_persona_name")]
+    pub router_persona_name: String,
+
+    /// Router Persona Trait
+    #[serde(default = "default_persona_trait")]
+    pub router_persona_trait: String,
+}
+
+fn default_persona_name() -> String {
+    "小特".to_string()
+}
+
+fn default_persona_trait() -> String {
+    "聪明、活泼且不失风趣".to_string()
 }
 
 fn default_max_concurrent_requests() -> usize {

@@ -328,6 +328,7 @@ impl ExecutableNode for ToolNode {
 struct AppState {
     broker: Arc<TokioEventBroker>,
     recent_traces: Arc<tokio::sync::RwLock<std::collections::VecDeque<telos_hci::AgentFeedback>>>,
+    active_tasks: telos_dag::engine::ActiveTaskRegistry,
 }
 
 #[derive(Deserialize)]
@@ -515,13 +516,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(script_code) = std::fs::read_to_string(&script_path) {
                                     let sandbox = std::sync::Arc::new(telos_tooling::ScriptSandbox::new());
                                     let native_registry = telos_tooling::wrap_tool_registry(tool_registry.clone());
-                                    let script_executor = telos_tooling::ScriptExecutor::new(script_code, sandbox)
-                                        .with_native_tools(native_registry);
+                                    let script_executor: std::sync::Arc<dyn telos_tooling::ToolExecutor> = std::sync::Arc::new(
+                                        telos_tooling::ScriptExecutor::new(script_code, sandbox)
+                                            .with_native_tools(native_registry)
+                                    );
 
                                     let mut guard = tool_registry.write().await;
                                     guard.register_tool(
                                         schema,
-                                        Some(std::sync::Arc::new(script_executor)),
+                                        Some(script_executor),
                                     );
                                     drop(guard);
                                     debug!(
@@ -637,6 +640,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let distillation_tx_bg = distillation_tx.clone();
+    
+    // Global active tasks registry
+    let active_tasks: telos_dag::engine::ActiveTaskRegistry = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let active_tasks_loop = active_tasks.clone();
 
     tokio::spawn(async move {
         debug!("[Daemon] Event loop started.");
@@ -672,7 +679,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
 
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new()
-                        .with_node_factory(node_factory);
+                        .with_node_factory(node_factory)
+                        .with_active_tasks(active_tasks_loop.clone());
 
                     let context_manager_spawn = context_manager.clone();
                     tokio::spawn(async move {
@@ -818,7 +826,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 status: telos_core::NodeStatus::Running,
                             });
 
-                            let router = agents::router::RouterAgent::new(gateway_clone.clone());
+                            let router = agents::router::RouterAgent::new(gateway_clone.clone(), config.router_persona_name.clone(), config.router_persona_trait.clone());
                             let router_input = telos_core::AgentInput {
                                 node_id: "router_main".to_string(),
                                 task: enriched_payload.clone(),
@@ -884,7 +892,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 status: telos_core::NodeStatus::Running,
                             });
                             
-                            let router_agent = RouterAgent::new(gateway_clone.clone());
+                            let router_agent = RouterAgent::new(gateway_clone.clone(), config.router_persona_name.clone(), config.router_persona_trait.clone());
                             let router_input = AgentInput {
                                 node_id: "router".to_string(),
                                 task: enriched_payload.clone(),
@@ -1248,7 +1256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
 
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new()
-                        .with_node_factory(node_factory);
+                        .with_node_factory(node_factory)
+                        .with_active_tasks(active_tasks_loop.clone());
 
                     let context_manager_approval = context_manager.clone();
                     tokio::spawn(async move {
@@ -1464,6 +1473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         broker: broker.clone(),
         recent_traces,
+        active_tasks,
     };
 
     let app = Router::new()
@@ -1473,6 +1483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/stream", get(ws_handler))
         .route("/api/v1/log-level", get(get_log_level).post(set_log_level))
         .route("/api/v1/traces", get(get_traces))
+        .route("/api/v1/tasks/active", get(get_active_tasks))
         .route("/ui", get(serve_ui))
         .with_state(state);
 
@@ -1489,6 +1500,14 @@ async fn get_traces(State(state): State<AppState>) -> Json<serde_json::Value> {
     let traces: Vec<_> = q.iter().cloned().collect();
     Json(serde_json::json!({
         "traces": traces
+    }))
+}
+
+async fn get_active_tasks(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let w = state.active_tasks.read().await;
+    let tasks: Vec<_> = w.values().cloned().collect();
+    Json(serde_json::json!({
+        "active_tasks": tasks
     }))
 }
 

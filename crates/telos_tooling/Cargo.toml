@@ -25,6 +25,7 @@ reqwest = { workspace = true }
 chrono = "0.4.44"
 scraper = "0.25.0"
 tracing.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 wat = "1.0"

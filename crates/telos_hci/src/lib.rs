@@ -211,6 +211,16 @@ pub struct TaskSummary {
     pub failed_node_ids: Vec<String>, // IDs of failed nodes
 }
 
+/// Active task information for TUI monitoring
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ActiveTaskInfo {
+    pub task_id: String,
+    pub task_name: String,
+    pub progress: ProgressInfo,
+    pub running_nodes: Vec<String>,
+    pub started_at_ms: u64,
+}
+
 // ============================================================================
 // Event System (Input)
 // ============================================================================

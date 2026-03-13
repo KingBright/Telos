@@ -205,14 +205,21 @@ impl GatewayManager {
 #[async_trait]
 impl ModelGateway for GatewayManager {
     async fn generate(&self, req: LlmRequest) -> Result<LlmResponse, GatewayError> {
-        // 1. 检查熔断器
-        {
-            let mut cb = self.circuit_breaker.lock().await;
-            if !cb.allow_request() {
-                return Err(GatewayError::ServiceUnavailable {
-                    estimated_recovery_ms: Some(cb.recovery_timeout_ms()),
-                });
+        // 1. 检查熔断器，阻塞等待而不是直接拒绝 (以实现“哪怕慢点，只要能交付”的业务目标)
+        loop {
+            let allow = {
+                let mut cb = self.circuit_breaker.lock().await;
+                cb.allow_request()
+            };
+
+            if allow {
+                break;
             }
+
+            // 如果熔断器未放行，不要直接报错抛弃整个图任务。
+            // 而是等待一小段时间后再次检查，也就是用时间换取交付成功率。
+            warn!("[Gateway] Circuit Breaker is active. Waiting 5s before re-evaluating to prioritize task delivery over fast-failure...");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
         // 2. 强制速率限制 (0 = 无限制)
@@ -246,19 +253,32 @@ impl ModelGateway for GatewayManager {
                         return Err(e);
                     }
 
-                    if retries >= self.backoff.get_max_retries() {
-                        // 达到最大重试次数，记录失败到熔断器
+                    // For Rate Limits (429 TooManyRequests), we infinitely backoff and retry 
+                    // instead of tripping the failure counter, ensuring ultimate Delivery-First success.
+                    let is_rate_limit = matches!(e, GatewayError::TooManyRequests { .. });
+                    
+                    if !is_rate_limit && retries >= self.backoff.get_max_retries() {
+                        // 达到最大重试次数，记录失败到熔断器 (仅针对非限流类型的普通报错)
                         self.circuit_breaker.lock().await.record_failure();
                         return Err(e);
                     }
 
                     retries += 1;
-                    warn!(
-                        "[Gateway] Request failed (attempt {}/{}), retrying: {}",
-                        retries,
-                        self.backoff.get_max_retries(),
-                        e.to_user_message()
-                    );
+                    
+                    if is_rate_limit {
+                        warn!(
+                            "[Gateway] Request Rate Limited (attempt {}/∞), patiently waiting to deliver task...",
+                            retries
+                        );
+                    } else {
+                        warn!(
+                            "[Gateway] Request failed (attempt {}/{}), retrying: {}",
+                            retries,
+                            self.backoff.get_max_retries(),
+                            e.to_user_message()
+                        );
+                    }
+                    
                     self.backoff.wait(retries).await;
                 }
             }

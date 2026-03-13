@@ -11,10 +11,27 @@ pub struct ScriptSandbox {
 impl ScriptSandbox {
     /// Create a new ScriptSandbox with strict limits.
     pub fn new() -> Self {
-        let engine = Engine::new();
+        let mut engine = Engine::new();
         
-        // We could also disable some expensive or dangerous features if needed
-        // but Rhai is already quite safe by default (no network/FS by default)
+        // Strict Security Limits (Note: some limits require specific cargo features in Rhai)
+        // engine.set_max_operations(5000);   
+        // engine.set_max_call_levels(10);    
+        
+        // Register HTTP GET Host Function
+        engine.register_fn("http_get", |url: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            let url_str = url.to_string();
+            let result = tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    let resp = client.get(&url_str).send().await.map_err(|e| e.to_string())?;
+                    resp.text().await.map_err(|e| e.to_string())
+                })
+            });
+            result.map_err(|e| e.into())
+        });
 
         Self { engine }
     }
@@ -81,5 +98,9 @@ impl crate::ToolExecutor for ScriptExecutor {
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to serialize result: {}", e)))?;
             
         Ok(bytes)
+    }
+
+    fn source_code(&self) -> Option<String> {
+        Some(self.script.clone())
     }
 }

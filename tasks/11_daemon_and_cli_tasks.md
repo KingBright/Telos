@@ -12,4 +12,7 @@
 
 ## Notes/Issues
 - Needs to verify if `TokioEventBroker` can be cleanly instantiated with other modules.
+- **Iteration 6**: Integrated configurable `RouterAgent` persona (name and trait) via `config.toml`, routing logic dynamically includes Memory-OS user profiles prior to task delegation.
+  - Implemented `ActiveTaskRegistry` within `TokioExecutionEngine` exposed by `GET /api/v1/tasks/active`.
+  - Upgraded Client from basic CLI output to powerful `ratatui` TUI featuring background web-socket listeners and async REST polling.
 - Ensure no mock providers are used in the production wiring; prompt users for real API keys during `cli init`.

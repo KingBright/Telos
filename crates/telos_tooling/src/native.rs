@@ -528,19 +528,31 @@ impl ToolExecutor for FileEditTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::ExecutionFailed("Missing 'replace'".into()))?;
 
-        let mut content = std::fs::read_to_string(path)
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read {}: {}", path, e)))?;
-        if content.contains(search) {
-            content = content.replace(search, replace);
-            std::fs::write(path, content).map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to write {}: {}", path, e))
-            })?;
-            Ok(b"{\"status\": \"success\", \"message\": \"Replaced occurrences\"}".to_vec())
+        // If file doesn't exist, treat it as empty.
+        let mut content = std::fs::read_to_string(path).unwrap_or_else(|_| String::new());
+        
+        let modified_content = if search.is_empty() {
+            // Overwrite if search string is empty
+            replace.to_string()
+        } else if content.contains(search) {
+            content.replace(search, replace)
         } else {
-            Err(ToolError::ExecutionFailed(
+            return Err(ToolError::ExecutionFailed(
                 "Search string not found in file".into(),
-            ))
+            ));
+        };
+
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
         }
+
+        std::fs::write(path, modified_content).map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to write {}: {}", path, e))
+        })?;
+
+        Ok(b"{\"status\": \"success\", \"message\": \"File updated successfully\"}".to_vec())
     }
 }
 
@@ -1021,7 +1033,11 @@ impl ToolExecutor for WebSearchTool {
             }
         }
 
-        Err(ToolError::ExecutionFailed(format!("All search engines failed. Last error: {}", last_error_msg)))
+        if last_error_msg.is_empty() {
+            Err(ToolError::ExecutionFailed("All search engines returned empty results. This may occur if the network blocks the crawler. Try simpler keywords.".into()))
+        } else {
+            Err(ToolError::ExecutionFailed(format!("All search engines failed. Last error: {}", last_error_msg)))
+        }
     }
 }
 

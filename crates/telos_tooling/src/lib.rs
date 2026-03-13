@@ -100,6 +100,11 @@ pub enum ToolError {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError>;
+    
+    /// Return the native source code of this tool if it is dynamically generated
+    fn source_code(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(feature = "full")]
@@ -107,6 +112,7 @@ pub trait ToolRegistry: Send + Sync {
     fn discover_tools(&self, intent: &str, limit: usize) -> Vec<ToolSchema>;
     fn get_executor(&self, tool_name: &str) -> Option<std::sync::Arc<dyn ToolExecutor>>;
     fn list_all_tools(&self) -> Vec<ToolSchema>;
+    fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String>;
 }
 
 /// A wrapper that allows an Arc<tokio::sync::RwLock<dyn ToolRegistry>> to be used where Arc<dyn ToolRegistry> is expected.
@@ -149,6 +155,14 @@ impl<T: ToolRegistry + ?Sized> ToolRegistry for SharedToolRegistry<T> {
             guard.list_all_tools()
         } else {
             vec![]
+        }
+    }
+
+    fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String> {
+        if let Ok(mut guard) = self.inner.try_write() {
+            guard.register_dynamic_tool(schema, executor)
+        } else {
+            Err("Registry is locked".into())
         }
     }
 }

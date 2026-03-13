@@ -6,6 +6,8 @@ pub enum MemoryType {
     Episodic,
     Semantic,
     Procedural,
+    UserProfile,
+    InteractionEvent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

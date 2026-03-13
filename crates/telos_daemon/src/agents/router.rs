@@ -2,14 +2,17 @@ use crate::agents::{
     async_trait, AgentInput, AgentOutput, Arc, ExecutableNode, GatewayManager, SystemRegistry,
 };
 use telos_model_gateway::{Capability, LlmRequest, Message, ModelGateway};
+use telos_memory::MemoryOS;
 
 pub struct RouterAgent {
     pub gateway: Arc<GatewayManager>,
+    pub persona_name: String,
+    pub persona_trait: String,
 }
 
 impl RouterAgent {
-    pub fn new(gateway: Arc<GatewayManager>) -> Self {
-        Self { gateway }
+    pub fn new(gateway: Arc<GatewayManager>, persona_name: String, persona_trait: String) -> Self {
+        Self { gateway, persona_name, persona_trait }
     }
 
     pub async fn evaluate(&self, original_task: &str, expert_output: &str, _registry: &dyn SystemRegistry) -> AgentOutput {
@@ -94,11 +97,35 @@ impl ExecutableNode for RouterAgent {
         } else {
             String::new()
         };
+        
+        // Dynamically query user profile and interaction memory
+        let mut user_profile_context = String::new();
+        if let Some(mem_any) = _registry.get_memory_os() {
+            if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+                if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::EntityLookup { entity: "user".to_string() }).await {
+                    let profile_entries: Vec<String> = results.iter()
+                        .filter(|e| e.memory_type == telos_memory::MemoryType::UserProfile)
+                        .map(|e| e.content.clone())
+                        .collect();
+                let interaction_entries: Vec<String> = results.iter()
+                    .filter(|e| e.memory_type == telos_memory::MemoryType::InteractionEvent)
+                    .map(|e| e.content.clone())
+                    .collect();
+                
+                if !profile_entries.is_empty() {
+                    user_profile_context.push_str(&format!("[USER PROFILE]\n{}\n\n", profile_entries.join("\n- ")));
+                }
+                if !interaction_entries.is_empty() {
+                    user_profile_context.push_str(&format!("[PAST INTERACTIONS]\n{}\n\n", interaction_entries.join("\n- ")));
+                }
+            }
+        }
+    }
+        
         let mem_context = input.memory_context.clone().unwrap_or_default();
 
-        let system_prompt = format!("{}{}{}", env_context, mem_context, r#"You are the Telos Master Router. Your job is to analyze a user's task and route it to the most specialized expert agent available.
-
-Available Experts:
+        let persona_intro = format!("You are the Telos Master Router. Your name is {}. You have the following personality and traits: {}. Your job is to analyze a user's task and route it to the most specialized expert agent available.\n\n", self.persona_name, self.persona_trait);
+        let system_prompt = format!("{}{}{}{}{}", env_context, user_profile_context, mem_context, persona_intro, r#"Available Experts:
 - "software_expert": For tasks requiring writing, modifying, or executing programming code, or software architecture.
 - "research_expert": For tasks requiring deep, iterative information gathering via search engines (e.g., current events, fact-checking, real-time data).
 - "qa_expert": For tasks heavily focused on writing tests, finding edge cases, or breaking code.

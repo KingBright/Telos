@@ -29,6 +29,9 @@ This file tracks the integration points between different modules to ensure the 
 - [x] **Model Gateway (Module 7) -> Memory OS (Module 4)**:
   - (Future) Memory OS background workers (reconsolidation) utilize the Model Gateway API for summarization, applying exponential backoff and rate limiting during background compression.
 
+- [x] **Router Agent (Module 11) -> Memory OS (Module 4)**:
+  - Master routing dispatcher executes EntityLookups for `UserProfile` and `InteractionEvent` memory types to inject identity and past interactions dynamically into its system prompt prior to making specialized agent determinations.
+
 ## 07 Model Gateway & Resource Governor (telos_model_gateway) Integration
 
 - [x] **DAG Engine (Module 2) -> Model Gateway (Module 7)**:
@@ -65,6 +68,9 @@ This file tracks the integration points between different modules to ensure the 
 
 - [x] **Tooling (Module 5) -> Daemon Execution (Module 11)**:
   - WasmToolNode in Daemon retrieves dynamic tools via `VectorToolRegistry`. Added `FsRead`, `FsWrite`, `ShellExec`, and `ToolRegister` to enable code execution and tool creation cycles.
+
+- [x] **CLI Client (Module 11) -> Daemon Execution (Module 11)**:
+  - CLI TUI actively queries `/api/v1/tasks/active` and continuously listens to `/api/v1/stream` WebSocket to aggregate and trace all parallel pipeline completions cleanly.
 
 ## 13 Project Management (telos_project) Integration
 

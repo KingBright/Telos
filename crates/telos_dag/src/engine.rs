@@ -65,11 +65,18 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Active task registry type
+pub type ActiveTaskRegistry = Arc<RwLock<HashMap<String, telos_hci::ActiveTaskInfo>>>;
+
 pub struct TokioExecutionEngine {
     node_factory: Option<std::sync::Arc<dyn NodeFactory>>,
     wakeup_tx: tokio::sync::mpsc::UnboundedSender<(String, String, String)>, // (task_id, node_id, instruction)
     wakeup_rx: tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>,
     circuit_breaker_config: CircuitBreakerConfig,
+    active_tasks: ActiveTaskRegistry,
 }
 
 impl TokioExecutionEngine {
@@ -80,7 +87,17 @@ impl TokioExecutionEngine {
             wakeup_tx,
             wakeup_rx,
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            active_tasks: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn active_tasks(&self) -> ActiveTaskRegistry {
+        self.active_tasks.clone()
+    }
+
+    pub fn with_active_tasks(mut self, active_tasks: ActiveTaskRegistry) -> Self {
+        self.active_tasks = active_tasks;
+        self
     }
 
     pub fn with_node_factory(mut self, factory: std::sync::Arc<dyn NodeFactory>) -> Self {
@@ -169,47 +186,6 @@ impl TokioExecutionEngine {
         failure_rate >= config.failure_rate_threshold
     }
 
-    /// 收集失败的节点ID
-    fn collect_failed_node_ids(graph: &TaskGraph) -> Vec<String> {
-        graph
-            .node_statuses
-            .iter()
-            .filter(|(_, status)| **status == NodeStatus::Failed)
-            .map(|(id, _)| id.clone())
-            .collect()
-    }
-
-    /// 发送任务完成通知
-    fn send_task_completed(
-        broker: &dyn EventBroker,
-        task_id: &str,
-        final_state: TaskFinalState,
-        total_nodes: usize,
-        completed_nodes: usize,
-        failed_nodes: usize,
-        start_time: Instant,
-        failed_node_ids: Vec<String>,
-    ) {
-        let summary = TaskSummary {
-            success: final_state.is_success(),
-            total_nodes,
-            completed_nodes,
-            failed_nodes,
-            total_time_ms: start_time.elapsed().as_millis() as u64,
-            summary: format!(
-                "{} - 完成 {} 个节点，失败 {} 个",
-                final_state.to_user_message(),
-                completed_nodes,
-                failed_nodes
-            ),
-            failed_node_ids,
-        };
-
-        broker.publish_feedback(AgentFeedback::TaskCompleted {
-            task_id: task_id.to_string(),
-            summary,
-        });
-    }
 }
 
 #[async_trait::async_trait]
@@ -255,6 +231,25 @@ impl ExecutionEngine for TokioExecutionEngine {
         let graph_span = info_span!("run_graph", trace_id = %graph_id);
         let circuit_config = self.circuit_breaker_config.clone();
 
+        // Register active task
+        let active_tasks_ref = self.active_tasks.clone();
+        let current_time_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let initial_progress = Self::calculate_progress(graph);
+        {
+            let mut w = active_tasks_ref.write().await;
+            w.insert(
+                graph_id.clone(),
+                telos_hci::ActiveTaskInfo {
+                    task_id: graph_id.clone(),
+                    task_name: graph_id.clone(),
+                    progress: initial_progress,
+                    running_nodes: vec![],
+                    started_at_ms: current_time_ms,
+                },
+            );
+        }
+
+        let active_tasks_ref = self.active_tasks.clone();
         async move {
             let mut last_progress_update = Instant::now();
             let progress_update_interval = std::time::Duration::from_millis(500);
@@ -317,10 +312,22 @@ impl ExecutionEngine for TokioExecutionEngine {
                         },
                     });
 
+                    let progress = Self::calculate_progress(graph);
                     broker.publish_feedback(AgentFeedback::ProgressUpdate {
                         task_id: graph_id.clone(),
-                        progress: Self::calculate_progress(graph),
+                        progress: progress.clone(),
                     });
+
+                    // Update ActiveTaskInfo
+                    {
+                        let mut w = active_tasks_ref.write().await;
+                        if let Some(mut info) = w.get_mut(&graph_id) {
+                            info.progress = progress;
+                            if !info.running_nodes.contains(&node_id) {
+                                info.running_nodes.push(node_id.clone());
+                            }
+                        }
+                    }
 
                     if let Some(node) = graph.nodes.remove(&node_id) {
                         let id_clone = node_id.clone();
@@ -393,10 +400,20 @@ impl ExecutionEngine for TokioExecutionEngine {
                                     status: NodeStatus::WaitingForInput,
                                 });
 
+                                let progress = Self::calculate_progress(graph);
                                 broker.publish_feedback(AgentFeedback::ProgressUpdate {
                                     task_id: graph_id.clone(),
-                                    progress: Self::calculate_progress(graph),
+                                    progress: progress.clone(),
                                 });
+
+                                // Update ActiveTaskInfo state to waiting/pending
+                                {
+                                    let mut w = active_tasks_ref.write().await;
+                                    if let Some(mut info) = w.get_mut(&graph_id) {
+                                        info.progress = progress;
+                                        info.running_nodes.retain(|n| n != &node_id);
+                                    }
+                                }
                                 continue;
                             }
 
@@ -514,6 +531,14 @@ impl ExecutionEngine for TokioExecutionEngine {
                                 });
                             }
 
+                            // Update active tasks map running nodes removal
+                            {
+                                let mut w = active_tasks_ref.write().await;
+                                if let Some(mut info) = w.get_mut(&graph_id) {
+                                    info.running_nodes.retain(|n| n != &node_id);
+                                }
+                            }
+
                             // Regular progress update (if didn't update already)
                             if last_progress_update.elapsed() >= progress_update_interval {
                                 broker.publish_feedback(AgentFeedback::ProgressUpdate {
@@ -556,6 +581,12 @@ impl ExecutionEngine for TokioExecutionEngine {
                         }
                     }
                 }
+            }
+
+            // Deregister active task once completed
+            {
+                let mut w = active_tasks_ref.write().await;
+                w.remove(&graph_id);
             }
 
             // 确定最终状态
