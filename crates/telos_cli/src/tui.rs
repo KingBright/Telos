@@ -32,6 +32,7 @@ enum TuiEvent {
     Feedback(AgentFeedback),
     ActiveTasksUpdate(Vec<telos_hci::ActiveTaskInfo>),
     Tick,
+    ConnectionError(String),
 }
 
 struct App<'a> {
@@ -43,7 +44,8 @@ struct App<'a> {
 
 impl<'a> Default for App<'a> {
     fn default() -> Self {
-        let textarea = TextArea::default();
+        let mut textarea = TextArea::default();
+        textarea.set_placeholder_text(" Type your task... (If using Chinese IME, Pinyin may be invisible until space is pressed)");
         Self {
             textarea,
             chat_history: Vec::new(),
@@ -123,15 +125,19 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
             "trace_id": trace_id
         });
         
+        let tx_err = tx.clone();
         app.chat_history.push(format!(">> {}", task));
 
         let req_client = client.clone();
         tokio::spawn(async move {
-            let _ = req_client
+            let res = req_client
                 .post("http://127.0.0.1:3000/api/v1/run")
                 .json(&payload)
                 .send()
                 .await;
+            if let Err(e) = res {
+                let _ = tx_err.send(TuiEvent::ConnectionError(format!("Failed to connect to daemon: {}", e)));
+            }
         });
     }
 
@@ -147,10 +153,11 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
                         }
                         (KeyCode::Enter, event::KeyModifiers::NONE) => {
                             let text = app.textarea.lines().join("\n");
-                            app.textarea.delete_line_by_head();
-                            app.textarea.delete_line_by_end();
-                            let trimmed = text.trim();
+                            // Reset textarea completely
+                            app.textarea = TextArea::default();
+                            app.textarea.set_placeholder_text(" Type your task... (If using Chinese IME, Pinyin may be invisible until space is pressed)");
                             
+                            let trimmed = text.trim();
                             if !trimmed.is_empty() {
                                 // Dispatch Task
                                 let trace_id = uuid::Uuid::new_v4().to_string();
@@ -162,13 +169,17 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
                                 
                                 app.chat_history.push(format!(">> {}", trimmed));
 
+                                let tx_err = tx.clone();
                                 let req_client = client.clone();
                                 tokio::spawn(async move {
-                                    let _ = req_client
+                                    let res = req_client
                                         .post("http://127.0.0.1:3000/api/v1/run")
                                         .json(&payload)
                                         .send()
                                         .await;
+                                    if let Err(e) = res {
+                                        let _ = tx_err.send(TuiEvent::ConnectionError(format!("Failed to dispatch task: {}", e)));
+                                    }
                                 });
                             }
                         }
@@ -186,22 +197,29 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
                     let log_level = global_log_level().get();
                     if fb.should_show(log_level) {
                         match fb {
-                            AgentFeedback::Output { content, task_id, is_final, .. } => {
-                                let prefix = if is_final { "✓" } else { ">>" };
-                                app.chat_history.push(format!("[{}] {} {}", task_id.chars().take(8).collect::<String>(), prefix, content));
+                            AgentFeedback::Output { content, is_final, .. } => {
+                                if is_final {
+                                    app.chat_history.push(format!("✅ {}", content));
+                                } else if global_log_level().get().should_show(LogLevel::Verbose) {
+                                    app.chat_history.push(format!("→ {}", content));
+                                }
                             }
-                            AgentFeedback::TaskCompleted { summary, task_id } => {
+                            AgentFeedback::TaskCompleted { summary, .. } => {
                                 let icon = if summary.success { "✅" } else { "⚠️" };
-                                app.chat_history.push(format!("[{}] {} Task finished: {}", task_id.chars().take(8).collect::<String>(), icon, summary.summary));
+                                app.chat_history.push(format!("{} Task finished: {}", icon, summary.summary));
                             }
-                            AgentFeedback::NodeStarted { node_id, detail, task_id } => {
-                                app.chat_history.push(format!("[{}] ▶ Starting node: {} ({})", task_id.chars().take(8).collect::<String>(), node_id, detail.task_type));
+                            AgentFeedback::NodeStarted { node_id, detail, .. } => {
+                                if global_log_level().get().should_show(LogLevel::Verbose) {
+                                    app.chat_history.push(format!("▶ Starting node: {} ({})", node_id, detail.task_type));
+                                }
                             }
-                            AgentFeedback::NodeFailed { node_id, error, task_id } => {
-                                app.chat_history.push(format!("[{}] ✗ Node {} Failed: {}", task_id.chars().take(8).collect::<String>(), node_id, error.message));
+                            AgentFeedback::NodeFailed { node_id, error, .. } => {
+                                if global_log_level().get().should_show(LogLevel::Verbose) {
+                                    app.chat_history.push(format!("✗ Node {} Failed: {}", node_id, error.message));
+                                }
                             }
-                            AgentFeedback::RequireHumanIntervention { prompt, task_id, .. } => {
-                                app.chat_history.push(format!("\n🚨 [HUMAN INTERVENTION REQUIRED] Task: {}\n{}\n", task_id.chars().take(8).collect::<String>(), prompt));
+                            AgentFeedback::RequireHumanIntervention { prompt, .. } => {
+                                app.chat_history.push(format!("\n🚨 [HUMAN INTERVENTION REQUIRED]\n{}\n", prompt));
                             }
                             _ => {}
                         }
@@ -209,6 +227,9 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
                 }
                 TuiEvent::ActiveTasksUpdate(tasks) => {
                     app.active_tasks = tasks;
+                }
+                TuiEvent::ConnectionError(msg) => {
+                    app.chat_history.push(format!("🚨 {}", msg));
                 }
                 TuiEvent::Tick => {}
             }
@@ -247,20 +268,24 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     
     let mut task_items = Vec::new();
     for task in &app.active_tasks {
-        let task_id_short = task.task_id.chars().take(8).collect::<String>();
         let nodes_str = if task.running_nodes.is_empty() {
             "Planning...".to_string()
         } else {
             task.running_nodes.join(", ")
         };
         
-        let content = format!(
-            "[{}] {} | Progress: {}% | Nodes: {}", 
-            task_id_short,
-            task.task_name,
-            task.progress.percentage,
-            nodes_str
-        );
+        let current_step = std::cmp::min(task.progress.completed + 1, task.progress.total);
+        let content = if task.progress.total > 0 {
+            format!(
+                "{} | Progress: {}/{} | Executing: {}", 
+                task.task_name,
+                current_step,
+                task.progress.total,
+                nodes_str
+            )
+        } else {
+            format!("{} | Planning...", task.task_name)
+        };
         task_items.push(ListItem::new(content));
     }
     if task_items.is_empty() {
@@ -274,14 +299,27 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .borders(Borders::ALL)
         .title(" Execution History & Multi-Agent Outputs ");
     
-    // Auto-scroll logic: take only the lines that fit
-    let visible_history_lines = (chunks[1].height as usize).saturating_sub(2); // Subtract borders
-    let start_idx = app.chat_history.len().saturating_sub(visible_history_lines);
+    let width = chunks[1].width.saturating_sub(2).max(10) as usize;
+    let mut wrapped_lines = Vec::new();
+    for msg in &app.chat_history {
+        for line in msg.lines() {
+            if line.is_empty() {
+                wrapped_lines.push(String::new());
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            for chunk in chars.chunks(width) {
+                wrapped_lines.push(chunk.iter().collect::<String>());
+            }
+        }
+    }
     
-    let history_text: String = app.chat_history[start_idx..].join("\n");
+    let visible_history_lines = (chunks[1].height as usize).saturating_sub(2);
+    let start_idx = wrapped_lines.len().saturating_sub(visible_history_lines);
+    
+    let history_text: String = wrapped_lines[start_idx..].join("\n");
     let history_paragraph = Paragraph::new(history_text)
-        .block(history_block)
-        .wrap(Wrap { trim: true });
+        .block(history_block);
     
     f.render_widget(history_paragraph, chunks[1]);
 

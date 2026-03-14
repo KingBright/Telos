@@ -47,6 +47,11 @@ pub struct TelosConfig {
     /// Router Persona Trait
     #[serde(default = "default_persona_trait")]
     pub router_persona_trait: String,
+
+    /// Optional default physical location (e.g., "Suzhou, Jiangsu, China")
+    /// Defaults to None. If set, ignores IP-based geolocation.
+    #[serde(default)]
+    pub default_location: Option<String>,
 }
 
 fn default_persona_name() -> String {

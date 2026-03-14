@@ -43,10 +43,11 @@ impl TelegramFeedbackFormatter {
         Self { level }
     }
 
-    /// Truncate string to fit within Telegram's 4096 char limit
+    /// Truncate string to fit within Telegram's 4096 char limit, safe for UTF-8
     fn truncate_for_telegram(s: &str, max_len: usize) -> String {
-        if s.len() > max_len {
-            format!("{}... (truncated)", &s[..max_len])
+        if s.chars().count() > max_len {
+            let truncated: String = s.chars().take(max_len).collect();
+            format!("{}... (truncated)", truncated)
         } else {
             s.to_string()
         }
@@ -60,6 +61,9 @@ impl TelegramFeedbackFormatter {
 
         match feedback {
             AgentFeedback::PlanCreated { plan, .. } => {
+                if !self.level.should_show(LogLevel::Verbose) {
+                    return None;
+                }
                 let mut output = format!("<b>📋 Plan Created: {} steps</b>\n", plan.total_steps);
                 if let Some(ref reply) = plan.reply {
                     output.push_str(&Self::truncate_for_telegram(&format!("{}\n", reply), 500));
@@ -84,9 +88,12 @@ impl TelegramFeedbackFormatter {
             AgentFeedback::NodeStarted {
                 node_id, detail, ..
             } => {
+                if !self.level.should_show(LogLevel::Verbose) {
+                    return None;
+                }
                 let mut output =
                     format!("▶ <b>Starting [{}]</b> ({})\n", node_id, detail.task_type);
-                if self.level.should_show(LogLevel::Verbose) {
+                if self.level.should_show(LogLevel::Debug) {
                     output.push_str(&Self::truncate_for_telegram(
                         &format!("Task: {}\n", detail.input_preview),
                         200,
@@ -101,8 +108,11 @@ impl TelegramFeedbackFormatter {
                 execution_time_ms,
                 ..
             } => {
+                if !self.level.should_show(LogLevel::Verbose) {
+                    return None;
+                }
                 let mut output = format!("✓ [{}] Completed ({}ms)\n", node_id, execution_time_ms);
-                if self.level.should_show(LogLevel::Verbose) {
+                if self.level.should_show(LogLevel::Debug) {
                     output.push_str(&Self::truncate_for_telegram(
                         &format!("Result: {}\n", result_preview),
                         300,
@@ -112,6 +122,9 @@ impl TelegramFeedbackFormatter {
             }
 
             AgentFeedback::NodeFailed { node_id, error, .. } => {
+                if !self.level.should_show(LogLevel::Verbose) {
+                    return None;
+                }
                 let mut output = format!("✗ <b>[{}] FAILED</b>\n", node_id);
                 output.push_str(&format!("Type: {}\n", error.error_type));
                 output.push_str(&Self::truncate_for_telegram(
@@ -122,13 +135,14 @@ impl TelegramFeedbackFormatter {
             }
 
             AgentFeedback::ProgressUpdate { progress, .. } => {
-                let status_icons = format!(
-                    "✓ {} ✗ {} ⏳ {}",
-                    progress.completed, progress.failed, progress.running
-                );
+                let current_step = std::cmp::min(progress.completed + 1, progress.total);
+                let current_desc = progress
+                    .current_node_desc
+                    .as_deref()
+                    .unwrap_or("Planning...");
                 Some(format!(
-                    "📊 Progress: {}/{} ({}%) | {}",
-                    progress.completed, progress.total, progress.percentage, status_icons
+                    "▶ Progress: {}/{} | {}",
+                    current_step, progress.total, current_desc
                 ))
             }
 
@@ -201,9 +215,14 @@ impl TelegramFeedbackFormatter {
             AgentFeedback::Output {
                 content, is_final, ..
             } => {
+                if !*is_final && !self.level.should_show(LogLevel::Verbose) {
+                    return None;
+                }
                 let prefix = if *is_final { "✓" } else { "→" };
+                // Escape HTML carefully because raw LLM output could contain '<', '>', '&' which crashes telegram's ParseMode::Html
+                let escaped_content = teloxide::utils::html::escape(content);
                 Some(Self::truncate_for_telegram(
-                    &format!("{} {}", prefix, content),
+                    &format!("{} {}", prefix, escaped_content),
                     4000,
                 ))
             }
@@ -234,7 +253,7 @@ pub struct TelegramBotProvider {
     bot: Bot,
     daemon_url: String,
     daemon_ws_url: String,
-    active_tasks: Arc<Mutex<HashMap<String, String>>>,
+    active_tasks: Arc<Mutex<HashMap<String, (String, i32)>>>,
     pending_interactions: Arc<Mutex<HashMap<String, (String, String)>>>, // chat_id -> (task_id, node_id)
     send_state_changes: bool,
 }
@@ -246,8 +265,24 @@ impl TelegramBotProvider {
         daemon_ws_url: String,
         send_state_changes: bool,
     ) -> Self {
+        let mut bot = Bot::new(token.clone());
+        if let Ok(config) = TelosConfig::load() {
+            if let Some(proxy_url) = config.proxy {
+                if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                    if let Ok(client) = reqwest::Client::builder()
+                        .proxy(proxy)
+                        // Setting a reasonable timeout to prevent hanging forever
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build() 
+                    {
+                        bot = Bot::with_client(token, client);
+                    }
+                }
+            }
+        }
+        
         Self {
-            bot: Bot::new(token),
+            bot,
             daemon_url,
             daemon_ws_url,
             active_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -260,10 +295,11 @@ impl TelegramBotProvider {
         bot: Bot,
         msg: Message,
         daemon_url: String,
-        _active_tasks: Arc<Mutex<HashMap<String, String>>>,
+        _active_tasks: Arc<Mutex<HashMap<String, (String, i32)>>>,
         cmd: Command,
     ) -> ResponseResult<()> {
         match cmd {
+// ... omitting unchanged body for handle_message as it doesn't touch active_tasks
             Command::Help | Command::Start => {
                 bot.send_message(msg.chat.id, Command::descriptions().to_string())
                     .await?;
@@ -343,7 +379,7 @@ impl TelegramBotProvider {
         bot: Bot,
         msg: Message,
         daemon_url: String,
-        active_tasks: Arc<Mutex<HashMap<String, String>>>,
+        active_tasks: Arc<Mutex<HashMap<String, (String, i32)>>>,
         pending_interactions: Arc<Mutex<HashMap<String, (String, String)>>>,
     ) -> ResponseResult<()> {
         if let Some(text) = msg.text() {
@@ -391,15 +427,29 @@ impl TelegramBotProvider {
                 Ok(r) if r.status().is_success() => {
                     if let Ok(response_body) = r.json::<serde_json::Value>().await {
                         if let Some(trace_id) = response_body["trace_id"].as_str() {
+                            let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                                InlineKeyboardButton::callback(
+                                    "🔄 Refresh Status",
+                                    format!("status_{}", trace_id),
+                                ),
+                                InlineKeyboardButton::callback(
+                                    "❌ Cancel Task",
+                                    format!("cancel_{}", trace_id),
+                                ),
+                            ]]);
+
+                            let sent_msg = bot.send_message(
+                                msg.chat.id,
+                                format!("🚀 Task Dispatched: `{}`", trace_id),
+                            )
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                            .reply_markup(keyboard)
+                            .await?;
+
                             active_tasks
                                 .lock()
                                 .await
-                                .insert(trace_id.to_string(), msg.chat.id.to_string());
-                            bot.send_message(
-                                msg.chat.id,
-                                format!("Task Dispatched. Trace ID: {}", trace_id),
-                            )
-                            .await?;
+                                .insert(trace_id.to_string(), (msg.chat.id.to_string(), sent_msg.id.0));
                         }
                     }
                 }
@@ -416,7 +466,7 @@ impl TelegramBotProvider {
         bot: Bot,
         daemon_ws_url: String,
         daemon_url: String,
-        active_tasks: Arc<Mutex<HashMap<String, String>>>,
+        active_tasks: Arc<Mutex<HashMap<String, (String, i32)>>>,
         pending_interactions: Arc<Mutex<HashMap<String, (String, String)>>>,
         send_state_changes: bool,
     ) {
@@ -453,7 +503,7 @@ impl TelegramBotProvider {
                                 {
                                     global_log_level().set(*new_level);
                                     let active_map = active_tasks.lock().await;
-                                    for (_, chat_id_str) in active_map.iter() {
+                                    for (_, (chat_id_str, _)) in active_map.iter() {
                                         if let Ok(chat_id_num) = chat_id_str.parse::<i64>() {
                                             let _ = bot
                                                 .send_message(
@@ -488,7 +538,7 @@ impl TelegramBotProvider {
                                     };
 
                                     if !task_id.is_empty() {
-                                        if let Some(chat_id) = active_map.get(task_id) {
+                                        if let Some((chat_id, _msg_id)) = active_map.get(task_id) {
                                             target_chat_id = Some(chat_id.clone());
                                             if feedback.is_final() {
                                                 trace_id_to_remove = Some(task_id.to_string());
@@ -551,6 +601,35 @@ impl TelegramBotProvider {
                                                         if send_state_changes {
                                                             let _ = bot.send_message(chat_id, format!("<i>{}</i>", formatted)).parse_mode(teloxide::types::ParseMode::Html).await;
                                                         }
+                                                    } else if matches!(feedback, AgentFeedback::ProgressUpdate { .. }) || matches!(feedback, AgentFeedback::TaskCompleted { .. }) {
+                                                        // Update the existing dispatch message in place instead of sending novel bubbles
+                                                        let mut msg_id_opt = None;
+                                                        if let Some(AgentFeedback::ProgressUpdate { task_id, .. }) | Some(AgentFeedback::TaskCompleted { task_id, .. }) = Some(&feedback) {
+                                                            let map = active_tasks.lock().await;
+                                                            if let Some((_, mid)) = map.get(task_id) {
+                                                                msg_id_opt = Some(*mid);
+                                                            }
+                                                        }
+                                                        
+                                                        if let Some(msg_id) = msg_id_opt {
+                                                            let keyboard = if let AgentFeedback::ProgressUpdate { task_id, .. } = &feedback {
+                                                                InlineKeyboardMarkup::new(vec![vec![
+                                                                    InlineKeyboardButton::callback("🔄 Refresh Status", format!("status_{}", task_id)),
+                                                                    InlineKeyboardButton::callback("❌ Cancel Task", format!("cancel_{}", task_id)),
+                                                                ]])
+                                                            } else {
+                                                                InlineKeyboardMarkup::new(vec![vec![] as Vec<InlineKeyboardButton>]) // Remove keyboard on completion
+                                                            };
+                                                            
+                                                            let _ = bot.edit_message_text(chat_id, teloxide::types::MessageId(msg_id), &formatted)
+                                                                .parse_mode(teloxide::types::ParseMode::Html)
+                                                                .reply_markup(keyboard)
+                                                                .await;
+                                                        } else {
+                                                            let _ = bot.send_message(chat_id, &formatted)
+                                                                .parse_mode(teloxide::types::ParseMode::Html)
+                                                                .await;
+                                                        }
                                                     } else {
                                                         let _ = bot
                                                             .send_message(chat_id, &formatted)
@@ -591,9 +670,70 @@ impl TelegramBotProvider {
             if parts.len() == 2 {
                 let action = parts[0];
                 let task_id = parts[1];
-                let approved = action == "approve";
-
                 let client = Client::new();
+
+                if action == "status" {
+                    let res = client.get(format!("{}/api/v1/tasks/active", daemon_url)).send().await;
+                    if let Ok(r) = res {
+                        if r.status().is_success() {
+                            if let Ok(active_list) = r.json::<Vec<serde_json::Value>>().await {
+                                if let Some(task_data) = active_list.iter().find(|t| t["trace_id"].as_str() == Some(task_id)) {
+                                    let progress = task_data["progress"]["percentage"].as_u64().unwrap_or(0);
+                                    let nodes_arr = task_data["running_nodes"].as_array();
+                                    
+                                    let nodes_str = if let Some(arr) = nodes_arr {
+                                        if arr.is_empty() {
+                                            "Planning\\.\\.\\.".to_string()
+                                        } else {
+                                            // Escape _ and * for MarkdownV2
+                                            arr.iter().filter_map(|v| v.as_str()).map(|s| s.replace('_', "\\_").replace('*', "\\*")).collect::<Vec<_>>().join(", ")
+                                        }
+                                    } else {
+                                        "Planning\\.\\.\\.".to_string()
+                                    };
+
+                                    let msg_text = format!("🚀 *Task Status*\n`{}`\n\n📊 Progress: {}\\%\n🧠 Nodes: {}", task_id.replace('-', "\\-"), progress, nodes_str);
+                                    
+                                    if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(regular_msg)) = q.message.clone() {
+                                        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                                            InlineKeyboardButton::callback("🔄 Refresh Status", format!("status_{}", task_id)),
+                                            InlineKeyboardButton::callback("❌ Cancel Task", format!("cancel_{}", task_id)),
+                                        ]]);
+                                        
+                                        let _ = bot.edit_message_text(regular_msg.chat.id, regular_msg.id, msg_text)
+                                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                                            .reply_markup(keyboard)
+                                            .await;
+                                    }
+                                    
+                                    bot.answer_callback_query(q.id.clone())
+                                        .text("Status Updated")
+                                        .await?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    bot.answer_callback_query(q.id.clone())
+                        .text("Task is no longer active or completed.")
+                        .show_alert(true)
+                        .await?;
+                    
+                    if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(regular_msg)) = q.message.clone() {
+                         let _ = bot.edit_message_text(regular_msg.chat.id, regular_msg.id, format!("✅ *Task Completed or Inactive*: `{}`", task_id.replace('-', "\\-")))
+                                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                                .await;
+                    }
+                    return Ok(());
+                } else if action == "cancel" {
+                    bot.answer_callback_query(q.id.clone())
+                        .text("Cancel command is not implemented yet in the Daemon.")
+                        .show_alert(true)
+                        .await?;
+                    return Ok(());
+                }
+
+                let approved = action == "approve";
                 let _res = client
                     .post(format!("{}/api/v1/approve", daemon_url))
                     .json(&json!({ "task_id": task_id, "approved": approved }))

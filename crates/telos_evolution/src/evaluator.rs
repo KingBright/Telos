@@ -6,19 +6,28 @@ use tokio::task;
 use crate::{DriftWarning, Evaluator, ExecutionTrace, SynthesizedSkill};
 
 pub struct ActorCriticEvaluator {
-    embedder: Arc<tokio::sync::Mutex<TextEmbedding>>,
+    embedder: Option<Arc<tokio::sync::Mutex<TextEmbedding>>>,
     similarity_threshold: f32,
 }
 
 impl ActorCriticEvaluator {
     pub fn new() -> anyhow::Result<Self> {
-        let mut options = InitOptions::new(EmbeddingModel::AllMiniLML6V2);
-        options.show_download_progress = false;
+        let model = std::panic::catch_unwind(|| {
+            let mut options = InitOptions::new(EmbeddingModel::AllMiniLML6V2);
+            options.show_download_progress = false;
+            TextEmbedding::try_new(options)
+        });
 
-        let embedder = TextEmbedding::try_new(options)?;
+        let embedder_opt = match model {
+            Ok(Ok(m)) => Some(Arc::new(tokio::sync::Mutex::new(m))),
+            _ => {
+                eprintln!("[ActorCritic] Fastembed init failed. Semantic loop detection disabled.");
+                None
+            }
+        };
 
         Ok(Self {
-            embedder: Arc::new(tokio::sync::Mutex::new(embedder)),
+            embedder: embedder_opt,
             similarity_threshold: 0.85, // Adjust threshold to allow slight variations in testing
         })
     }
@@ -51,6 +60,11 @@ impl Evaluator for ActorCriticEvaluator {
             return Ok(());
         }
 
+        let embedder = match &self.embedder {
+            Some(e) => e.clone(),
+            None => return Ok(()),
+        };
+
         // Extract text representations of the last two steps
         let steps_text: Vec<String> = trace.steps.iter().rev().take(2).map(|step| {
             format!("Node: {}, Input: {}, Output: {:?}",
@@ -59,8 +73,6 @@ impl Evaluator for ActorCriticEvaluator {
                 step.output_data.as_deref().unwrap_or("None")
             )
         }).collect();
-
-        let embedder = self.embedder.clone();
 
         // Wrap CPU-bound synchronous fastembed execution in spawn_blocking
         let embeddings = task::spawn_blocking(move || {

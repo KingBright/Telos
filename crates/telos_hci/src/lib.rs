@@ -141,6 +141,7 @@ pub struct ProgressInfo {
     pub failed: usize,
     pub pending: usize,
     pub percentage: u8,
+    pub current_node_desc: Option<String>,
 }
 
 impl ProgressInfo {
@@ -150,6 +151,7 @@ impl ProgressInfo {
         running: usize,
         failed: usize,
         pending: usize,
+        current_node_desc: Option<String>,
     ) -> Self {
         let percentage = if total > 0 {
             ((completed as f64 / total as f64) * 100.0) as u8
@@ -163,6 +165,7 @@ impl ProgressInfo {
             failed,
             pending,
             percentage,
+            current_node_desc,
         }
     }
 }
@@ -428,7 +431,7 @@ impl AgentFeedback {
     pub fn is_final(&self) -> bool {
         matches!(
             self,
-            AgentFeedback::Output { is_final: true, .. } | AgentFeedback::TaskCompleted { .. }
+            AgentFeedback::TaskCompleted { .. }
         )
     }
 }
@@ -593,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_progress_info() {
-        let progress = ProgressInfo::new(3, 5, 1, 0, 1);
+        let progress = ProgressInfo::new(3, 5, 1, 0, 1, None);
         assert_eq!(progress.completed, 3);
         assert_eq!(progress.total, 5);
         assert_eq!(progress.percentage, 60);

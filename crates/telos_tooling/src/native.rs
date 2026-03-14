@@ -933,110 +933,117 @@ impl ToolExecutor for WebSearchTool {
             (Self::create_client()?, false)
         };
 
-        // Determine search engine order based on proxy setting
-        // When using proxy: Google -> DuckDuckGo -> Bing -> Baidu
-        // Without proxy: Baidu -> Bing -> DuckDuckGo
+        let max_retries = 3;
         let mut last_error_msg = String::new();
 
-        if using_proxy {
-            // International order with proxy: Google -> DuckDuckGo -> Bing -> Baidu
-            // 1. Try Google (best search engine)
-            match Self::search_google(query, &client).await {
-                Ok(results) if !results.is_empty() => {
-                    info!("[WebSearch] ✅ Google 返回 {} 条结果", results.len());
-                    return Ok(serde_json::to_vec(&results).unwrap_or_default());
-                }
-                Ok(_) => warn!("[WebSearch] ⚠️ Google 返回空结果，尝试下一个引擎"),
-                Err(e) => {
-                    last_error_msg = format!("Google: {:?}", e);
-                    warn!("[WebSearch] ❌ Google 失败，尝试下一个引擎");
-                }
+        for attempt in 1..=max_retries {
+            if attempt > 1 {
+                let sleep_time = std::time::Duration::from_secs(1 << (attempt - 2));
+                warn!("[WebSearch] 🔄 Silent Retry attempt {}/{} in {:?}...", attempt, max_retries, sleep_time);
+                tokio::time::sleep(sleep_time).await;
             }
 
-            // 2. Try DuckDuckGo
-            match Self::search_duckduckgo(query, &client).await {
-                Ok(results) if !results.is_empty() => {
-                    info!("[WebSearch] ✅ DuckDuckGo 返回 {} 条结果", results.len());
-                    return Ok(serde_json::to_vec(&results).unwrap_or_default());
+            // Determine search engine order based on proxy setting
+            if using_proxy {
+                // International order with proxy: Google -> DuckDuckGo -> Bing -> Baidu
+                // 1. Try Google
+                match Self::search_google(query, &client).await {
+                    Ok(results) if !results.is_empty() => {
+                        info!("[WebSearch] ✅ Google 返回 {} 条结果", results.len());
+                        return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                    }
+                    Ok(_) => warn!("[WebSearch] ⚠️ Google 返回空结果，尝试下一个引擎"),
+                    Err(e) => {
+                        last_error_msg = format!("Google: {:?}", e);
+                        warn!("[WebSearch] ❌ Google 失败，尝试下一个引擎: {}", last_error_msg);
+                    }
                 }
-                Ok(_) => warn!("[WebSearch] ⚠️ DuckDuckGo 返回空结果，尝试下一个引擎"),
-                Err(e) => {
-                    last_error_msg = format!("DuckDuckGo: {:?}", e);
-                    warn!("[WebSearch] ❌ DuckDuckGo 失败，尝试下一个引擎");
-                }
-            }
 
-            // 3. Try Bing
-            match Self::search_bing(query, &client).await {
-                Ok(results) if !results.is_empty() => {
-                    info!("[WebSearch] ✅ Bing 返回 {} 条结果", results.len());
-                    return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                // 2. Try DuckDuckGo
+                match Self::search_duckduckgo(query, &client).await {
+                    Ok(results) if !results.is_empty() => {
+                        info!("[WebSearch] ✅ DuckDuckGo 返回 {} 条结果", results.len());
+                        return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                    }
+                    Ok(_) => warn!("[WebSearch] ⚠️ DuckDuckGo 返回空结果，尝试下一个引擎"),
+                    Err(e) => {
+                        last_error_msg = format!("DuckDuckGo: {:?}", e);
+                        warn!("[WebSearch] ❌ DuckDuckGo 失败，尝试下一个引擎: {}", last_error_msg);
+                    }
                 }
-                Ok(_) => warn!("[WebSearch] ⚠️ Bing 返回空结果，尝试下一个引擎"),
-                Err(e) => {
-                    last_error_msg = format!("Bing: {:?}", e);
-                    warn!("[WebSearch] ❌ Bing 失败，尝试下一个引擎");
-                }
-            }
 
-            // 4. Try Baidu
-            match Self::search_baidu(query, &client).await {
-                Ok(results) if !results.is_empty() => {
-                    info!("[WebSearch] ✅ Baidu 返回 {} 条结果", results.len());
-                    return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                // 3. Try Bing
+                match Self::search_bing(query, &client).await {
+                    Ok(results) if !results.is_empty() => {
+                        info!("[WebSearch] ✅ Bing 返回 {} 条结果", results.len());
+                        return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                    }
+                    Ok(_) => warn!("[WebSearch] ⚠️ Bing 返回空结果，尝试下一个引擎"),
+                    Err(e) => {
+                        last_error_msg = format!("Bing: {:?}", e);
+                        warn!("[WebSearch] ❌ Bing 失败，尝试下一个引擎: {}", last_error_msg);
+                    }
                 }
-                Ok(_) => warn!("[WebSearch] ⚠️ Baidu 返回空结果"),
-                Err(e) => {
-                    last_error_msg = format!("Baidu: {:?}", e);
-                    error!("[WebSearch] ❌ Baidu 失败");
-                }
-            }
-        } else {
-            // Domestic order without proxy: Baidu -> Bing -> DuckDuckGo
-            // 1. Try Baidu
-            match Self::search_baidu(query, &client).await {
-                Ok(results) if !results.is_empty() => {
-                    info!("[WebSearch] ✅ Baidu 返回 {} 条结果", results.len());
-                    return Ok(serde_json::to_vec(&results).unwrap_or_default());
-                }
-                Ok(_) => warn!("[WebSearch] ⚠️ Baidu 返回空结果，尝试下一个引擎"),
-                Err(e) => {
-                    last_error_msg = format!("Baidu: {:?}", e);
-                    warn!("[WebSearch] ❌ Baidu 失败，尝试下一个引擎");
-                }
-            }
 
-            // 2. Try Bing
-            match Self::search_bing(query, &client).await {
-                Ok(results) if !results.is_empty() => {
-                    info!("[WebSearch] ✅ Bing 返回 {} 条结果", results.len());
-                    return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                // 4. Try Baidu
+                match Self::search_baidu(query, &client).await {
+                    Ok(results) if !results.is_empty() => {
+                        info!("[WebSearch] ✅ Baidu 返回 {} 条结果", results.len());
+                        return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                    }
+                    Ok(_) => warn!("[WebSearch] ⚠️ Baidu 返回空结果"),
+                    Err(e) => {
+                        last_error_msg = format!("Baidu: {:?}", e);
+                        error!("[WebSearch] ❌ Baidu 失败: {}", last_error_msg);
+                    }
                 }
-                Ok(_) => warn!("[WebSearch] ⚠️ Bing 返回空结果，尝试下一个引擎"),
-                Err(e) => {
-                    last_error_msg = format!("Bing: {:?}", e);
-                    warn!("[WebSearch] ❌ Bing 失败，尝试下一个引擎");
+            } else {
+                // Domestic order without proxy: Baidu -> Bing -> DuckDuckGo
+                // 1. Try Baidu
+                match Self::search_baidu(query, &client).await {
+                    Ok(results) if !results.is_empty() => {
+                        info!("[WebSearch] ✅ Baidu 返回 {} 条结果", results.len());
+                        return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                    }
+                    Ok(_) => warn!("[WebSearch] ⚠️ Baidu 返回空结果，尝试下一个引擎"),
+                    Err(e) => {
+                        last_error_msg = format!("Baidu: {:?}", e);
+                        warn!("[WebSearch] ❌ Baidu 失败，尝试下一个引擎: {}", last_error_msg);
+                    }
                 }
-            }
 
-            // 3. Try DuckDuckGo
-            match Self::search_duckduckgo(query, &client).await {
-                Ok(results) if !results.is_empty() => {
-                    info!("[WebSearch] ✅ DuckDuckGo 返回 {} 条结果", results.len());
-                    return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                // 2. Try Bing
+                match Self::search_bing(query, &client).await {
+                    Ok(results) if !results.is_empty() => {
+                        info!("[WebSearch] ✅ Bing 返回 {} 条结果", results.len());
+                        return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                    }
+                    Ok(_) => warn!("[WebSearch] ⚠️ Bing 返回空结果，尝试下一个引擎"),
+                    Err(e) => {
+                        last_error_msg = format!("Bing: {:?}", e);
+                        warn!("[WebSearch] ❌ Bing 失败，尝试下一个引擎: {}", last_error_msg);
+                    }
                 }
-                Ok(_) => warn!("[WebSearch] ⚠️ DuckDuckGo 返回空结果"),
-                Err(e) => {
-                    last_error_msg = format!("DuckDuckGo: {:?}", e);
-                    error!("[WebSearch] ❌ DuckDuckGo 失败");
+
+                // 3. Try DuckDuckGo
+                match Self::search_duckduckgo(query, &client).await {
+                    Ok(results) if !results.is_empty() => {
+                        info!("[WebSearch] ✅ DuckDuckGo 返回 {} 条结果", results.len());
+                        return Ok(serde_json::to_vec(&results).unwrap_or_default());
+                    }
+                    Ok(_) => warn!("[WebSearch] ⚠️ DuckDuckGo 返回空结果"),
+                    Err(e) => {
+                        last_error_msg = format!("DuckDuckGo: {:?}", e);
+                        error!("[WebSearch] ❌ DuckDuckGo 失败: {}", last_error_msg);
+                    }
                 }
             }
         }
 
         if last_error_msg.is_empty() {
-            Err(ToolError::ExecutionFailed("All search engines returned empty results. This may occur if the network blocks the crawler. Try simpler keywords.".into()))
+            Err(ToolError::ExecutionFailed("All search engines returned empty results across all 3 retries. This may occur if the network blocks the crawler. Try simpler keywords.".into()))
         } else {
-            Err(ToolError::ExecutionFailed(format!("All search engines failed. Last error: {}", last_error_msg)))
+            Err(ToolError::ExecutionFailed(format!("All search engines failed after {} retries. Last error: {}", max_retries, last_error_msg)))
         }
     }
 }

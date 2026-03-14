@@ -455,6 +455,7 @@ fn check_and_init_config(force: bool) -> bool {
         proxy: None,
         router_persona_name: "小特".to_string(),
         router_persona_trait: "聪明、活泼且不失风趣".to_string(),
+        default_location: None,
     };
 
     match config.save() {

@@ -30,7 +30,7 @@ use telos_hci::{
     global_log_level, AgentEvent, AgentFeedback, EventBroker, LogLevel,
     TaskSummary, TokioEventBroker,
 };
-use telos_memory::engine::RedbGraphStore;
+use telos_memory::engine::{RedbGraphStore, MemoryOS};
 use telos_model_gateway::gateway::{GatewayManager, ModelProvider};
 use telos_model_gateway::{Capability, GatewayError, LlmRequest, LlmResponse, ModelGateway};
 use telos_tooling::ToolRegistry;
@@ -130,7 +130,7 @@ impl SystemRegistry for DaemonRegistry {
     fn get_system_context(&self) -> Option<telos_core::SystemContext> {
         if let Ok(ctx) = self.system_context.try_read() {
             Some(telos_core::SystemContext {
-                current_time: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string(),
+                current_time: format!("Today is {}", chrono::Local::now().format("%Y-%m-%d, %H:%M:%S %Z")),
                 location: ctx.location.clone(),
             })
         } else {
@@ -377,9 +377,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize logging with timestamps, rotation, and size limits
     let log_dir = TelosConfig::logs_dir();
     let log_dir_str = log_dir.to_string_lossy();
-    
     let _guard = telos_telemetry::init_standard_logging(
-        "info", // Default level, will be filtered by EnvFilter if TELOS_LOG_LEVEL is set
+        "debug", // Default level, will be filtered by EnvFilter if TELOS_LOG_LEVEL is set
         Some(&log_dir_str),
         Some("daemon.log")
     );
@@ -550,26 +549,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let system_context = Arc::new(tokio::sync::RwLock::new(telos_core::SystemContext {
         current_time: String::new(),
-        location: "Unknown Location".to_string(),
+        location: config.default_location.clone().unwrap_or_else(|| "Unknown Location".to_string()),
     }));
 
-    let sys_ctx_clone = system_context.clone();
-    tokio::spawn(async move {
-        loop {
-            if let Ok(resp) = reqwest::get("http://ip-api.com/json/").await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    let loc = format!("{}, {}, {}", 
-                        json.get("city").and_then(|v| v.as_str()).unwrap_or("Unknown City"),
-                        json.get("regionName").and_then(|v| v.as_str()).unwrap_or("Unknown Region"),
-                        json.get("country").and_then(|v| v.as_str()).unwrap_or("Unknown Country")
-                    );
-                    let mut w = sys_ctx_clone.write().await;
-                    w.location = loc;
+    if config.default_location.is_none() {
+        let sys_ctx_clone = system_context.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(resp) = reqwest::get("http://ip-api.com/json/").await {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        let mut city = json.get("city").and_then(|v| v.as_str()).unwrap_or("Unknown City").to_string();
+                        let as_str = json.get("as").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let isp_str = json.get("isp").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        
+                        // Extract finer city details from ASN/ISP if "city" defaults poorly
+                        if as_str.contains("suzhou") || isp_str.contains("suzhou") {
+                            city = "Suzhou".to_string();
+                        } else if as_str.contains("shanghai") || isp_str.contains("shanghai") {
+                            city = "Shanghai".to_string();
+                        }
+
+                        let loc = format!("{}, {}, {}", 
+                            city,
+                            json.get("regionName").and_then(|v| v.as_str()).unwrap_or("Unknown Region"),
+                            json.get("country").and_then(|v| v.as_str()).unwrap_or("Unknown Country")
+                        );
+                        let mut w = sys_ctx_clone.write().await;
+                        w.location = loc;
+                    }
                 }
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-        }
-    });
+        });
+    }
 
     let registry = Arc::new(DaemonRegistry {
         gateway: gateway.clone(),
@@ -645,6 +657,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let active_tasks: telos_dag::engine::ActiveTaskRegistry = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let active_tasks_loop = active_tasks.clone();
 
+    // Global short-term session memory for Context/History Injection
+    let global_session_logs: Arc<tokio::sync::RwLock<std::collections::VecDeque<telos_context::LogEntry>>> = Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::with_capacity(20)));
+    let session_logs_loop = global_session_logs.clone();
+
     tokio::spawn(async move {
         debug!("[Daemon] Event loop started.");
         while let Some(event) = event_rx.recv().await {
@@ -671,6 +687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let config = loop_config.clone();
                     let paused_tasks_bg = paused_tasks_bg.clone();
                     let distillation_tx_spawn = distillation_tx_bg.clone();
+                    let session_logs_loop = session_logs_loop.clone();
 
                     let node_factory = std::sync::Arc::new(DaemonNodeFactory {
                         gateway: gateway_clone.clone(),
@@ -683,12 +700,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_active_tasks(active_tasks_loop.clone());
 
                     let context_manager_spawn = context_manager.clone();
+                    let active_tasks_spawn = active_tasks_loop.clone();
                     tokio::spawn(async move {
                         let task_start_time = Instant::now();
                         debug!(
                             "[Daemon] Received UserInput: {} (trace: {})",
                             payload, trace_id
                         );
+                        let current_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+
+                        // -- GLOBAL SESSION HISTORY INJECTION --
+                        let mut recent_history_text = String::new();
+                        {
+                            let mut logs_w = session_logs_loop.write().await;
+                            
+                            // Maintain max 20 turns
+                            while logs_w.len() > 20 {
+                                logs_w.pop_front();
+                            }
+
+                            if !logs_w.is_empty() {
+                                recent_history_text.push_str("[GLOBAL CONVERSATION HISTORY]\nThe user has interacted with you previously in this continuous temporal session. Use the following context to resolve pronouns, temporal/spatial defaults, and maintain conversational context:\n");
+                                for log in logs_w.iter() {
+                                    recent_history_text.push_str(&log.message);
+                                    recent_history_text.push('\n');
+                                }
+                                recent_history_text.push('\n');
+                            }
+                            
+                            // Immediately append the user's new query so it's logged
+                            logs_w.push_back(telos_context::LogEntry {
+                                timestamp: current_ms,
+                                message: format!("User: {}", payload),
+                            });
+                        }
+                        // ----------------------------------------
+
+                        {
+                            let mut w = active_tasks_spawn.write().await;
+                            w.insert(
+                                trace_id.to_string(),
+                                telos_hci::ActiveTaskInfo {
+                                    task_id: trace_id.to_string(),
+                                    task_name: trace_id.to_string(),
+                                    progress: telos_hci::ProgressInfo::new(0, 1, 1, 0, 0, None),
+                                    running_nodes: vec!["router".to_string()],
+                                    started_at_ms: current_ms,
+                                }
+                            );
+                        }
 
                         // --- CONTEXTUAL BYPASS ---
                         let is_resume = paused_tasks_bg
@@ -759,19 +819,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "Task Replan Failed".to_string()
                             };
 
-                            broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
-                                task_id: trace_id.to_string(),
-                                summary: TaskSummary {
-                                    success: task_success,
-                                    total_nodes: graph.node_statuses.len(),
-                                    completed_nodes,
-                                    failed_nodes,
-                                    total_time_ms: task_start_time.elapsed().as_millis() as u64,
-                                    summary: summary.clone(),
-                                    failed_node_ids,
-                                },
-                            });
-
                             let combined_result = graph
                                 .node_results
                                 .iter()
@@ -786,6 +833,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 session_id: session_id.clone(),
                                 content: format!("{}\n\n{}", summary, combined_result),
                                 is_final: true,
+                            });
+
+                            broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                                task_id: trace_id.to_string(),
+                                summary: TaskSummary {
+                                    success: task_success,
+                                    total_nodes: graph.node_statuses.len(),
+                                    completed_nodes,
+                                    failed_nodes,
+                                    total_time_ms: task_start_time.elapsed().as_millis() as u64,
+                                    summary: summary.clone(),
+                                    failed_node_ids,
+                                },
                             });
                         } else {
                             // --- NORMAL PLANNING & EXECUTION ---
@@ -832,7 +892,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 task: enriched_payload.clone(),
                                 dependencies: Default::default(),
                                 schema_payload: None,
-                                memory_context: None,
+                                memory_context: Some(recent_history_text.clone()),
                             };
 
                             let route_result = router.execute(router_input, registry_clone.as_ref()).await;
@@ -845,6 +905,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     content: format!("Routing Failed: {}", error_msg),
                                     is_final: true,
                                 });
+                                broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                                    task_id: trace_id.to_string(),
+                                    summary: TaskSummary {
+                                        success: false,
+                                        total_nodes: 1,
+                                        completed_nodes: 0,
+                                        failed_nodes: 1,
+                                        total_time_ms: task_start_time.elapsed().as_millis() as u64,
+                                        summary: "Router Task Failed".to_string(),
+                                        failed_node_ids: vec!["router_main".to_string()],
+                                    },
+                                });
+                                // Remove from active tasks before return
+                                {
+                                    let mut w = active_tasks_spawn.write().await;
+                                    w.remove(&trace_id.clone().to_string());
+                                }
                                 return;
                             }
 
@@ -898,7 +975,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 task: enriched_payload.clone(),
                                 dependencies: Default::default(),
                                 schema_payload: None,
-                                memory_context: None,
+                                memory_context: Some(recent_history_text.clone()),
                             };
                             
                             let router_output = router_agent.execute(router_input, registry_clone.as_ref()).await;
@@ -1173,12 +1250,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
-                            // Send Output FIRST (is_final: false) so CLI prints it but doesn't exit yet
+                            // Send Output FIRST (is_final: true) so UI displays the final result text block
                             broker_bg.publish_feedback(AgentFeedback::Output {
                                 task_id: trace_id.to_string(),
                                 session_id: session_id.clone(),
-                                content: loop_final_response,
-                                is_final: false,
+                                content: loop_final_response.clone(),
+                                is_final: true,
                             });
 
                             // Publish TaskCompleted feedback LAST, which breaks the CLI stream
@@ -1194,6 +1271,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     failed_node_ids: loop_failed_node_ids,
                                 },
                             });
+                            // --- INTERACTION EVENT PERSISTENCE (Global Long-Term Memory) ---
+                            let interaction_content = format!("User: {}\nAssistant: {}", payload, loop_final_response);
+                            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                            let interaction_entry = telos_memory::MemoryEntry::new(
+                                format!("interaction_{}_{}", session_id, timestamp),
+                                telos_memory::MemoryType::InteractionEvent,
+                                interaction_content.clone(),
+                                timestamp,
+                                None,
+                            );
+
+                            let memory_clone = registry_clone.memory_os.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = memory_clone.store(interaction_entry).await {
+                                    debug!("[Daemon] ⚠️ Failed to store InteractionEvent for session {}: {}", session_id, e);
+                                } else {
+                                    debug!("[Daemon] 📥 Successfully archived global InteractionEvent.");
+                                }
+                            });
 
                             // --- EVOLUTION & MEMORY INTEGRATION LOOP ---
                             let trace = telos_evolution::ExecutionTrace {
@@ -1207,8 +1303,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(e) = distillation_tx_spawn.send(trace) {
                                 debug!("[Daemon] ⚠️ Failed to send trace {} to evolution queue: {}", trace_id, e);
                             } else {
-                                debug!("[Daemon] 📦 Trace {} queued for Evolution distillation.", trace_id);
                             }
+                        }
+                        
+                        // Cleanup task from registry
+                        {
+                            let mut w = active_tasks_spawn.write().await;
+                            w.remove(&trace_id.clone().to_string());
                         }
                     });
                 }

@@ -70,6 +70,7 @@ INTERNAL KNOWLEDGE & RULES:
 4. YOUR PLAN MUST BE A DIRECTED ACYCLIC GRAPH (DAG) OF TOOL NODES.
 5. YOU MUST END YOUR PLAN WITH A `summarize` NODE (agent_type: "general") ONCE ALL DATA IS GATHERED.
 6. YOU MUST OUTPUT A STRICTLY VALID JSON SUBGRAPH. NO CONVERSATIONAL TEXT.
+7. [DEFENSIVE] IF A PREVIOUS TOOL ATTEMPT FAILED OR RETURNED EMPTY, DO NOT WRITE A SUMMARY APOLOGIZING TO THE USER. YOU MUST DYNAMICALLY CONSTRUCT AN ALTERED SEARCH DAG WITH A DIFFERENT/SIMPLER QUERY TO TRY AGAIN.
 
 --- EXAMPLE ---
 User Task: "What's the current stock price of Apple?"
@@ -148,17 +149,27 @@ REQUIRED JSON STRUCTURE:
             Original Task: \"{}\"\n\n\
             Tool Results:\n{}\n\n\
             Please synthesize a helpful, concise final answer for the user based on these results. \
+            [CRITICAL CONSTRAINT]: Filter the Tool Results STRICTLY against the Original Task constraints (especially time/date/location). \
+            If the retrieved data is macroscopic, irrelevant SEO garbage, or completely empty, EXPLICITLY state the specific data deficiency directly (e.g., 'No specific data found for this context') INSTEAD of hallucinating misaligned fluff or summarizing generic information. \
             If the results contain weather information, report it clearly. \
             Output ONLY the final answer text.",
             input.task, results
         );
 
+        let env_context = if let Some(ctx) = _registry.get_system_context() {
+            format!("[ENVIRONMENT CONTEXT]\nLocal Time: {}\nPhysical Location: {}\n\n", ctx.current_time, ctx.location)
+        } else {
+            String::new()
+        };
+        let mem_context = input.memory_context.clone().unwrap_or_default();
+        let system_prompt = format!("{}{}{}You are the GeneralAgent Synthesizer.", env_context, mem_context, if mem_context.is_empty() {""} else {"\n\n"});
+
         let req = LlmRequest {
             session_id: format!("summarize_{}", input.node_id),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: prompt,
-            }],
+            messages: vec![
+                Message { role: "system".to_string(), content: system_prompt },
+                Message { role: "user".to_string(), content: prompt },
+            ],
             required_capabilities: Capability {
                 requires_vision: false,
                 strong_reasoning: false,

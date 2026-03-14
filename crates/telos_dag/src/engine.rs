@@ -122,11 +122,24 @@ impl TokioExecutionEngine {
         let mut running = 0;
         let mut failed = 0;
         let mut pending = 0;
+        let mut running_nodes_desc = Vec::new();
 
-        for status in graph.node_statuses.values() {
+        for (node_id, status) in &graph.node_statuses {
             match status {
                 NodeStatus::Completed => completed += 1,
-                NodeStatus::Running => running += 1,
+                NodeStatus::Running => {
+                    running += 1;
+                    if let Some(meta) = graph.node_metadata.get(node_id) {
+                        let desc = if meta.prompt_preview.is_empty() {
+                            meta.task_type.clone()
+                        } else {
+                            format!("{} - {}", meta.task_type, Self::truncate(&meta.prompt_preview, 50))
+                        };
+                        running_nodes_desc.push(desc);
+                    } else {
+                        running_nodes_desc.push(node_id.clone());
+                    }
+                }
                 NodeStatus::Failed => failed += 1,
                 NodeStatus::Pending => pending += 1,
                 NodeStatus::WaitingForInput => pending += 1, // Treat as pending for progress
@@ -134,7 +147,12 @@ impl TokioExecutionEngine {
         }
 
         let total = graph.nodes.len();
-        ProgressInfo::new(completed, total, running, failed, pending)
+        let current_node_desc = if running_nodes_desc.is_empty() {
+            None
+        } else {
+            Some(running_nodes_desc.join(", "))
+        };
+        ProgressInfo::new(completed, total, running, failed, pending, current_node_desc)
     }
 
     /// Truncate a string for display purposes (UTF-8 safe)
@@ -237,11 +255,12 @@ impl ExecutionEngine for TokioExecutionEngine {
         let initial_progress = Self::calculate_progress(graph);
         {
             let mut w = active_tasks_ref.write().await;
+            let existing_name = w.get(&graph_id).map(|info| info.task_name.clone()).unwrap_or_else(|| graph_id.clone());
             w.insert(
                 graph_id.clone(),
                 telos_hci::ActiveTaskInfo {
                     task_id: graph_id.clone(),
-                    task_name: graph_id.clone(),
+                    task_name: existing_name,
                     progress: initial_progress,
                     running_nodes: vec![],
                     started_at_ms: current_time_ms,
