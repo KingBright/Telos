@@ -205,7 +205,7 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
                                 }
                             }
                             AgentFeedback::TaskCompleted { summary, .. } => {
-                                let icon = if summary.success { "✅" } else { "⚠️" };
+                                let icon = if summary.fulfilled { "✅" } else { "⚠️" };
                                 app.chat_history.push(format!("{} Task finished: {}", icon, summary.summary));
                             }
                             AgentFeedback::NodeStarted { node_id, detail, .. } => {

@@ -205,7 +205,12 @@ impl ErrorDetail {
 /// Task completion summary
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TaskSummary {
-    pub success: bool,
+    /// Business success: did we actually fulfill the user's request?
+    /// Determined by QA evaluation verdict or direct_reply acceptance.
+    pub fulfilled: bool,
+    /// Technical completion: did the pipeline finish running without crashes?
+    /// true even if some nodes failed, as long as the pipeline terminated normally.
+    pub completed: bool,
     pub total_nodes: usize,
     pub completed_nodes: usize,
     pub failed_nodes: usize,
@@ -582,7 +587,8 @@ mod tests {
         let feedback = AgentFeedback::TaskCompleted {
             task_id: "test".into(),
             summary: TaskSummary {
-                success: true,
+                fulfilled: true,
+                completed: true,
                 total_nodes: 1,
                 completed_nodes: 1,
                 failed_nodes: 0,

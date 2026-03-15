@@ -147,8 +147,8 @@ impl TelegramFeedbackFormatter {
             }
 
             AgentFeedback::TaskCompleted { summary, .. } => {
-                let icon = if summary.success { "✅" } else { "⚠️" };
-                let status = if summary.success {
+                let icon = if summary.fulfilled { "✅" } else { "⚠️" };
+                let status = if summary.fulfilled {
                     "Success"
                 } else {
                     "Finished with errors"
@@ -165,7 +165,7 @@ impl TelegramFeedbackFormatter {
                     time_str
                 );
 
-                if !summary.success && !summary.failed_node_ids.is_empty() {
+                if !summary.fulfilled && !summary.failed_node_ids.is_empty() {
                     output.push_str(&format!("Failed: {}\n", summary.failed_node_ids.join(", ")));
                 }
 

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, OwnedSemaphorePermit};
 use async_trait::async_trait;
-use tracing::warn;
+use tracing::{warn, info};
 
 use crate::{
     LlmRequest, LlmResponse, GatewayError, QuotaExceededError, ModelGateway,
@@ -73,7 +73,6 @@ impl CircuitBreaker {
         match self.state {
             CircuitState::Closed => true,
             CircuitState::Open => {
-                // 检查是否超过恢复时间
                 if let Some(last_failure) = self.last_failure_time {
                     let elapsed = last_failure.elapsed().as_millis() as u64;
                     if elapsed >= self.config.recovery_timeout_ms {
@@ -99,13 +98,11 @@ impl CircuitBreaker {
     pub fn record_success(&mut self) {
         match self.state {
             CircuitState::HalfOpen => {
-                // 半开状态成功，恢复正常
                 self.state = CircuitState::Closed;
                 self.failure_count = 0;
                 self.half_open_requests = 0;
             }
             CircuitState::Closed => {
-                // 正常状态成功，重置失败计数
                 self.failure_count = 0;
             }
             _ => {}
@@ -124,7 +121,6 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::HalfOpen => {
-                // 半开状态失败，立即熔断
                 self.state = CircuitState::Open;
                 self.half_open_requests = 0;
             }
@@ -163,6 +159,12 @@ pub struct GatewayManager {
     rate_limiters: Mutex<HashMap<String, SimpleRateLimiter>>,
     max_concurrent_requests: usize, // 0 = unlimited
     circuit_breaker: Mutex<CircuitBreaker>,
+    /// Global concurrency semaphore: serializes all LLM requests to prevent
+    /// concurrent 429 storms from overwhelming the API provider.
+    global_concurrency: Arc<Semaphore>,
+    /// Maximum number of retries specifically for 429 rate-limit errors.
+    /// After this many retries, the error is returned instead of retrying forever.
+    rate_limit_max_retries: u32,
 }
 
 impl GatewayManager {
@@ -173,6 +175,8 @@ impl GatewayManager {
             rate_limiters: Mutex::new(HashMap::new()),
             max_concurrent_requests,
             circuit_breaker: Mutex::new(CircuitBreaker::default()),
+            global_concurrency: Arc::new(Semaphore::new(3)),
+            rate_limit_max_retries: 10,
         }
     }
 
@@ -188,6 +192,26 @@ impl GatewayManager {
             rate_limiters: Mutex::new(HashMap::new()),
             max_concurrent_requests,
             circuit_breaker: Mutex::new(CircuitBreaker::new(config)),
+            global_concurrency: Arc::new(Semaphore::new(3)),
+            rate_limit_max_retries: 10,
+        }
+    }
+
+    /// Create with custom concurrency limits
+    pub fn with_concurrency(
+        provider: Arc<dyn ModelProvider>,
+        max_concurrent_requests: usize,
+        global_permits: usize,
+        rate_limit_max_retries: u32,
+    ) -> Self {
+        Self {
+            provider,
+            backoff: ExponentialBackoff::default(),
+            rate_limiters: Mutex::new(HashMap::new()),
+            max_concurrent_requests,
+            circuit_breaker: Mutex::new(CircuitBreaker::default()),
+            global_concurrency: Arc::new(Semaphore::new(global_permits)),
+            rate_limit_max_retries,
         }
     }
 
@@ -200,12 +224,89 @@ impl GatewayManager {
     pub async fn reset_circuit(&self) {
         self.circuit_breaker.lock().await.reset();
     }
+
+    /// Internal: execute an LLM request while holding a semaphore permit.
+    /// `initial_retries` allows continuing the retry count across permit re-acquisitions.
+    async fn generate_with_permit(
+        &self,
+        req: &LlmRequest,
+        permit: OwnedSemaphorePermit,
+        initial_retries: u32,
+    ) -> Result<LlmResponse, GatewayError> {
+        let mut retries = initial_retries;
+        let mut _permit = permit;
+
+        loop {
+            match self.provider.generate(req).await {
+                Ok(response) => {
+                    self.circuit_breaker.lock().await.record_success();
+                    return Ok(response);
+                }
+                Err(e) => {
+                    if e.is_permanent() {
+                        return Err(e);
+                    }
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
+
+                    let is_rate_limit = matches!(e, GatewayError::TooManyRequests { .. });
+
+                    if is_rate_limit {
+                        if retries >= self.rate_limit_max_retries {
+                            warn!(
+                                "[Gateway] Rate limit retries exhausted ({}/{}). Returning error to allow system recovery.",
+                                retries, self.rate_limit_max_retries
+                            );
+                            self.circuit_breaker.lock().await.record_failure();
+                            return Err(e);
+                        }
+
+                        retries += 1;
+                        info!(
+                            "[Gateway] Request Rate Limited (attempt {}/{}), releasing permit and backing off...",
+                            retries, self.rate_limit_max_retries
+                        );
+
+                        // CRITICAL: Release semaphore permit BEFORE sleeping.
+                        // This lets other queued tasks proceed while we wait,
+                        // avoiding a deadlock where all permits are held by sleeping tasks.
+                        drop(_permit);
+                        self.backoff.wait(retries).await;
+
+                        // Re-acquire permit after backoff
+                        _permit = self.global_concurrency.clone().acquire_owned().await
+                            .map_err(|_| GatewayError::Other {
+                                message: "Global concurrency semaphore closed during retry".to_string(),
+                                is_retryable: false,
+                            })?;
+                        // Continue the loop with the new permit
+                    } else {
+                        // Non-rate-limit retryable error: standard max_retries
+                        if retries >= self.backoff.get_max_retries() {
+                            self.circuit_breaker.lock().await.record_failure();
+                            return Err(e);
+                        }
+
+                        retries += 1;
+                        warn!(
+                            "[Gateway] Request failed (attempt {}/{}), retrying: {}",
+                            retries,
+                            self.backoff.get_max_retries(),
+                            e.to_user_message()
+                        );
+                        self.backoff.wait(retries).await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl ModelGateway for GatewayManager {
     async fn generate(&self, req: LlmRequest) -> Result<LlmResponse, GatewayError> {
-        // 1. 检查熔断器，阻塞等待而不是直接拒绝 (以实现“哪怕慢点，只要能交付”的业务目标)
+        // 1. 检查熔断器，阻塞等待而不是直接拒绝
         loop {
             let allow = {
                 let mut cb = self.circuit_breaker.lock().await;
@@ -216,9 +317,7 @@ impl ModelGateway for GatewayManager {
                 break;
             }
 
-            // 如果熔断器未放行，不要直接报错抛弃整个图任务。
-            // 而是等待一小段时间后再次检查，也就是用时间换取交付成功率。
-            warn!("[Gateway] Circuit Breaker is active. Waiting 5s before re-evaluating to prioritize task delivery over fast-failure...");
+            warn!("[Gateway] Circuit Breaker is active. Waiting 5s before re-evaluating...");
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
@@ -234,55 +333,17 @@ impl ModelGateway for GatewayManager {
             }
         }
 
-        let mut retries = 0;
-        loop {
-            match self.provider.generate(&req).await {
-                Ok(response) => {
-                    // 成功时重置熔断器
-                    self.circuit_breaker.lock().await.record_success();
-                    return Ok(response);
-                }
-                Err(e) => {
-                    // 永久性错误直接返回，不重试
-                    if e.is_permanent() {
-                        return Err(e);
-                    }
+        // 3. Acquire global concurrency semaphore permit.
+        //    This serializes all LLM requests system-wide, preventing concurrent
+        //    429 storms from overwhelming the API provider.
+        let permit = self.global_concurrency.clone().acquire_owned().await
+            .map_err(|_| GatewayError::Other {
+                message: "Global concurrency semaphore closed".to_string(),
+                is_retryable: false,
+            })?;
 
-                    // 检查是否可重试
-                    if !e.is_retryable() {
-                        return Err(e);
-                    }
-
-                    // For Rate Limits (429 TooManyRequests), we infinitely backoff and retry 
-                    // instead of tripping the failure counter, ensuring ultimate Delivery-First success.
-                    let is_rate_limit = matches!(e, GatewayError::TooManyRequests { .. });
-                    
-                    if !is_rate_limit && retries >= self.backoff.get_max_retries() {
-                        // 达到最大重试次数，记录失败到熔断器 (仅针对非限流类型的普通报错)
-                        self.circuit_breaker.lock().await.record_failure();
-                        return Err(e);
-                    }
-
-                    retries += 1;
-                    
-                    if is_rate_limit {
-                        warn!(
-                            "[Gateway] Request Rate Limited (attempt {}/∞), patiently waiting to deliver task...",
-                            retries
-                        );
-                    } else {
-                        warn!(
-                            "[Gateway] Request failed (attempt {}/{}), retrying: {}",
-                            retries,
-                            self.backoff.get_max_retries(),
-                            e.to_user_message()
-                        );
-                    }
-                    
-                    self.backoff.wait(retries).await;
-                }
-            }
-        }
+        // 4. Execute with the held permit
+        self.generate_with_permit(&req, permit, 0).await
     }
 
     fn check_budget(&self, _session_id: &str) -> Result<(), QuotaExceededError> {

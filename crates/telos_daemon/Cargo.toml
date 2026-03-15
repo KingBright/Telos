@@ -28,4 +28,5 @@ telos_model_gateway = { path = "../telos_model_gateway" }
 telos_security = { path = "../telos_security" }
 telos_telemetry = { path = "../telos_telemetry" }
 telos_bot = { path = "../telos_bot" }
+async-stream = "0.3"
 petgraph.workspace = true

@@ -54,6 +54,10 @@ pub struct CircuitBreakerConfig {
     pub failure_rate_threshold: f32,
     /// 最小执行节点数才开始计算失败率
     pub min_nodes_for_circuit_break: usize,
+    /// SubGraph maximum allowed nesting depth
+    pub max_graph_depth: usize,
+    /// Absolute maximum total nodes across all subgraphs to prevent exhaustion
+    pub max_total_nodes: usize,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -61,6 +65,8 @@ impl Default for CircuitBreakerConfig {
         Self {
             failure_rate_threshold: 0.5, // 50% 失败率触发熔断
             min_nodes_for_circuit_break: 3, // 至少执行 3 个节点
+            max_graph_depth: 5,
+            max_total_nodes: 50,
         }
     }
 }
@@ -438,7 +444,21 @@ impl ExecutionEngine for TokioExecutionEngine {
 
                             // Dynamic SubGraph Injection
                             if let Some(sub_graph) = output.sub_graph.take() {
-                                if let Some(factory) = &self.node_factory {
+                                let current_depth = node_id.matches("__").count() + 1;
+                                
+                                if current_depth >= circuit_config.max_graph_depth || total_nodes + sub_graph.nodes.len() > circuit_config.max_total_nodes {
+                                    error!("[DAG Engine] 🔴 Circuit breaker: SubGraph rejected. Max depth/nodes exceeded (Depth: {}, Projected Total Nodes: {})", current_depth, total_nodes + sub_graph.nodes.len());
+                                    // Force failure to prevent infinite loop
+                                    output.success = false;
+                                    output.error = Some(telos_core::AgentErrorDetail {
+                                        error_type: "CircuitBreak_Exhaustion".to_string(),
+                                        message: format!("SubGraph dynamically rejected to prevent stack exhaustion or infinite AI loops. Depth: {}", current_depth),
+                                        technical_detail: None,
+                                        severity: telos_core::ErrorSeverity::Fatal,
+                                        layer: telos_core::ErrorLayer::Dag,
+                                        retry_suggested: false,
+                                    });
+                                } else if let Some(factory) = &self.node_factory {
                                     let mut added_nodes = Vec::new();
                                     for sg_node in &sub_graph.nodes {
                                         let full_id = format!("{}__{}", node_id, sg_node.id);

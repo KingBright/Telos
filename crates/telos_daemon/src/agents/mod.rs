@@ -2,9 +2,11 @@ pub mod architect;
 pub mod coder;
 pub mod evolutor;
 pub mod general;
+pub mod prompt_builder;
 pub mod researcher;
 pub mod reviewer;
 pub mod router;
+pub mod search_worker;
 pub mod tester;
 
 // Re-export common dependencies that agents might need
@@ -22,6 +24,7 @@ pub use general::GeneralAgent;
 pub use researcher::DeepResearchAgent;
 pub use reviewer::ReviewAgent;
 pub use router::RouterAgent;
+pub use search_worker::SearchWorkerAgent;
 pub use tester::TestingAgent;
 
 /// 从 GatewayError 创建 AgentOutput

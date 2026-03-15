@@ -4,10 +4,14 @@ use axum::{
         Query,
         State,
     },
-    response::IntoResponse,
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
     Json, Router,
 };
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -170,6 +174,10 @@ impl telos_dag::engine::NodeFactory for DaemonNodeFactory {
                 tool_name: _task.to_string(),
                 tool_registry: self.tool_registry.clone(),
             }) as Box<dyn ExecutableNode>),
+            "search_worker" => Some(Box::new(SearchWorkerAgent::new(
+                self.gateway.clone(),
+                self.tool_registry.clone(),
+            )) as Box<dyn ExecutableNode>),
             _ => None,
         }
     }
@@ -344,6 +352,14 @@ struct RunResponse {
     trace_id: String,
 }
 
+#[derive(Serialize)]
+struct RunSyncResponse {
+    status: String,
+    trace_id: String,
+    task_summary: Option<telos_hci::TaskSummary>,
+    final_output: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct ApproveRequest {
     task_id: String,
@@ -397,6 +413,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("TELOS_PROXY", proxy);
         info!("[Daemon] Proxy configured: {}", proxy);
     }
+
+    // Initialize SOUL (personality/identity) from SOUL.md
+    agents::prompt_builder::init_soul(".");
 
     // Initialize global log level from config
     let initial_log_level = LogLevel::from_string(&config.log_level);
@@ -720,12 +739,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if !logs_w.is_empty() {
-                                recent_history_text.push_str("[GLOBAL CONVERSATION HISTORY]\nThe user has interacted with you previously in this continuous temporal session. Use the following context to resolve pronouns, temporal/spatial defaults, and maintain conversational context:\n");
-                                for log in logs_w.iter() {
-                                    recent_history_text.push_str(&log.message);
-                                    recent_history_text.push('\n');
+                                recent_history_text.push_str("[GLOBAL CONVERSATION HISTORY]\nThe user has interacted with you previously in this session. Interactions are numbered chronologically (#1 = first/earliest). Use this to resolve pronouns, references like \"第一个问题\", and maintain context:\n");
+                                for (i, log) in logs_w.iter().enumerate() {
+                                    recent_history_text.push_str(&format!("#{}: {}\n", i + 1, log.message));
                                 }
                                 recent_history_text.push('\n');
+                            } else {
+                                // Session memory is empty — preload from persistent memory (telos_memory)
+                                // This bridges headless CLI calls and daemon restarts
+                                if let Some(mem_any) = registry_clone.get_memory_os() {
+                                    if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+                                        let one_hour_ago = current_ms.saturating_sub(3600_000);
+                                        if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange {
+                                            start: one_hour_ago,
+                                            end: current_ms,
+                                        }).await {
+                                            let mut interaction_entries: Vec<&telos_memory::MemoryEntry> = results.iter()
+                                                .filter(|e| e.memory_type == telos_memory::MemoryType::InteractionEvent)
+                                                .collect();
+                                            // Sort chronologically: oldest first
+                                            interaction_entries.sort_by_key(|e| e.created_at);
+                                            if !interaction_entries.is_empty() {
+                                                recent_history_text.push_str("[GLOBAL CONVERSATION HISTORY (from persistent memory)]\nThe user has interacted with you recently. Interactions are numbered chronologically (#1 = first/earliest). Use this to resolve references like \"第一个问题\" or \"之前\":\n");
+                                                for (i, entry) in interaction_entries.iter().take(10).enumerate() {
+                                                    recent_history_text.push_str(&format!("#{}: {}\n", i + 1, entry.content));
+                                                }
+                                                recent_history_text.push('\n');
+                                                debug!("[Daemon] Preloaded {} interaction events from persistent memory", interaction_entries.len());
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             
                             // Immediately append the user's new query so it's logged
@@ -838,7 +882,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
                                 task_id: trace_id.to_string(),
                                 summary: TaskSummary {
-                                    success: task_success,
+                                    fulfilled: task_success,
+                                    completed: true,
                                     total_nodes: graph.node_statuses.len(),
                                     completed_nodes,
                                     failed_nodes,
@@ -872,11 +917,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         project_config.custom_instructions.unwrap_or_else(|| "None".to_string()),
                                         payload
                                     );
-
+                                    
                                     debug!(
                                         "[Daemon] Dynamically injected project context into payload."
                                     );
                                 }
+                            }
+
+                            // --- ACTIVE TASK INJECTION FOR ROUTER OMNISCIENCE ---
+                            let active_tasks_snapshot = {
+                                let w = active_tasks_spawn.read().await;
+                                if w.is_empty() {
+                                    String::new()
+                                } else {
+                                    let mut tasks_desc = Vec::new();
+                                    for (id, state) in w.iter() {
+                                        if id != &trace_id.to_string() {
+                                            let nodes_str = if state.running_nodes.is_empty() { "Pending".to_string() } else { state.running_nodes.join(", ") };
+                                            tasks_desc.push(format!("- Task ID [{}]: {}", id, nodes_str));
+                                        }
+                                    }
+                                    if tasks_desc.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("[SYSTEM: Active Background Tasks]\nThe system is currently executing the following tasks in the background:\n{}\n\n", tasks_desc.join("\n"))
+                                    }
+                                }
+                            };
+                            
+                            if !active_tasks_snapshot.is_empty() {
+                                enriched_payload = format!("{}{}", active_tasks_snapshot, enriched_payload);
                             }
 
                             // --- TIER 1: ROUTER AGENT DISPATCH ---
@@ -887,7 +957,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
 
                             let router = agents::router::RouterAgent::new(gateway_clone.clone(), config.router_persona_name.clone(), config.router_persona_trait.clone());
-                            let router_input = telos_core::AgentInput {
+                            let mut router_input = telos_core::AgentInput {
                                 node_id: "router_main".to_string(),
                                 task: enriched_payload.clone(),
                                 dependencies: Default::default(),
@@ -895,7 +965,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 memory_context: Some(recent_history_text.clone()),
                             };
 
-                            let route_result = router.execute(router_input, registry_clone.as_ref()).await;
+                            let mut route_result = telos_core::AgentOutput::failure("Init", "Not started");
+                            let mut tool_used = false;
+
+                           // --- ROUTER REACT LOOP for TOOL ACCESS ---
+                            let mut tool_attempts_used = 0u32;
+                            for attempt in 0..3 {
+                                route_result = router.execute(router_input.clone(), registry_clone.as_ref()).await;
+                                
+                                if !route_result.success {
+                                    break;
+                                }
+
+                                if let Some(route_data) = route_result.output.as_ref() {
+                                    // Intercept "tool"
+                                    if let Some(tool_name) = route_data.get("tool").and_then(|v| v.as_str()) {
+                                        if tool_name == "memory_read" {
+                                            tool_attempts_used = attempt + 1;
+                                            let query_val = route_data.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                                            debug!("[Daemon] Router triggered memory_read tool for query: {}", query_val);
+                                            
+                                            // Provide feedback to UI that we are searching memory
+                                            broker_bg.publish_feedback(AgentFeedback::Output {
+                                                task_id: trace_id.to_string(),
+                                                session_id: session_id.clone(),
+                                                content: format!("*(Router is recalling memory for: {})*", query_val),
+                                                is_final: false,
+                                            });
+
+                                            let mut memory_findings = String::new();
+                                            if let Some(mem_any) = registry_clone.get_memory_os() {
+                                                if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+                                                    // Dual-strategy query: EntityLookup (keyword) + TimeRange (recency)
+                                                    let mut all_entries: Vec<(u64, String)> = Vec::new(); // (created_at, content)
+                                                    
+                                                    // Strategy 1: Keyword-based EntityLookup
+                                                    if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::EntityLookup { entity: query_val.to_string() }).await {
+                                                        for e in results.iter().filter(|e| e.memory_type == telos_memory::MemoryType::Semantic || e.memory_type == telos_memory::MemoryType::InteractionEvent) {
+                                                            all_entries.push((e.created_at, e.content.clone()));
+                                                        }
+                                                    }
+                                                    
+                                                    // Strategy 2: Recent interactions (last 1 hour)
+                                                    let one_hour_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                                                    let one_hour_ago = one_hour_ago.saturating_sub(3600_000);
+                                                    if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange { start: one_hour_ago, end: u64::MAX }).await {
+                                                        for e in results.iter().filter(|e| e.memory_type == telos_memory::MemoryType::InteractionEvent) {
+                                                            if !all_entries.iter().any(|(_, c)| c == &e.content) {
+                                                                all_entries.push((e.created_at, e.content.clone()));
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    // Sort chronologically (oldest first) and format with ordinals
+                                                    all_entries.sort_by_key(|(ts, _)| *ts);
+                                                    
+                                                    if !all_entries.is_empty() {
+                                                        let formatted: Vec<String> = all_entries.iter().enumerate()
+                                                            .map(|(i, (_, content))| format!("#{}: {}", i + 1, content))
+                                                            .collect();
+                                                        let merged = formatted.join("\n");
+                                                        let truncated: String = if merged.chars().count() > 2000 { merged.chars().take(2000).collect::<String>() + "..." } else { merged };
+                                                        memory_findings = format!("[TOOL RESULT: memory_read]\nFound relevant memories (chronological order, #1 = earliest):\n{}\n\n", truncated);
+                                                    } else {
+                                                        memory_findings = format!("[TOOL RESULT: memory_read]\nNo relevant memories found for '{}'.\n\n", query_val);
+                                                    }
+                                                }
+                                            }
+
+                                            // Append findings back to Router memory context and loop
+                                            let existing_mem = router_input.memory_context.unwrap_or_default();
+                                            router_input.memory_context = Some(format!("{}{}", existing_mem, memory_findings));
+                                            tool_used = true;
+                                            continue; 
+                                        }
+                                    }
+                                    
+                                    // If we reach here, it's either "direct_reply" or "route", routing is finished
+                                    break;
+                                }
+                            }
+                            
+                            // --- GRACEFUL DEGRADATION: Final synthesis pass ---
+                            // If the loop exhausted all 3 tool attempts without converging on
+                            // a direct_reply or route decision, give the Router ONE final chance
+                            // to synthesize an answer from whatever it gathered, or escalate.
+                            if tool_attempts_used >= 3 && route_result.success {
+                                if let Some(route_data) = route_result.output.as_ref() {
+                                    if route_data.get("tool").is_some() && route_data.get("direct_reply").is_none() && route_data.get("route").is_none() {
+                                        debug!("[Daemon] Router exhausted all tool attempts without converging. Triggering final synthesis pass.");
+                                        let existing_mem = router_input.memory_context.unwrap_or_default();
+                                        router_input.memory_context = Some(format!(
+                                            "{}[SYSTEM NOTE: You have used all your tool attempts. You MUST now make a final decision: either provide a direct_reply with your best answer based on whatever information you found (even if partial), or route to an appropriate expert if you believe only a deeper search pipeline can answer the question. Do NOT request any more tools.]\n\n",
+                                            existing_mem
+                                        ));
+                                        route_result = router.execute(router_input.clone(), registry_clone.as_ref()).await;
+                                    }
+                                }
+                            }
                             
                             if !route_result.success {
                                 let error_msg = route_result.error.map(|e| e.message).unwrap_or_else(|| "Unknown routing error".to_string());
@@ -908,7 +1075,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
                                     task_id: trace_id.to_string(),
                                     summary: TaskSummary {
-                                        success: false,
+                                        fulfilled: false,
+                                        completed: true,
                                         total_nodes: 1,
                                         completed_nodes: 0,
                                         failed_nodes: 1,
@@ -927,6 +1095,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             // Parse router output
                             let route_data = route_result.output.unwrap_or_default();
+                            
+                            // --- DIRECT REPLY SHORT-CIRCUIT (with QA Gate) ---
+                            if let Some(direct_reply) = route_data.get("direct_reply").and_then(|v| v.as_str()) {
+                                debug!("[Daemon] Router generated a direct reply. Running QA verification...");
+                                
+                                // QA Gate: evaluate direct_reply quality before accepting
+                                let qa_result = router.evaluate(&payload, direct_reply, registry_clone.as_ref()).await;
+                                let qa_accepted = if qa_result.success {
+                                    qa_result.output.as_ref()
+                                        .and_then(|json| json.get("is_acceptable").and_then(|v| v.as_bool()))
+                                        .unwrap_or(true) // default accept if parsing fails
+                                } else {
+                                    true // default accept if QA call itself fails
+                                };
+
+                                if qa_accepted {
+                                    debug!("[Daemon] QA Gate approved direct reply.");
+                                    broker_bg.publish_feedback(AgentFeedback::Output {
+                                        task_id: trace_id.to_string(),
+                                        session_id: session_id.clone(),
+                                        content: direct_reply.to_string(),
+                                        is_final: true,
+                                    });
+                                    
+                                    broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                                        task_id: trace_id.to_string(),
+                                        summary: TaskSummary {
+                                            fulfilled: true,
+                                            completed: true,
+                                            total_nodes: 1,
+                                            completed_nodes: 1,
+                                            failed_nodes: 0,
+                                            total_time_ms: task_start_time.elapsed().as_millis() as u64,
+                                            summary: "Direct Router Reply".to_string(),
+                                            failed_node_ids: vec![],
+                                        },
+                                    });
+
+                                    // Persist to long-term memory
+                                    if let Some(mem_any) = registry_clone.get_memory_os() {
+                                        if let Ok(mem_os) = mem_any.downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+                                            let conversation = format!("[User]: {}\n[Assistant ({} Persona)]: {}", payload, config.router_persona_name, direct_reply);
+                                            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                                            let entry = telos_memory::MemoryEntry::new(
+                                                uuid::Uuid::new_v4().to_string(),
+                                                telos_memory::MemoryType::InteractionEvent,
+                                                conversation,
+                                                current_time,
+                                                None,
+                                            );
+                                            if let Err(e) = mem_os.store(entry).await {
+                                                error!("[Daemon] Failed to store direct reply interaction memory: {:?}", e);
+                                            }
+                                        }
+                                    }
+
+                                    // Remove from active tasks
+                                    {
+                                        let mut w = active_tasks_spawn.write().await;
+                                        w.remove(&trace_id.to_string());
+                                    }
+                                    return; // QA passed, skip DAG
+                                } else {
+                                    // QA rejected direct_reply — fallthrough to Expert routing
+                                    let critique = qa_result.output.as_ref()
+                                        .and_then(|json| json.get("critique").and_then(|v| v.as_str()))
+                                        .unwrap_or("Direct reply did not adequately answer the user's question.");
+                                    debug!("[Daemon] QA Gate REJECTED direct reply. Falling through to Expert routing. Critique: {}", critique);
+                                    broker_bg.publish_feedback(AgentFeedback::Output {
+                                        task_id: trace_id.to_string(),
+                                        session_id: session_id.clone(),
+                                        content: format!("🔄 Direct reply rejected by QA. Routing to expert. Critique: {}", critique),
+                                        is_final: false,
+                                    });
+                                    // Don't return — fall through to expert routing below
+                                }
+                            }
+
                             let expert_route = route_data.get("route").and_then(|v| v.as_str()).unwrap_or("general_expert");
                             let route_reason = route_data.get("reason").and_then(|v| v.as_str()).unwrap_or("Fallback to general expert.");
 
@@ -962,42 +1208,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 actual_ctx.precise_facts.len()
                             );
 
-                            // --- TIER 1: ROUTER AGENT DISPATCH ---
-                            broker_bg.publish_feedback(AgentFeedback::StateChanged {
-                                task_id: trace_id.to_string(),
-                                current_node: "planning".into(),
-                                status: telos_core::NodeStatus::Running,
-                            });
-                            
-                            let router_agent = RouterAgent::new(gateway_clone.clone(), config.router_persona_name.clone(), config.router_persona_trait.clone());
-                            let router_input = AgentInput {
-                                node_id: "router".to_string(),
-                                task: enriched_payload.clone(),
-                                dependencies: Default::default(),
-                                schema_payload: None,
-                                memory_context: Some(recent_history_text.clone()),
-                            };
-                            
-                            let router_output = router_agent.execute(router_input, registry_clone.as_ref()).await;
-                            
-                            let expert_route = if router_output.success {
-                                router_output.output.as_ref()
-                                    .and_then(|json| json.get("route"))
-                                    .and_then(|route| route.as_str())
-                                    .unwrap_or("general_expert")
-                                    .to_string()
-                            } else {
-                                debug!("[Daemon] RouterAgent failed: {:?}, falling back to general_expert", router_output.error);
-                                "general_expert".to_string()
-                            };
-
-                            debug!("[Daemon] Router selected expert route: {}", expert_route);
-
                             // --- TIER 2: EXPERT AGENT PLANNING & DAG EXECUTION ---
                             let mut attempt = 0;
                             const MAX_ATTEMPTS: usize = 3;
                             let mut loop_final_response = String::new();
-                            let mut loop_task_success = false;
+                            let mut loop_qa_accepted = false;
                             let mut loop_completed_nodes = 0;
                             let mut loop_failed_nodes = 0;
                             let mut loop_failed_node_ids = vec![];
@@ -1013,7 +1228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let mut terminal_nodes = vec![];
 
                                 // Instantiate the specific expert dynamically.
-                                let expert_node: Box<dyn ExecutableNode> = match expert_route.as_str() {
+                                let expert_node: Box<dyn ExecutableNode> = match expert_route {
                                     "software_expert" => Box::new(agents::architect::ArchitectAgent::new(gateway_clone.clone())) as Box<dyn ExecutableNode>,
                                     "research_expert" => Box::new(agents::researcher::DeepResearchAgent::new(gateway_clone.clone(), tool_registry.clone())) as Box<dyn ExecutableNode>,
                                     "qa_expert" => Box::new(agents::tester::TestingAgent::new(gateway_clone.clone())) as Box<dyn ExecutableNode>,
@@ -1028,7 +1243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "expert_execution".to_string(),
                                     expert_node,
                                     NodeMetadata {
-                                        task_type: expert_route.clone(),
+                                        task_type: expert_route.to_string(),
                                         prompt_preview: truncate_for_preview(&enriched_payload, 100),
                                         tool_name: None,
                                         schema_payload: None,
@@ -1155,7 +1370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // --- ROUTE AGENT SYNTHESIS ---
                                 // Delegate the final summary to the ExpertAgent that planned the execution
-                                let expert_agent_for_summary: Box<dyn telos_core::agent_traits::ExpertAgent> = match expert_route.as_str() {
+                                let expert_agent_for_summary: Box<dyn telos_core::agent_traits::ExpertAgent> = match expert_route {
                                     "software_expert" => Box::new(agents::architect::ArchitectAgent::new(gateway_clone.clone())) as Box<dyn telos_core::agent_traits::ExpertAgent>,
                                     "research_expert" => Box::new(agents::researcher::DeepResearchAgent::new(gateway_clone.clone(), tool_registry.clone())) as Box<dyn telos_core::agent_traits::ExpertAgent>,
                                     "qa_expert" => Box::new(agents::tester::TestingAgent::new(gateway_clone.clone())) as Box<dyn telos_core::agent_traits::ExpertAgent>,
@@ -1174,7 +1389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ),
                                     dependencies: std::collections::HashMap::new(),
                                     schema_payload: None,
-                                    memory_context: None,
+                                    memory_context: router_input.memory_context.clone(),
                                 };
 
                                 let summary_output = expert_agent_for_summary
@@ -1196,7 +1411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 };
 
                                 loop_final_response = final_response.clone();
-                                loop_task_success = task_success;
+
                                 loop_completed_nodes = completed_nodes;
                                 loop_failed_nodes = failed_nodes;
                                 loop_failed_node_ids = failed_node_ids.clone();
@@ -1215,13 +1430,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
 
                                 // --- ROUTER EVALUATION ---
-                                let eval_output = router_agent.evaluate(&payload, &final_response, registry_clone.as_ref()).await;
+                                let eval_output = router.evaluate(&payload, &final_response, registry_clone.as_ref()).await;
                                 if eval_output.success {
                                     if let Some(json) = eval_output.output {
                                         let is_acceptable = json.get("is_acceptable").and_then(|v| v.as_bool()).unwrap_or(false);
                                         let critique = json.get("critique").and_then(|v| v.as_str()).unwrap_or("");
                                         
                                         if is_acceptable || attempt == MAX_ATTEMPTS {
+                                            loop_qa_accepted = is_acceptable;
                                             if !is_acceptable {
                                                 debug!("[Daemon] Max attempts reached despite router rejection. Proceeding anyway.");
                                             } else {
@@ -1237,7 +1453,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 is_final: false,
                                             });
                                             enriched_payload = format!(
-                                                "Task:\n{}\n\n[Previous attempt was rejected. Fix the following issue: {}]",
+                                                "Task:\n{}\n\n[SYSTEM DIRECTIVE — MANDATORY]\n\
+                                                 Your previous attempt was REJECTED by the QA evaluator.\n\
+                                                 Critique: {}\n\n\
+                                                 You MUST autonomously retry with an improved strategy.\n\
+                                                 DO NOT ask the user for permission, clarification, or confirmation.\n\
+                                                 DO NOT say 'if you want me to continue' or similar phrases.\n\
+                                                 Execute the corrected approach IMMEDIATELY and deliver the result.",
                                                 payload, critique
                                             );
                                         }
@@ -1262,7 +1484,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
                                 task_id: trace_id.to_string(),
                                 summary: TaskSummary {
-                                    success: loop_task_success,
+                                    fulfilled: loop_qa_accepted,
+                                    completed: true,
                                     total_nodes: loop_completed_nodes + loop_failed_nodes,
                                     completed_nodes: loop_completed_nodes,
                                     failed_nodes: loop_failed_nodes,
@@ -1296,23 +1519,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 task_id: trace_id.to_string(),
                                 steps: loop_final_trace_steps,
                                 errors_encountered: vec![],
-                                success: loop_task_success,
+                                success: loop_qa_accepted,
                             };
                             
-                            // Send trace to asynchronous Evolution worker for Skill Distillation
-                            if let Err(e) = distillation_tx_spawn.send(trace) {
-                                debug!("[Daemon] ⚠️ Failed to send trace {} to evolution queue: {}", trace_id, e);
-                            } else {
+                                // Send trace to asynchronous Evolution worker for Skill Distillation
+                                if let Err(e) = distillation_tx_spawn.send(trace) {
+                                    debug!("[Daemon] ⚠️ Failed to send trace {} to evolution queue: {}", trace_id, e);
+                                }
+                            
+                            // Cleanup task from registry
+                            {
+                                let mut w = active_tasks_spawn.write().await;
+                                w.remove(&trace_id.clone().to_string());
                             }
-                        }
-                        
-                        // Cleanup task from registry
-                        {
-                            let mut w = active_tasks_spawn.write().await;
-                            w.remove(&trace_id.clone().to_string());
-                        }
-                    });
-                }
+                            }
+                        });
+                    }
                 AgentEvent::UserIntervention {
                     task_id,
                     node_id,
@@ -1381,7 +1603,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
                                 task_id: task_id.clone(),
                                 summary: TaskSummary {
-                                    success: false,
+                                    fulfilled: false,
+                                    completed: true,
                                     total_nodes: 0,
                                     completed_nodes: 0,
                                     failed_nodes: 0,
@@ -1474,59 +1697,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .get("llm_node")
                                 .map(|s| *s == telos_core::NodeStatus::Completed)
                                 .unwrap_or(false);
-
-                            // Publish TaskCompleted
-                            broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
-                                task_id: task_id.clone(),
-                                summary: TaskSummary {
-                                    success: task_success,
-                                    total_nodes: 1,
-                                    completed_nodes: if task_success { 1 } else { 0 },
-                                    failed_nodes: if task_success { 0 } else { 1 },
-                                    total_time_ms,
-                                    summary: if task_success {
-                                        "Approved task completed successfully".to_string()
-                                    } else {
-                                        "Approved task failed during execution".to_string()
-                                    },
-                                    failed_node_ids: if task_success {
-                                        vec![]
-                                    } else {
-                                        vec!["llm_node".to_string()]
-                                    },
-                                },
-                            });
-
-                            broker_bg.publish_feedback(AgentFeedback::Output {
-                                task_id: task_id.clone(),
-                                session_id: "default".into(),
-                                content: format!(
-                                    "Execution Complete. LLM Response: {}",
-                                    final_result
-                                ),
-                                is_final: true,
-                            });
-                        } else {
-                            broker_bg.publish_feedback(AgentFeedback::Output {
-                                task_id: task_id.clone(),
-                                session_id: "default".into(),
-                                content: "Task failed to resume: Payload lost or expired.".into(),
-                                is_final: true,
-                            });
-
-                            broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
-                                task_id: task_id.clone(),
-                                summary: TaskSummary {
-                                    success: false,
-                                    total_nodes: 0,
-                                    completed_nodes: 0,
-                                    failed_nodes: 0,
-                                    total_time_ms: 0,
-                                    summary: "Task failed to resume: Payload lost or expired"
-                                        .to_string(),
-                                    failed_node_ids: vec![],
-                                },
-                            });
                         }
                     });
                 }
@@ -1579,6 +1749,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/api/v1/run", post(handle_run))
+        .route("/api/v1/run_sync", post(handle_run_sync))
         .route("/api/v1/approve", post(handle_approve))
         .route("/api/v1/intervention", post(handle_intervention))
         .route("/api/v1/stream", get(ws_handler))
@@ -1635,6 +1806,54 @@ async fn handle_run(
         status: "accepted".into(),
         trace_id: trace_id.to_string(),
     })
+}
+
+async fn handle_run_sync(
+    State(state): State<AppState>,
+    Json(req): Json<RunRequest>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let trace_id = req.trace_id.clone().and_then(|id| Uuid::parse_str(&id).ok()).unwrap_or_else(Uuid::new_v4);
+    let trace_id_str = trace_id.to_string();
+    
+    // Subscribe *before* dispatching to avoid race conditions
+    let mut rx = state.broker.subscribe_feedback();
+    
+    let _ = state
+        .broker
+        .publish_event(AgentEvent::UserInput {
+            session_id: "default".into(),
+            payload: req.payload,
+            trace_id,
+            project_id: req.project_id,
+        })
+        .await;
+
+    let stream = async_stream::stream! {
+        // Send initial acknowledgment
+        yield Ok(Event::default().event("started").data(
+            serde_json::json!({"trace_id": trace_id_str}).to_string()
+        ));
+
+        while let Ok(feedback) = rx.recv().await {
+            match feedback {
+                AgentFeedback::TaskCompleted { task_id, summary } if task_id == trace_id_str => {
+                    let summary_json = serde_json::to_string(&summary).unwrap_or_default();
+                    yield Ok(Event::default().event("completed").data(summary_json));
+                    break;
+                }
+                AgentFeedback::Output { task_id, content, is_final, .. } if task_id == trace_id_str => {
+                    if is_final {
+                        yield Ok(Event::default().event("output").data(content));
+                    } else {
+                        yield Ok(Event::default().event("heartbeat").data(content));
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn handle_approve(
@@ -1747,7 +1966,8 @@ fn create_cancellation_feedback(task_id: &str) -> AgentFeedback {
     AgentFeedback::TaskCompleted {
         task_id: task_id.to_string(),
         summary: telos_hci::TaskSummary {
-            success: false,
+            fulfilled: false,
+            completed: true,
             total_nodes: 0,
             completed_nodes: 0,
             failed_nodes: 0,

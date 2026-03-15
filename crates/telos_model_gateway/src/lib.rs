@@ -319,15 +319,16 @@ mod tests {
     #[tokio::test]
     async fn test_gateway_exponential_backoff_max_retries() {
         let provider = Arc::new(MockProvider {
-            fail_count: Mutex::new(10), // Fails more than max retries (5)
+            fail_count: Mutex::new(10), // Fails more than rate_limit_max_retries (3)
             error_to_return: GatewayError::TooManyRequests { retry_after_ms: None },
         });
 
-        let gateway = GatewayManager::new(provider, 1000);
+        // Use with_concurrency to set a low rate_limit_max_retries for fast test execution
+        let gateway = GatewayManager::with_concurrency(provider, 1000, 3, 3);
 
         let res = gateway.generate(dummy_req(10)).await;
 
-        // Should return the error after exhausting retries
+        // Should return the error after exhausting rate-limit retries (3)
         assert!(matches!(res.unwrap_err(), GatewayError::TooManyRequests { .. }));
     }
 

@@ -150,8 +150,8 @@ impl CliFeedbackFormatter {
             }
 
             AgentFeedback::TaskCompleted { summary, .. } => {
-                let icon = if summary.success { "✅" } else { "⚠️" };
-                let status = if summary.success {
+                let icon = if summary.fulfilled { "✅" } else { "⚠️" };
+                let status = if summary.fulfilled {
                     "Success"
                 } else {
                     "Finished with errors"
@@ -168,7 +168,7 @@ impl CliFeedbackFormatter {
                     time_str
                 );
 
-                if !summary.success && !summary.failed_node_ids.is_empty() {
+                if !summary.fulfilled && !summary.failed_node_ids.is_empty() {
                     output.push_str(&format!(
                         "  Failed nodes: {}\n",
                         summary.failed_node_ids.join(", ")
@@ -266,7 +266,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 start_daemon();
             }
             let config = TelosConfig::load().unwrap_or_else(|_| panic!("Config should exist"));
-            tui::run_tui(config, Some(task.clone())).await?;
+            use std::io::IsTerminal;
+            if std::io::stdout().is_terminal() {
+                tui::run_tui(config, Some(task.clone())).await?;
+            } else {
+                handle_run_headless(&config, task).await?;
+            }
         }
         Commands::Bot { telegram } => {
             if check_and_init_config(false) {
@@ -638,6 +643,115 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
                 if feedback.is_final() {
                     break;
                 }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_run_headless(config: &TelosConfig, task: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use futures_util::StreamExt;
+
+    let client = Client::new();
+    let project_id = config.active_project_id.clone();
+    let trace_id = uuid::Uuid::new_v4().to_string();
+
+    let payload = json!({
+        "payload": task,
+        "project_id": project_id,
+        "trace_id": trace_id
+    });
+
+    println!("Dispatching task headlessly (Trace ID: {})...", trace_id);
+    
+    // No hard timeout — we use idle-based timeout instead.
+    // The SSE stream will send heartbeat events as the system works.
+    let res = client
+        .post("http://127.0.0.1:3000/api/v1/run_sync")
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        println!("Failed to run task. HTTP Status: {}", res.status());
+        return Ok(());
+    }
+
+    // Consume SSE stream with idle-based timeout
+    let idle_timeout = std::time::Duration::from_secs(120);
+    let mut byte_stream = res.bytes_stream();
+    let mut buffer = String::new();
+    let mut last_event_time = std::time::Instant::now();
+    let mut final_output = String::new();
+
+    loop {
+        let chunk = tokio::time::timeout(idle_timeout, byte_stream.next()).await;
+
+        match chunk {
+            Ok(Some(Ok(bytes))) => {
+                buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                // Parse SSE events from the buffer
+                while let Some(event_end) = buffer.find("\n\n") {
+                    let event_block = buffer[..event_end].to_string();
+                    buffer = buffer[event_end + 2..].to_string();
+
+                    let mut event_type = String::new();
+                    let mut data = String::new();
+
+                    for line in event_block.lines() {
+                        if let Some(val) = line.strip_prefix("event: ") {
+                            event_type = val.trim().to_string();
+                        } else if let Some(val) = line.strip_prefix("data: ") {
+                            data = val.to_string();
+                        } else if line.starts_with(":") {
+                            // SSE comment (keep-alive), do NOT reset idle timer
+                            continue;
+                        }
+                    }
+
+                    // Only reset idle timer when a real data event is received
+                    if !data.is_empty() || !event_type.is_empty() {
+                        last_event_time = std::time::Instant::now();
+                    }
+
+                    match event_type.as_str() {
+                        "started" => {
+                            println!("[Started] Task accepted by daemon.");
+                        }
+                        "heartbeat" => {
+                            println!("[Progress] {}", data);
+                        }
+                        "output" => {
+                            final_output = data.clone();
+                            println!("\n[Final Output]\n{}", data);
+                        }
+                        "completed" => {
+                            println!("\n[Summary]\n{}", data);
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Err(e))) => {
+                println!("Stream error: {}", e);
+                break;
+            }
+            Ok(None) => {
+                // Stream ended without a completed event
+                if !final_output.is_empty() {
+                    println!("\nStream ended. Output was received.");
+                } else {
+                    println!("\nStream ended prematurely without final output.");
+                }
+                break;
+            }
+            Err(_) => {
+                // Idle timeout triggered
+                println!("\n[Idle Timeout] No activity from daemon for {}s. The task may still be running on the server.", idle_timeout.as_secs());
+                break;
             }
         }
     }
