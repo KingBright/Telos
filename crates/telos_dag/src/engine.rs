@@ -5,9 +5,68 @@ use petgraph::Direction;
 use std::collections::HashMap;
 use std::time::Instant;
 use telos_context::ScopedContext;
-use telos_core::{AgentInput, AgentOutput, DependencyType, ErrorSeverity, NodeStatus, SystemRegistry};
+use telos_core::{AgentInput, AgentOutput, CorrectionDirective, DependencyType, ErrorSeverity, ExitCondition, LoopConfig, NodeStatus, SystemRegistry};
 use telos_hci::{AgentFeedback, ErrorDetail, EventBroker, ProgressInfo, TaskSummary};
 use tracing::{info_span, Instrument, info, warn, error};
+
+// ============================================================================
+// Corrective Loop Runtime State (Actor-Critic pattern)
+// ============================================================================
+
+/// Runtime state for a corrective loop pair (Actor + Critic)
+struct LoopState {
+    config: LoopConfig,
+    iteration: usize,
+    actor_node_id: String,
+    critic_node_id: String,
+    /// Historical scores for stagnation detection
+    score_history: Vec<f32>,
+    /// Best output seen so far (score, output)
+    best_output: Option<(f32, AgentOutput)>,
+    /// Pending correction to inject into next Actor iteration
+    pending_correction: Option<CorrectionDirective>,
+}
+
+impl LoopState {
+    fn new(config: LoopConfig, actor_node_id: String, critic_node_id: String) -> Self {
+        Self {
+            config,
+            iteration: 0,
+            actor_node_id,
+            critic_node_id,
+            score_history: Vec::new(),
+            best_output: None,
+            pending_correction: None,
+        }
+    }
+
+    /// Record a score and update best_output if this is the best so far
+    fn record_score(&mut self, score: f32, output: &AgentOutput) {
+        self.score_history.push(score);
+        if self.best_output.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+            self.best_output = Some((score, output.clone()));
+        }
+    }
+
+    /// Stagnation detection: last 2 scores vary by less than 0.05 from current
+    fn is_stagnated(&self, current_score: f32) -> bool {
+        if self.score_history.len() < 2 {
+            return false;
+        }
+        let recent: Vec<f32> = self.score_history.iter().rev().take(2).copied().collect();
+        let max_diff = recent.iter()
+            .map(|s| (s - current_score).abs())
+            .fold(0.0f32, f32::max);
+        max_diff < 0.05
+    }
+
+    /// Take the best output, or fall back to a default failure
+    fn take_best_output(&mut self) -> AgentOutput {
+        self.best_output.take()
+            .map(|(_, output)| output)
+            .unwrap_or_else(|| AgentOutput::failure("LoopExhausted", "Loop exited without producing usable output"))
+    }
+}
 
 pub trait NodeFactory: Send + Sync {
     fn create_node(&self, agent_type: &str, task: &str) -> Option<Box<dyn ExecutableNode>>;
@@ -279,6 +338,9 @@ impl ExecutionEngine for TokioExecutionEngine {
             let mut last_progress_update = Instant::now();
             let progress_update_interval = std::time::Duration::from_millis(500);
 
+            // Corrective loop states: keyed by Critic node ID
+            let mut loop_states: HashMap<String, LoopState> = HashMap::new();
+
             while completed_nodes < total_nodes {
                 // 1. 熔断检查：失败率 > 阈值时停止
                 if Self::should_circuit_break(completed_nodes, failed_nodes, &circuit_config) {
@@ -369,12 +431,18 @@ impl ExecutionEngine for TokioExecutionEngine {
                             None
                         };
 
+                        // Check if this node has a pending correction from a loop
+                        let correction = loop_states.values_mut()
+                            .find(|ls| ls.actor_node_id == node_id)
+                            .and_then(|ls| ls.pending_correction.take());
+
                         let agent_input = AgentInput {
                             node_id: id_clone.clone(),
                             task: prompt_preview.clone(),
                             dependencies,
                             schema_payload: graph.node_metadata.get(&node_id).and_then(|m| m.schema_payload.clone()),
                             memory_context,
+                            correction,
                         };
 
                         futures.push(async move {
@@ -460,6 +528,8 @@ impl ExecutionEngine for TokioExecutionEngine {
                                     });
                                 } else if let Some(factory) = &self.node_factory {
                                     let mut added_nodes = Vec::new();
+                                    let mut loop_registrations: Vec<(String, LoopConfig, String)> = Vec::new();
+
                                     for sg_node in &sub_graph.nodes {
                                         let full_id = format!("{}__{}", node_id, sg_node.id);
                                         if let Some(executable) = factory.create_node(&sg_node.agent_type, &sg_node.task) {
@@ -480,8 +550,14 @@ impl ExecutionEngine for TokioExecutionEngine {
                                                 },
                                             );
                                             in_degrees.insert(full_id.clone(), 0);
-                                            added_nodes.push(full_id);
+                                            added_nodes.push(full_id.clone());
                                             total_nodes += 1;
+
+                                            // Detect loop_config for LoopState registration
+                                            if let Some(ref lc) = sg_node.loop_config {
+                                                let critic_full_id = format!("{}__{}", node_id, lc.critic_node_id);
+                                                loop_registrations.push((full_id, lc.clone(), critic_full_id));
+                                            }
                                         }
                                     }
                                     for sg_edge in &sub_graph.edges {
@@ -498,10 +574,105 @@ impl ExecutionEngine for TokioExecutionEngine {
                                             ready_queue.push(full_id);
                                         }
                                     }
+
+                                    // Register corrective loop states
+                                    for (actor_id, config, critic_id) in loop_registrations {
+                                        info!("[DAG Engine] 🔄 Registered corrective loop: Actor={} ↔ Critic={} (max_iter={})",
+                                            actor_id, critic_id, config.max_iterations);
+                                        loop_states.insert(critic_id.clone(), LoopState::new(config, actor_id, critic_id));
+                                    }
                                 }
                             }
 
                             if output.success {
+                                // === Corrective Loop: Check if this Critic node triggers a re-loop ===
+                                if let Some(loop_state) = loop_states.get_mut(&node_id) {
+                                    // Extract satisfaction_score from Critic output
+                                    let score = output.output.as_ref()
+                                        .and_then(|v| v.get("satisfaction_score"))
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0) as f32;
+
+                                    // Record this score and Actor's output as candidate for best_output
+                                    // (We use the Actor's output stored in node_results, not the Critic's)
+                                    let actor_output = graph.node_results.get(&loop_state.actor_node_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| output.clone());
+                                    loop_state.record_score(score, &actor_output);
+
+                                    // Check exit conditions
+                                    let should_exit = match &loop_state.config.exit_condition {
+                                        ExitCondition::SatisfactionThreshold(threshold) => score >= *threshold,
+                                        ExitCondition::OutputContains(key) => output.output.as_ref()
+                                            .and_then(|v| v.get(key.as_str()))
+                                            .is_some(),
+                                    };
+                                    let stagnated = loop_state.is_stagnated(score);
+                                    let max_reached = loop_state.iteration >= loop_state.config.max_iterations;
+
+                                    if should_exit {
+                                        info!("[DAG Engine] 🔄✅ Loop exiting (satisfied): Actor={}, iter={}, score={:.2}",
+                                            loop_state.actor_node_id, loop_state.iteration, score);
+                                    } else if stagnated {
+                                        warn!("[DAG Engine] 🔄⚠️ Loop exiting (stagnated): Actor={}, iter={}, score={:.2}, history={:?}",
+                                            loop_state.actor_node_id, loop_state.iteration, score, loop_state.score_history);
+                                    } else if max_reached {
+                                        warn!("[DAG Engine] 🔄⚠️ Loop exiting (max iterations): Actor={}, iter={}/{}",
+                                            loop_state.actor_node_id, loop_state.iteration, loop_state.config.max_iterations);
+                                    }
+
+                                    if !(should_exit || stagnated || max_reached) {
+                                        // === Re-loop: Generate CorrectionDirective and re-queue Actor ===
+                                        let diagnosis = output.output.as_ref()
+                                            .and_then(|v| v.get("diagnosis").and_then(|d| d.as_str()))
+                                            .unwrap_or("No specific diagnosis")
+                                            .to_string();
+
+                                        let corrections: Vec<String> = output.output.as_ref()
+                                            .and_then(|v| v.get("corrections"))
+                                            .and_then(|v| v.as_array())
+                                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                            .unwrap_or_default();
+
+                                        let previous_summary: String = output.output.as_ref()
+                                            .and_then(|v| v.get("previous_summary").and_then(|s| s.as_str()))
+                                            .unwrap_or("")
+                                            .to_string();
+
+                                        let directive = CorrectionDirective {
+                                            iteration: loop_state.iteration + 1,
+                                            satisfaction_score: score,
+                                            diagnosis: diagnosis.clone(),
+                                            correction_instructions: corrections.clone(),
+                                            previous_summary,
+                                        };
+
+                                        loop_state.iteration += 1;
+                                        loop_state.pending_correction = Some(directive);
+
+                                        info!("[DAG Engine] 🔄🔁 Loop continuing: Actor={}, iter={}, score={:.2}, diagnosis='{}', corrections={:?}",
+                                            loop_state.actor_node_id, loop_state.iteration, score, diagnosis, corrections);
+
+                                        // Re-set Actor node to Pending and re-queue
+                                        let actor_id = loop_state.actor_node_id.clone();
+                                        graph.node_statuses.insert(actor_id.clone(), NodeStatus::Pending);
+                                        // Also reset Critic so it can run again after Actor
+                                        graph.node_statuses.insert(node_id.clone(), NodeStatus::Pending);
+                                        ready_queue.push(actor_id);
+
+                                        // Don't count as completed — loop continues
+                                        continue;
+                                    } else {
+                                        // Exit loop — replace output with best Actor output
+                                        let best = loop_state.take_best_output();
+                                        // Store the best Actor output as the Critic node's result
+                                        // so downstream nodes see the Actor's work, not the Critic's eval
+                                        graph.node_results.insert(node_id.clone(), best.clone());
+                                        output = best;
+                                    }
+                                }
+                                // === End Corrective Loop ===
+
                                 graph.node_statuses.insert(node_id.clone(), NodeStatus::Completed);
                                 info!("[DAG Engine] ✓ Node \"{}\" completed in {}ms", node_id, execution_time_ms);
 

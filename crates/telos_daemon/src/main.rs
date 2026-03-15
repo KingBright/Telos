@@ -877,6 +877,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 session_id: session_id.clone(),
                                 content: format!("{}\n\n{}", summary, combined_result),
                                 is_final: true,
+                                silent: false,
                             });
 
                             broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
@@ -963,6 +964,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 dependencies: Default::default(),
                                 schema_payload: None,
                                 memory_context: Some(recent_history_text.clone()),
+                                correction: None,
                             };
 
                             let mut route_result = telos_core::AgentOutput::failure("Init", "Not started");
@@ -991,6 +993,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 session_id: session_id.clone(),
                                                 content: format!("*(Router is recalling memory for: {})*", query_val),
                                                 is_final: false,
+                                                silent: false,
                                             });
 
                                             let mut memory_findings = String::new();
@@ -1071,6 +1074,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     session_id: session_id.clone(),
                                     content: format!("Routing Failed: {}", error_msg),
                                     is_final: true,
+                                    silent: false,
                                 });
                                 broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
                                     task_id: trace_id.to_string(),
@@ -1117,6 +1121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         session_id: session_id.clone(),
                                         content: direct_reply.to_string(),
                                         is_final: true,
+                                        silent: false,
                                     });
                                     
                                     broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
@@ -1168,6 +1173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         session_id: session_id.clone(),
                                         content: format!("🔄 Direct reply rejected by QA. Routing to expert. Critique: {}", critique),
                                         is_final: false,
+                                        silent: false,
                                     });
                                     // Don't return — fall through to expert routing below
                                 }
@@ -1181,6 +1187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 session_id: session_id.clone(),
                                 content: format!("Router Decision: Dispatching to `{}`. Reason: {}", expert_route, route_reason),
                                 is_final: false, // Not final, we are just starting
+                                silent: false,
                             });
 
                             // Build context using the context manager with memory integration for the Expert
@@ -1390,6 +1397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     dependencies: std::collections::HashMap::new(),
                                     schema_payload: None,
                                     memory_context: router_input.memory_context.clone(),
+                                    correction: None,
                                 };
 
                                 let summary_output = expert_agent_for_summary
@@ -1451,6 +1459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 session_id: session_id.clone(),
                                                 content: format!("🔄 Router QA rejected output.\nCritique: {}", critique),
                                                 is_final: false,
+                                                silent: false,
                                             });
                                             enriched_payload = format!(
                                                 "Task:\n{}\n\n[SYSTEM DIRECTIVE — MANDATORY]\n\
@@ -1478,6 +1487,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 session_id: session_id.clone(),
                                 content: loop_final_response.clone(),
                                 is_final: true,
+                                silent: false,
                             });
 
                             // Publish TaskCompleted feedback LAST, which breaks the CLI stream
@@ -1596,6 +1606,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 session_id: "default".into(),
                                 content: "Task Rejected.".into(),
                                 is_final: true,
+                                silent: false,
                             });
                             paused_tasks_bg.lock().await.remove(&task_id);
 
@@ -1624,6 +1635,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 session_id: "default".into(),
                                 content: "Task Approved. Executing...".into(),
                                 is_final: false,
+                                silent: false,
                             });
 
                             let mut graph = TaskGraph::new(task_id.clone());

@@ -320,6 +320,10 @@ pub enum AgentFeedback {
         session_id: String,
         content: String,
         is_final: bool,
+        /// When true, this output is an intermediate step (e.g., search query 2/5)
+        /// and should NOT be displayed to the user by CLI/TUI/Telegram renderers.
+        #[serde(default)]
+        silent: bool,
     },
 
     // === New Enhanced Feedback Types ===

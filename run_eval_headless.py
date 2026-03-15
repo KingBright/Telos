@@ -1,46 +1,65 @@
-import subprocess
-import json
-import time
-import os
+#!/usr/bin/env python3
+"""Telos 评估数据采集 — 调用 /api/v1/run_sync SSE 收集输出"""
+import requests, json, time, os, uuid
 
+API = "http://127.0.0.1:3000/api/v1/run_sync"
 os.makedirs("test_traces", exist_ok=True)
 
 queries = [
-    # Baseline
-    "今天天气怎么样？",
-    "计算 25 的平方根加上 150 的 15%", # Case 2: previously caused infinite loop
-    "帮我计划一个为期3天的北京旅游行程",
-    "2026年3月14日火星发生的爆炸新闻是什么？",
-    # Phase 4/5
-    "你是谁？你的名字是什么？",
-    "执行一个长文本研究任务：总结AI在2026年的前沿进展",
-    "系统现在正在跑什么编程或是搜索任务吗？",
-    "回忆一下在刚才的测试中，我问过的第一个问题是什么？"
+    "你好，你叫什么名字？",
+    "计算 25 的平方根加上 150 的 15%",
+    "北京和上海哪个城市面积更大？大多少？",
+    "今天苏州天气怎么样？",
+    "总结2026年3月AI领域的最新进展",
+    "现在几点了？今天是几月几号？",
+    "帮我写一个Python函数，输入一个列表，返回其中所有偶数的平方和",
+    "解释一下什么是Actor-Critic模式",
 ]
 
-print("Starting Deterministic Headless Execution via CLI...")
-print("NOTE: No timeout or parallelism. All cases run sequentially.")
 for i, q in enumerate(queries):
-    case_num = i + 1
-    print(f"========================================")
-    print(f"Running Case {case_num}: {q}")
-    
-    start_time = time.time()
-    # No timeout — the CLI's idle-based timeout (120s) handles deadlock detection.
-    # All cases run sequentially to avoid concurrent API pressure.
-    result = subprocess.run(
-        [os.path.expanduser("~/.cargo/bin/telos"), "run", q],
-        capture_output=True,
-        text=True,
-    )
-    elapsed = time.time() - start_time
-    print(f"Finished Case {case_num} in {elapsed:.2f}s")
-    print(result.stdout)
-    if result.stderr:
-        print("Errors:", result.stderr[:500])  # Truncate verbose stderr
-        
-    with open(f"test_traces/iter12_case_{case_num}_cli_output.log", "w", encoding="utf-8") as f:
-        f.write(result.stdout + "\n" + result.stderr)
+    n = i + 1
+    print(f"\n== Case {n}: {q}")
+    start = time.time()
+    final_output, heartbeats, summary = "", [], {}
+    try:
+        r = requests.post(API, json={"payload": q, "trace_id": str(uuid.uuid4())},
+                          headers={"Accept": "text/event-stream"}, stream=True, timeout=240)
+        # Parse SSE: accumulate multiline data blocks
+        event_type, data_lines = "", []
+        for raw_line in r.iter_lines():
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            if line.startswith("event:"):
+                event_type = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+            elif line == "":
+                # Event boundary — flush
+                data = "\n".join(data_lines)
+                if event_type == "output":
+                    final_output = data
+                elif event_type == "heartbeat":
+                    heartbeats.append(data)
+                elif event_type == "completed":
+                    try: summary = json.loads(data)
+                    except: summary = {"raw": data}
+                event_type, data_lines = "", []
+    except Exception as e:
+        final_output = f"ERROR: {e}"
 
-print("========================================")
-print("All tasks finished successfully.")
+    elapsed = time.time() - start
+    # Combine: if final_output is short, heartbeats may have the real content
+    full_output = final_output if len(final_output) > 100 else "\n".join(heartbeats + [final_output])
+
+    print(f"   {elapsed:.1f}s | final={len(final_output)}c | heartbeats={len(heartbeats)} | total={len(full_output)}c")
+    print(f"   {full_output[:200]}")
+
+    with open(f"test_traces/iter14_case_{n}.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "query": q, "elapsed": round(elapsed,1),
+            "final_output": final_output,
+            "heartbeats": heartbeats,
+            "full_output": full_output,
+            "summary": summary,
+        }, f, ensure_ascii=False, indent=2)
+
+print(f"\n✅ Done. Traces in test_traces/iter14_case_*.json")

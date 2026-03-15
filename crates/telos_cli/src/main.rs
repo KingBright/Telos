@@ -201,8 +201,9 @@ impl CliFeedbackFormatter {
             )),
 
             AgentFeedback::Output {
-                content, is_final, ..
+                content, is_final, silent, ..
             } => {
+                if *silent { return None; }
                 let prefix = if *is_final { "✓" } else { ">>" };
                 Some(format!("{} {}\n", prefix, content))
             }

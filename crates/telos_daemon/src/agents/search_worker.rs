@@ -226,6 +226,86 @@ Output JSON:
             Err(_) => (true, truncated),
         }
     }
+
+    /// Generate corrected search queries based on CorrectionDirective from Critic feedback.
+    /// This implements the "correction, not retry" principle — each iteration adjusts
+    /// its approach based on what the Critic diagnosed as missing or wrong.
+    async fn generate_corrected_queries(
+        &self,
+        intent: &str,
+        correction: &telos_core::CorrectionDirective,
+    ) -> Vec<String> {
+        let corrections_text = if correction.correction_instructions.is_empty() {
+            "No specific corrections provided.".to_string()
+        } else {
+            correction.correction_instructions.iter()
+                .enumerate()
+                .map(|(i, c)| format!("{}. {}", i + 1, c))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let prompt = format!(
+            r#"You are a search keyword engineer performing a CORRECTED search.
+
+Original Intent: "{}"
+
+Previous Iteration (#{}):
+- Score: {:.1}/1.0
+- Diagnosis: {}
+- Previous Summary: {}
+
+Correction Instructions:
+{}
+
+Generate 3-5 NEW search queries that address the corrections above.
+Do NOT repeat queries from the previous iteration.
+Focus on what was MISSING or WRONG according to the diagnosis.
+
+Output ONLY a JSON object: {{ "queries": ["query1", "query2", ...] }}"#,
+            intent,
+            correction.iteration,
+            correction.satisfaction_score,
+            correction.diagnosis,
+            correction.previous_summary,
+            corrections_text
+        );
+
+        let req = LlmRequest {
+            session_id: "search_worker_corrected_keygen".to_string(),
+            messages: vec![
+                Message { role: "system".to_string(), content: "You are a search keyword engineer. Output ONLY valid JSON.".to_string() },
+                Message { role: "user".to_string(), content: prompt },
+            ],
+            required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
+            budget_limit: 500,
+        };
+
+        match self.gateway.generate(req).await {
+            Ok(res) => {
+                let content = res.content.trim();
+                let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
+                    if e > s { &content[s..=e] } else { content }
+                } else { content };
+
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(queries) = json.get("queries").and_then(|v| v.as_array()) {
+                        let result: Vec<String> = queries.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect();
+                        if !result.is_empty() {
+                            info!("[SearchWorker] 🔄 Generated {} corrected queries (iter {}): {:?}",
+                                result.len(), correction.iteration, result);
+                            return result;
+                        }
+                    }
+                }
+                info!("[SearchWorker] Corrected query generation failed, using intent as fallback");
+                vec![intent.to_string()]
+            }
+            Err(_) => vec![intent.to_string()],
+        }
+    }
 }
 
 #[async_trait]
@@ -321,8 +401,14 @@ impl ExecutableNode for SearchWorkerAgent {
 
         // === DEEP MODE: keyword engineering + multi-query + batch scrape ===
         
-        // Phase 1: Keyword Engineering
-        let queries = self.generate_search_queries(intent).await;
+        // Phase 1: Keyword Engineering (corrected if CorrectionDirective present)
+        let queries = if let Some(ref correction) = input.correction {
+            info!("[SearchWorker] 🔄 Iteration {} — applying corrections. Diagnosis: {}",
+                correction.iteration, correction.diagnosis);
+            self.generate_corrected_queries(intent, correction).await
+        } else {
+            self.generate_search_queries(intent).await
+        };
 
         // Phase 2: Execute all queries, collect structured results
         let mut all_results: Vec<SearchResult> = Vec::new();

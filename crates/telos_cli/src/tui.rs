@@ -197,7 +197,8 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
                     let log_level = global_log_level().get();
                     if fb.should_show(log_level) {
                         match fb {
-                            AgentFeedback::Output { content, is_final, .. } => {
+                            AgentFeedback::Output { content, is_final, silent, .. } => {
+                                if silent { continue; }
                                 if is_final {
                                     app.chat_history.push(format!("✅ {}", content));
                                 } else if global_log_level().get().should_show(LogLevel::Verbose) {

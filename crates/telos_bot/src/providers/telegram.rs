@@ -213,8 +213,9 @@ impl TelegramFeedbackFormatter {
             }
 
             AgentFeedback::Output {
-                content, is_final, ..
+                content, is_final, silent, ..
             } => {
+                if *silent { return None; }
                 if !*is_final && !self.level.should_show(LogLevel::Verbose) {
                     return None;
                 }
