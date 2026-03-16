@@ -55,6 +55,8 @@ pub async fn consolidate_memories(
                 created_at: entry.created_at,
                 last_accessed: entry.last_accessed,
                 embedding: entry.embedding.clone(),
+                access_count: 0,
+                confidence: 1.0, // Freshly consolidated = full confidence
             };
 
             newly_consolidated.push(semantic_entry);

@@ -96,6 +96,8 @@
                 created_at: ts,
                 last_accessed: ts,
                 embedding: None,
+                access_count: 0,
+                confidence: 1.0,
             },
             MemoryEntry {
                 id: "recon_2".to_string(),
@@ -106,6 +108,8 @@
                 created_at: ts,
                 last_accessed: ts,
                 embedding: None,
+                access_count: 0,
+                confidence: 1.0,
             }
         ];
 
@@ -140,4 +144,165 @@
         assert_eq!(entry.current_strength, strength);
 
         let _ = std::fs::remove_file(db_path); // Cleanup
+    }
+
+    // --- NEW TESTS: Memory OS 100% coverage ---
+
+    #[test]
+    fn test_decay_interaction_event() {
+        // InteractionEvent should decay with 48h half-life (slower than Episodic 24h)
+        let ts = get_current_timestamp();
+        let mut entry = MemoryEntry::new(
+            "ie_1".to_string(),
+            MemoryType::InteractionEvent,
+            "User asked about weather".to_string(),
+            ts - 86400, // 24 hours ago
+            None,
+        );
+
+        let pruned = apply_decay(&mut entry, ts, 0.5);
+        // At 24h with 48h half-life: e^(-24/48) = e^(-0.5) ≈ 0.607
+        // So strength = 1.0 * 0.607 ≈ 0.607, should NOT be pruned
+        assert!(!pruned, "InteractionEvent should not be pruned after only 24h");
+        assert!(entry.current_strength > 0.5);
+
+        // After 96h (4 days): e^(-96/48) = e^(-2) ≈ 0.135
+        let mut entry2 = MemoryEntry::new(
+            "ie_2".to_string(),
+            MemoryType::InteractionEvent,
+            "Old conversation".to_string(),
+            ts - 86400 * 4, // 4 days ago
+            None,
+        );
+        let pruned2 = apply_decay(&mut entry2, ts, 0.5);
+        assert!(pruned2, "InteractionEvent should be pruned after 4 days");
+    }
+
+    #[test]
+    fn test_semantic_never_decays() {
+        let ts = get_current_timestamp();
+        let mut entry = MemoryEntry::new(
+            "sem_1".to_string(),
+            MemoryType::Semantic,
+            "Permanent fact".to_string(),
+            ts - 86400 * 365, // 1 year ago!
+            None,
+        );
+
+        let pruned = apply_decay(&mut entry, ts, 0.5);
+        assert!(!pruned, "Semantic memory should never decay");
+        assert_eq!(entry.current_strength, 1.0, "Semantic strength should be unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_delete_and_retrieve_all() {
+        let db_path = "test_delete_db.redb";
+        let _ = std::fs::remove_file(db_path);
+        let store = RedbGraphStore::new(db_path).unwrap();
+
+        let e1 = MemoryEntry::new("del_1".to_string(), MemoryType::Episodic, "First memory".to_string(), 100, None);
+        let e2 = MemoryEntry::new("del_2".to_string(), MemoryType::Episodic, "Second memory".to_string(), 200, None);
+
+        store.store(e1).await.unwrap();
+        store.store(e2).await.unwrap();
+
+        let all = store.retrieve_all().await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        store.delete("del_1").await.unwrap();
+
+        let remaining = store.retrieve_all().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "del_2");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_fade_consolidation() {
+        let db_path = "test_fade_db.redb";
+        let _ = std::fs::remove_file(db_path);
+        let store = RedbGraphStore::new(db_path).unwrap();
+
+        let ts = get_current_timestamp();
+        // Store a very old episodic memory (should be pruned)
+        let old_entry = MemoryEntry::new(
+            "old_ep".to_string(),
+            MemoryType::Episodic,
+            "Ancient memory".to_string(),
+            ts - 86400 * 30, // 30 days ago
+            None,
+        );
+        // Store a recent episodic memory (should survive)
+        let recent_entry = MemoryEntry::new(
+            "recent_ep".to_string(),
+            MemoryType::Episodic,
+            "Recent memory".to_string(),
+            ts,
+            None,
+        );
+        // Store a semantic memory (never decays)
+        let semantic_entry = MemoryEntry::new(
+            "perm_sem".to_string(),
+            MemoryType::Semantic,
+            "Permanent fact".to_string(),
+            ts - 86400 * 30,
+            None,
+        );
+
+        store.store(old_entry).await.unwrap();
+        store.store(recent_entry).await.unwrap();
+        store.store(semantic_entry).await.unwrap();
+
+        assert_eq!(store.retrieve_all().await.unwrap().len(), 3);
+
+        // Run fade consolidation
+        store.trigger_fade_consolidation().await.unwrap();
+
+        let remaining = store.retrieve_all().await.unwrap();
+        // Old episodic should be pruned, recent episodic & semantic should survive
+        assert_eq!(remaining.len(), 2);
+        let ids: Vec<String> = remaining.iter().map(|e| e.id.clone()).collect();
+        assert!(ids.contains(&"recent_ep".to_string()));
+        assert!(ids.contains(&"perm_sem".to_string()));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn test_confidence_field_default() {
+        // Test that deserializing old data without confidence works
+        let json_str = r#"{"id":"test","memory_type":"Semantic","content":"hello","base_strength":1.0,"current_strength":1.0,"created_at":100,"last_accessed":100,"embedding":null}"#;
+        let entry: MemoryEntry = serde_json::from_str(json_str).unwrap();
+        assert_eq!(entry.confidence, 1.0, "Default confidence should be 1.0");
+        assert_eq!(entry.access_count, 0, "Default access_count should be 0");
+    }
+
+    #[test]
+    fn test_access_count_tracking() {
+        let mut entry = MemoryEntry::new(
+            "ac_1".to_string(),
+            MemoryType::Episodic,
+            "Test".to_string(),
+            100,
+            None,
+        );
+
+        assert_eq!(entry.access_count, 0);
+        assert_eq!(entry.base_strength, 1.0);
+
+        entry.access(200);
+        assert_eq!(entry.access_count, 1);
+        assert!(entry.base_strength > 1.0); // Should boost
+
+        let first_strength = entry.base_strength;
+        entry.access(300);
+        assert_eq!(entry.access_count, 2);
+        let second_boost = entry.base_strength - first_strength;
+
+        entry.access(400);
+        let third_boost = entry.base_strength - first_strength - second_boost;
+
+        // Verify diminishing returns
+        assert!(third_boost < second_boost, "Boost should diminish with more accesses");
     }

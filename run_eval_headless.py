@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Telos Agent Evaluation Suite — Iteration 15 (Post-P0 Tool Calling)
+Telos Agent Evaluation Suite — Iteration 16 (Post Memory OS Upgrade)
 Tests all agent categories via /api/v1/run_sync SSE endpoint.
 
 Categories: Identity, Math, Common Knowledge, Real-time Search,
             Deep Research, Time Awareness, Coding, Knowledge Reasoning,
-            Ambiguous/Edge, Multi-step Planning
+            Ambiguous/Edge, Multi-step Planning, Memory, Persona
 """
 import requests, json, time, os, uuid, sys, re
 
 API = "http://127.0.0.1:3000/api/v1/run_sync"
-ITER = 15
+BASE_URL = "http://127.0.0.1:3000"
+ITER = 17
 TRACES_DIR = "test_traces"
 os.makedirs(TRACES_DIR, exist_ok=True)
 
@@ -99,6 +100,35 @@ test_cases = [
         "category": "Reasoning",
         "query": "请将以下句子翻译成英文，并解释其中的文化含义：'塞翁失马，焉知非福'",
         "description": "翻译 + 文化推理",
+    },
+    # ─── NEW: Memory & Persona Test Cases (Iteration 16) ──────────────
+    # Category: Memory - User Preference Storage & Recall
+    {
+        "id": 13,
+        "category": "Memory",
+        "query": "请记住：我最喜欢的颜色是蓝色，我喜欢早起",
+        "description": "用户偏好记忆存储 — 测试 memory_write 工具",
+    },
+    # Category: Memory - Cross-session Recall
+    {
+        "id": 14,
+        "category": "Memory",
+        "query": "你还记得我喜欢什么颜色吗？",
+        "description": "跨会话记忆回忆 — 测试 memory_read 工具",
+    },
+    # Category: Memory - Conflict/Update
+    {
+        "id": 15,
+        "category": "MemoryConflict",
+        "query": "更正一下，我最喜欢的颜色其实是绿色而不是蓝色",
+        "description": "记忆冲突更新 — 测试 conflict detection",
+    },
+    # Category: Persona
+    {
+        "id": 16,
+        "category": "Persona",
+        "query": "你有什么独特的个性和特点吗？你和其他AI有什么不同？",
+        "description": "人格独立性 — 测试 SOUL persona",
     },
 ]
 

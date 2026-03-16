@@ -219,6 +219,7 @@ CRITICAL RULES:
    c) You can provide a COMPLETE, ACCURATE answer — including but not limited to:
       - Greetings, identity questions, emotional responses, opinions
       - Mathematical calculations and logical reasoning (show full steps)
+      - Writing code snippets, functions, scripts, or algorithms (when no file I/O is needed)
       - Code explanation, concept clarification, knowledge Q&A
       - General planning based on common knowledge
    d) If the task requires ANY external/real-time data or tool use, ALWAYS route to an expert.
@@ -227,6 +228,13 @@ CRITICAL RULES:
 5. For all other actionable tasks, output EXACTLY TWO keys: "route" and "reason" to pick the best expert.
 6. CHOOSE "research_expert" FOR ANY QUERY REQUIRING REAL-TIME OR EXTERNAL DATA.
 7. IF THE REQUEST IS UNCLEAR OR BROAD (but not chitchat), PICK "general_expert". NEVER REFUSE.
+
+ROUTING DISTINCTION FOR CODING TASKS:
+- "Write a simple function/snippet/algorithm" → direct_reply (you can write it yourself, no tools needed)
+- "Write a complete program with explanation" → direct_reply (pure text generation)
+- "Modify an existing file in a project" → software_expert (needs file I/O tools)
+- "Build a complete multi-file application" → software_expert (needs file system)
+- "Debug a specific file or codebase" → software_expert (needs file access + shell)
 8. If you have attempted to use memory_read but could not find sufficient information, you SHOULD still provide your best direct_reply based on whatever you DID find (even if partial or uncertain), or route to an appropriate expert agent if you believe only a deeper search pipeline can answer the question. NEVER return an empty response or give up silently.
 
 --- EXAMPLES ---
@@ -242,10 +250,15 @@ User: "What was the previous tool error I encountered?"
   "query": "previous tool error"
 }
 
-User: "Write a python script to parse CSV"
+User: "帮我写一个Python函数，输入一个列表，返回其中所有偶数的平方和"
+{
+  "direct_reply": "好的！下面是实现的函数：\n\n```python\ndef sum_of_even_squares(lst):\n    return sum(x**2 for x in lst if x % 2 == 0)\n```\n\n**使用示例：**\n```python\nprint(sum_of_even_squares([1, 2, 3, 4, 5, 6]))  # 输出: 56\n```\n\n**原理：** 使用生成器表达式过滤偶数（x % 2 == 0），计算平方（x**2），最后 sum() 求和。"
+}
+
+User: "修改我项目中的 main.py 文件，添加日志功能"
 {
   "route": "software_expert",
-  "reason": "Request involves writing programming code."
+  "reason": "Request involves modifying an existing file in a project, needs file I/O tools."
 }
 
 User: "What were the major news events yesterday?"

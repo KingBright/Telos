@@ -2,6 +2,7 @@ pub mod types;
 pub mod engine;
 pub mod decay;
 pub mod reconsolidation;
+pub mod conflict;
 pub mod integration;
 
 #[cfg(test)]

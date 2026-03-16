@@ -800,8 +800,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         memory_os: memory_os_instance.clone(),
         system_context,
     });
-    // Reuse the same memory instance instead of creating a duplicate
-    let _memory = memory_os_instance.clone();
+    // Inject LLM gateway into MemoryOS for reconsolidation
+    memory_os_instance.set_gateway(gateway.clone() as Arc<dyn telos_model_gateway::ModelGateway>);
+
     // Using cloud embeddings as configured
     let context_manager = Arc::new(RaptorContextManager::new(
         Arc::new(openai_provider.clone()),
@@ -842,10 +843,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(trace) = distillation_rx.recv().await {
             let trace_id = trace.task_id.clone();
             
-            // Log extraction attempt
             debug!("[Daemon] 🧠 Evolution worker processing trace {}...", trace_id);
             
-            // Distill Experience asynchronously (CPU/Network bound)
             if let Some(skill) = evaluator_worker.distill_experience(&trace).await {
                 info!("[Daemon] 🧠 Telos distilled a new SynthesizedSkill from task {}!", trace_id);
                 
@@ -856,10 +855,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     skill.executable_code
                 );
                 
-                // Save to Long Term Memory
                 let _ = registry_worker.memory_os.store_semantic_fact(skill_string).await;
                 debug!("[Daemon] 📥 Distilled skill securely archived in Long-Term Memory.");
             }
+        }
+    });
+
+    // --- BACKGROUND MEMORY MAINTENANCE WORKER ---
+    // Runs hourly: (1) fade/decay sweep to prune forgotten Episodic/InteractionEvent memories
+    //              (2) reconsolidation to promote strong Episodic → Semantic knowledge
+    let memory_maintenance = memory_os_instance.clone();
+    tokio::spawn(async move {
+        use telos_memory::engine::MemoryOS;
+        // Initial delay: wait 5 minutes before first sweep (let system stabilize after startup)
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // 1 hour
+        loop {
+            interval.tick().await;
+            // Step 1: Decay sweep — prune forgotten episodic memories
+            if let Err(e) = memory_maintenance.trigger_fade_consolidation().await {
+                warn!("[MemoryWorker] Fade sweep failed: {}", e);
+            }
+            // Step 2: Reconsolidation — promote strong episodic → semantic
+            if let Err(e) = memory_maintenance.consolidate().await {
+                warn!("[MemoryWorker] Reconsolidation failed: {}", e);
+            }
+            info!("[MemoryWorker] ✅ Hourly memory maintenance completed");
         }
     });
 
@@ -1553,7 +1574,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 .map(|v| v.to_string())
                                                 .unwrap_or_else(|| "No output".to_string());
                                                 
-                                            if !output_str.contains("Research plan generated") {
+                                            if !output_str.contains("Research plan generated")
+                                                && !output_str.contains("execution stub")
+                                                && !output_str.contains("SubGraph decomposition complete")
+                                            {
                                                 if res.success {
                                                     final_results.push(format!("[{}] {}", node_id, output_str));
                                                 } else {
