@@ -228,6 +228,15 @@ impl CliFeedbackFormatter {
                 ))
             }
             AgentFeedback::Trace { .. } => None,
+
+            AgentFeedback::ClarificationNeeded { prompt, options, .. } => {
+                let mut output = format!("\n❓ [CLARIFICATION NEEDED]\n{}\n", prompt);
+                for (i, opt) in options.iter().enumerate() {
+                    output.push_str(&format!("  {}) {} - {}\n", i + 1, opt.label, opt.description));
+                }
+                output.push_str("  Enter a number or type your response:\n");
+                Some(output)
+            }
         }
     }
 }

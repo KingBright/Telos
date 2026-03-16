@@ -222,6 +222,12 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
                             AgentFeedback::RequireHumanIntervention { prompt, .. } => {
                                 app.chat_history.push(format!("\n🚨 [HUMAN INTERVENTION REQUIRED]\n{}\n", prompt));
                             }
+                            AgentFeedback::ClarificationNeeded { prompt, options, .. } => {
+                                app.chat_history.push(format!("❓ {}", prompt));
+                                for opt in &options {
+                                    app.chat_history.push(format!("  {} - {}", opt.label, opt.description));
+                                }
+                            }
                             _ => {}
                         }
                     }

@@ -61,6 +61,8 @@ impl telos_model_gateway::gateway::ModelProvider for DummyModelProvider {
         Ok(telos_model_gateway::LlmResponse {
             content: "Mock LLM Response".to_string(),
             tokens_used: 10,
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
         })
     }
 }
@@ -93,6 +95,7 @@ impl ExecutableNode for LlmTestNode {
             messages: vec![],
             required_capabilities: telos_model_gateway::Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: 100,
+            tools: None,
         };
 
         match gateway.generate(req).await {

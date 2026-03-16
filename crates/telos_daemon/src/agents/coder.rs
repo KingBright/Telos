@@ -1,18 +1,29 @@
 use crate::agents::{
     async_trait, AgentInput, AgentOutput, Arc, ExecutableNode, GatewayManager, SystemRegistry,
 };
-use tracing::{info, warn, error};
+use crate::agents::react_loop::{ReactLoop, ReactConfig};
+use tracing::{info, warn};
 use telos_model_gateway::ModelGateway;
+use telos_tooling::ToolRegistry;
+use tokio::sync::RwLock;
 
 pub struct CoderAgent {
     pub gateway: Arc<GatewayManager>,
+    pub tool_registry: Arc<RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
     pub tools_dir: String,
-    // Add additional fields as needed for TDD-style execution loop
 }
 
 impl CoderAgent {
-    pub fn new(gateway: Arc<GatewayManager>, tools_dir: String) -> Self {
-        Self { gateway, tools_dir }
+    pub fn new(
+        gateway: Arc<GatewayManager>,
+        tool_registry: Arc<RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
+        tools_dir: String,
+    ) -> Self {
+        Self {
+            gateway,
+            tool_registry,
+            tools_dir,
+        }
     }
 }
 
@@ -41,7 +52,7 @@ impl WorkerAgent for CoderAgent {
             input.node_id
         );
 
-        // As a strict worker in the Sub-DAG, the CoderAgent receives an exact implementation prompt.
+        // 1. Build environment context
         let env_context = if let Some(ctx) = _registry.get_system_context() {
             format!("[ENVIRONMENT CONTEXT]\nLocal Time: {}\nPhysical Location: {}\n\n", ctx.current_time, ctx.location)
         } else {
@@ -49,105 +60,80 @@ impl WorkerAgent for CoderAgent {
         };
         let mem_context = input.memory_context.clone().unwrap_or_default();
 
-        let system_prompt = format!("{}{}{}", env_context, mem_context, r#"You are the CoderAgent, an expert software engineer.
-You are a worker node inside a larger task graph. You have received precise implementation instructions from the Architect.
+        // 2. Build system prompt for coding with tool usage
+        let system_prompt = format!("{}{}{}",
+            env_context,
+            if mem_context.is_empty() { String::new() } else { format!("{}\n\n", mem_context) },
+            r#"You are the CoderAgent, an expert autonomous software engineer.
 
-If you are asked to create a new Telos Dynamic Tool or fetch data from a new API, you MUST write a `rhai` script.
-Rhai is a Rust-like scripting language. By default, the sandbox provides a `http_get(url)` function which returns a JSON string or text.
-Example Rhai tool script:
-```rhai
-let response = http_get("https://api.example.com/data");
-// return a JSON object (or Map) structure
-#{ status: "success", data: response }
-```
-Return your implementation details or the raw script."#);
+You have access to tools for reading files, editing files, and executing shell commands.
+Use them to implement the requested changes step by step.
 
-        let mut attempts = 0;
-        let mut current_task_payload = input.task.clone();
-        let max_attempts = 3;
+WORKFLOW:
+1. First, READ the relevant files to understand the existing code
+2. PLAN your changes (think about what needs to be modified)
+3. EDIT the files using the file_edit or fs_write tools
+4. VERIFY your changes by running appropriate commands (e.g., cargo check, npm test)
+5. If there are errors, READ the error output and FIX them iteratively
 
-        loop {
-            let prompt = format!("System: {}\n\nTask:\n{}", system_prompt, current_task_payload);
-    
-            let req = telos_model_gateway::LlmRequest {
-                session_id: format!("coder_{}_{}", input.node_id, attempts),
-                messages: vec![telos_model_gateway::Message {
-                    role: "user".to_string(),
-                    content: prompt,
-                }],
-                required_capabilities: telos_model_gateway::Capability {
-                    requires_vision: false,
-                    strong_reasoning: false, // Coding can often manage without strong reasoning if instructions are precise
-                },
-                budget_limit: 128_000,
-            };
-    
-            match self.gateway.generate(req.clone()).await {
-                Ok(res) => {
-                    let trace = telos_core::TraceLog::LlmCall {
-                        request: serde_json::to_value(&req).unwrap_or_else(|_| serde_json::json!({})),
-                        response: serde_json::to_value(&res).unwrap_or_else(|_| serde_json::json!({})),
-                    };
-                    let text = res.content.to_lowercase();
-                    // Determine if we need to escalate based on content (mocking validation failure)
-                    // In reality, if tests fail repeatedly we would escalate.
-                    if text.contains("i don't know") || text.contains("cannot complete") || text.contains("need help") || text.contains("stuck") {
-                        attempts += 1;
-                        if attempts < max_attempts {
-                            warn!("[CoderAgent] ⚠️ Worker stuck. Consulting Expert (Attempt {}/{})", attempts, max_attempts);
-                            let expert_prompt = format!(
-                                "You are a Senior Software Architect overseeing a junior CoderAgent.\n\
-                                The Coder is stuck on this task:\n{}\n\n\
-                                The Coder's last output/issue was:\n{}\n\n\
-                                Please provide concrete guidance, hints, or revised step-by-step instructions to help the Coder succeed. Be concise.",
-                                input.task, res.content
-                            );
+IMPORTANT RULES:
+- When using file_edit, provide search text that closely matches the existing file content
+- After editing, always verify with a compile/lint check
+- If a compile check fails, READ the error carefully and fix the specific issue
+- Do NOT repeat the same failing edit — adjust your approach
+- When done, provide a summary of all changes made
 
-                            let expert_req = telos_model_gateway::LlmRequest {
-                                session_id: format!("expert_help_{}_{}", input.node_id, attempts),
-                                messages: vec![telos_model_gateway::Message {
-                                    role: "user".to_string(),
-                                    content: expert_prompt,
-                                }],
-                                required_capabilities: telos_model_gateway::Capability {
-                                    requires_vision: false,
-                                    strong_reasoning: true, // Expert needs to reason
-                                },
-                                budget_limit: 128_000,
-                            };
+If you cannot complete the task with the available tools, explain what's blocking you."#
+        );
 
-                            if let Ok(expert_res) = self.gateway.generate(expert_req.clone()).await {
-                                info!("[CoderAgent] 🧠 Expert provided guidance. Retrying...");
-                                current_task_payload = format!(
-                                    "Original Task:\n{}\n\nExpert Guidance (Follow this carefully):\n{}",
-                                    input.task, expert_res.content
-                                );
-                                continue;
-                            }
-                        }
-                        
-                        error!("[CoderAgent] 🆘 Worker completely stuck after {} attempts. Escalating to Router/User.", attempts);
-                        return AgentOutput::help(
-                            "ImplementationBlock",
-                            &format!("Escalated after {} attempts. The instructions are ambiguous or I lack the necessary tool. Last output: {}", attempts, res.content),
-                            vec![
-                                "Clarify the precise architectural pattern to use".to_string(),
-                                "Provide the missing dependency or file path".to_string()
-                            ]
-                        ).with_trace(trace);
-                    } else {
-                        info!(
-                            "[CoderAgent] ✅ Implementation finished. ({} bytes)",
-                            res.content.len()
-                        );
-                        return AgentOutput::success(serde_json::json!({
-                            "text": res.content
-                        })).with_trace(trace);
+        // 3. Discover available coding tools
+        let available_tools = {
+            let guard = self.tool_registry.read().await;
+            // Get coding-relevant tools
+            let mut tools = guard.discover_tools(&input.task, 10);
+            // Also explicitly include core coding tools if not already discovered
+            let core_names = ["file_edit", "fs_read", "fs_write", "shell_exec", "lsp_tool", "glob"];
+            for name in &core_names {
+                if !tools.iter().any(|t| t.name == *name) {
+                    if let Some(schema) = guard.list_all_tools().into_iter().find(|t| t.name == *name) {
+                        tools.push(schema);
                     }
                 }
-                Err(e) => return AgentOutput::failure("CoderLLMError", &format!("LLM failed: {:?}", e)),
             }
-        }
+            tools
+        };
+
+        info!(
+            "[CoderAgent] Discovered {} tools: {:?}",
+            available_tools.len(),
+            available_tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+
+        // 4. Run the ReAct loop
+        let react = ReactLoop::new(
+            self.gateway.clone(),
+            self.tool_registry.clone(),
+            ReactConfig {
+                max_iterations: 20, // Coding tasks may need more iterations
+                max_consecutive_errors: 3,
+                max_duplicate_calls: 3,
+                session_id: format!("coder_{}", input.node_id),
+                budget_limit: 128_000,
+            },
+        );
+
+        let result = react.run(
+            system_prompt,
+            format!("Implementation Task:\n{}", input.task),
+            available_tools,
+        ).await;
+
+        info!(
+            "[CoderAgent] ReAct loop completed: {} iterations, {} tool calls, completed_normally={}",
+            result.iterations, result.tool_calls_made, result.completed_normally
+        );
+
+        ReactLoop::to_agent_output(result)
     }
 }
 

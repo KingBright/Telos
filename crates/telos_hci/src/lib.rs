@@ -170,6 +170,14 @@ impl ProgressInfo {
     }
 }
 
+/// A single clarification option presented to the user
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClarificationOption {
+    pub id: String,          // "opt_1", "opt_2" ...
+    pub label: String,       // "🔍 搜索信息"
+    pub description: String, // "新闻、天气、知识问答"
+}
+
 /// Detailed error information
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ErrorDetail {
@@ -267,6 +275,13 @@ pub enum AgentEvent {
         instruction: String,
         trace_id: Uuid,
     },
+    /// User's response to a clarification request
+    ClarificationResponse {
+        task_id: String,
+        selected_option_id: Option<String>,
+        free_text: Option<String>,
+        trace_id: Uuid,
+    },
     /// Change the log level at runtime
     SetLogLevel { level: LogLevel },
 }
@@ -279,6 +294,7 @@ impl AgentEvent {
             AgentEvent::UserApproval { trace_id, .. } => *trace_id,
             AgentEvent::ReplanRequested { trace_id, .. } => *trace_id,
             AgentEvent::UserIntervention { trace_id, .. } => *trace_id,
+            AgentEvent::ClarificationResponse { trace_id, .. } => *trace_id,
             AgentEvent::SetLogLevel { .. } => Uuid::nil(),
         }
     }
@@ -291,6 +307,7 @@ impl AgentEvent {
             AgentEvent::ReplanRequested { .. }
                 | AgentEvent::UserApproval { .. }
                 | AgentEvent::UserIntervention { .. }
+                | AgentEvent::ClarificationResponse { .. }
                 | AgentEvent::SetLogLevel { .. }
         )
     }
@@ -383,6 +400,16 @@ pub enum AgentFeedback {
         node_id: String,
         trace: telos_core::TraceLog,
     },
+
+    /// Agent needs user clarification to proceed (Always shown)
+    ClarificationNeeded {
+        task_id: String,
+        session_id: String,
+        /// Guiding text shown to the user
+        prompt: String,
+        /// Structured options (>=2), user can pick or type freely
+        options: Vec<ClarificationOption>,
+    },
 }
 
 // ============================================================================
@@ -396,6 +423,7 @@ impl AgentFeedback {
             // Always shown
             AgentFeedback::RequireHumanIntervention { .. }
             | AgentFeedback::TaskCompleted { .. }
+            | AgentFeedback::ClarificationNeeded { .. }
             | AgentFeedback::LogLevelChanged { .. } => LogLevel::Quiet,
 
             // Normal and above
@@ -431,6 +459,7 @@ impl AgentFeedback {
             | AgentFeedback::NodeNeedsHelp { task_id, .. }
             | AgentFeedback::Trace { task_id, .. }
             | AgentFeedback::ProgressUpdate { task_id, .. }
+            | AgentFeedback::ClarificationNeeded { task_id, .. }
             | AgentFeedback::TaskCompleted { task_id, .. } => Some(task_id),
             AgentFeedback::LogLevelChanged { .. } => None,
         }

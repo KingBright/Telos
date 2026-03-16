@@ -209,17 +209,38 @@ impl OpenAiProvider {
     }
 
     pub async fn generate_chat(&self, messages: Vec<serde_json::Value>) -> Result<String, ProviderError> {
+        let response = self.generate_chat_with_tools(messages, None).await?;
+        Ok(response.content)
+    }
+
+    /// Extended chat completion that supports tool calling.
+    /// Returns a structured response including content, tool_calls, and finish_reason.
+    pub async fn generate_chat_with_tools(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "model": self.llm_model,
             "messages": messages,
             "temperature": 0.7
         });
 
+        // Add tools to payload if provided
+        if let Some(ref tool_defs) = tools {
+            if !tool_defs.is_empty() {
+                payload["tools"] = serde_json::json!(tool_defs);
+            }
+        }
+
         // === DIAGNOSTIC: Request details ===
         info!("[OpenAiProvider] API Request: {} (Model: {})", url, self.llm_model);
         debug!("[OpenAiProvider] Messages count: {}", messages.len());
+        if let Some(ref t) = tools {
+            debug!("[OpenAiProvider] Tools count: {}", t.len());
+        }
         debug!("[OpenAiProvider] API Key: {}...{}",
             &self.api_key.chars().take(8).collect::<String>(),
             &self.api_key.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>());
@@ -265,20 +286,58 @@ impl OpenAiProvider {
             )
         })?;
 
-        let reply = json["choices"][0]["message"]["content"]
+        let message = &json["choices"][0]["message"];
+        let finish_reason = json["choices"][0]["finish_reason"]
             .as_str()
-            .ok_or_else(|| {
-                error!("[OpenAiProvider] ❌ INVALID FORMAT - Response JSON: {}", 
-                    serde_json::to_string_pretty(&json).unwrap_or_else(|_| "Failed to serialize".to_string()));
-                ProviderError::new("Invalid reply format from API", ProviderErrorKind::Other)
-            })?
+            .map(|s| s.to_string());
+
+        // Extract text content (may be null when tool_calls are present)
+        let content = message["content"]
+            .as_str()
+            .unwrap_or("")
             .to_string();
 
-        info!("[OpenAiProvider] ✅ SUCCESS - Response length: {} bytes", reply.len());
-        debug!("[OpenAiProvider] Response Content: {}", reply);
+        // Extract tool calls if present
+        let tool_calls = if let Some(tc_array) = message["tool_calls"].as_array() {
+            tc_array.iter().filter_map(|tc| {
+                let id = tc["id"].as_str()?.to_string();
+                let name = tc["function"]["name"].as_str()?.to_string();
+                let arguments = tc["function"]["arguments"].as_str()?.to_string();
+                Some(ToolCallResponse { id, name, arguments })
+            }).collect()
+        } else {
+            vec![]
+        };
 
-        Ok(reply)
+        info!("[OpenAiProvider] ✅ SUCCESS - Content: {} bytes, tool_calls: {}, finish_reason: {:?}",
+            content.len(), tool_calls.len(), finish_reason);
+        debug!("[OpenAiProvider] Response Content: {}", content);
+
+        Ok(ChatCompletionResponse {
+            content,
+            tool_calls,
+            finish_reason,
+        })
     }
+}
+
+/// Structured response from chat completion API, supporting both text and tool calls.
+#[derive(Debug, Clone)]
+pub struct ChatCompletionResponse {
+    /// Text content from the LLM (may be empty when tool_calls are present)
+    pub content: String,
+    /// Tool calls requested by the LLM
+    pub tool_calls: Vec<ToolCallResponse>,
+    /// Finish reason: "stop", "tool_calls", "length", etc.
+    pub finish_reason: Option<String>,
+}
+
+/// A tool call from the LLM response.
+#[derive(Debug, Clone)]
+pub struct ToolCallResponse {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[async_trait]
@@ -475,6 +534,7 @@ impl LlmProvider for GatewayLlmProvider {
                 strong_reasoning: false,
             },
             budget_limit: 1000,
+            tools: None,
         };
 
         let response = self

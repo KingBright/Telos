@@ -100,6 +100,7 @@ REQUIRED JSON STRUCTURE:
                 strong_reasoning: true,
             },
             budget_limit: 4000,
+            tools: None,
         };
 
         match self.gateway.generate(req.clone()).await {
@@ -165,6 +166,7 @@ REQUIRED JSON STRUCTURE:
                 ],
                 required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
                 budget_limit: 300,
+                tools: None,
             };
 
             let relevance_flags: Vec<bool> = match self.gateway.generate(classify_req).await {
@@ -239,6 +241,7 @@ REQUIRED JSON STRUCTURE:
                 strong_reasoning: false,
             },
             budget_limit: 2000,
+            tools: None,
         };
         match self.gateway.generate(req.clone()).await {
             Ok(res) => {

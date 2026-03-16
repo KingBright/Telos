@@ -54,6 +54,7 @@ Output ONLY a JSON object: {{ "queries": ["query1", "query2", ...] }}"#,
             ],
             required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: 500,
+            tools: None,
         };
 
         match self.gateway.generate(req).await {
@@ -207,6 +208,7 @@ Output JSON:
             ],
             required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: 1500,
+            tools: None,
         };
 
         match self.gateway.generate(req).await {
@@ -279,6 +281,7 @@ Output ONLY a JSON object: {{ "queries": ["query1", "query2", ...] }}"#,
             ],
             required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: 500,
+            tools: None,
         };
 
         match self.gateway.generate(req).await {

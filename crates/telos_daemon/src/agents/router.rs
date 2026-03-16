@@ -26,7 +26,7 @@ impl RouterAgent {
         let system_prompt = format!("{}{}", env_context, r#"You are the Telos Master Router acting as a strict Quality Assurance supervisor.
 Your job is to evaluate whether the Expert Agent's final output fully satisfies the User's original request.
 
-You MUST evaluate on THREE dimensions:
+You MUST evaluate on FIVE dimensions:
 
 1. "contains_answer" (bool): Does the output ACTUALLY CONTAIN a direct answer or result for the user's question?
    - TRUE: The output includes specific data, facts, a plan, calculation result, or actionable content.
@@ -38,14 +38,22 @@ You MUST evaluate on THREE dimensions:
    - TRUE: The output addresses the specific topic/entity/timeframe the user asked about.
    - FALSE: The output contains information about a different topic, wrong location, wrong time period, or generic filler unrelated to the request.
 
-3. "is_acceptable" (bool): Overall quality judgment. This can ONLY be true if BOTH contains_answer AND is_relevant are true.
+3. "is_clarification" (bool): Is the user's original request too vague/ambiguous for the agent to act on, AND does the Expert provide structured guidance?
+   - TRUE: The user's request is genuinely incomplete (e.g., "帮我", "继续", "你说呢", single-word commands without context), AND the Expert responds with specific options or categories to help narrow down the intent.
+   - FALSE: The user's request is clear enough to act on, regardless of what the Expert does.
+   - IMPORTANT: When is_clarification is true, is_acceptable MUST also be true (providing guidance for ambiguous input IS correct behavior).
 
-4. "critique" (string): If is_acceptable is false, provide a clear, constructive critique on what needs to be different. If is_acceptable is true, set to "".
+4. "is_acceptable" (bool): Overall quality judgment.
+   - TRUE if: (contains_answer AND is_relevant) OR is_clarification
+   - FALSE otherwise.
+
+5. "critique" (string): If is_acceptable is false, provide a clear, constructive critique on what needs to be different. If is_acceptable is true, set to "".
 
 CRITICAL RULES:
-- You MUST output a strictly valid JSON object with exactly these four keys.
+- You MUST output a strictly valid JSON object with exactly these five keys.
 - DO NOT INCLUDE ANY CONVERSATIONAL TEXT outside the JSON.
-- is_acceptable can NEVER be true if contains_answer is false.
+- is_acceptable can NEVER be true if contains_answer is false AND is_clarification is false.
+- is_clarification should be true ONLY when the user's input is genuinely ambiguous — NOT when the Expert lazily asks follow-up questions to a clear request.
 
 --- EXAMPLES ---
 
@@ -54,6 +62,7 @@ Expert: "Beijing weather today: 15°C, partly cloudy."
 {
   "contains_answer": true,
   "is_relevant": true,
+  "is_clarification": false,
   "is_acceptable": true,
   "critique": ""
 }
@@ -63,17 +72,19 @@ Expert: "I searched but could not find weather data. Here is some tourism info i
 {
   "contains_answer": false,
   "is_relevant": false,
+  "is_clarification": false,
   "is_acceptable": false,
   "critique": "The output does not contain any weather information. It provides irrelevant tourism data instead. Retry with a different search query specifically targeting weather forecasts."
 }
 
-User: "Recall my first question in this session."
-Expert: "I need you to provide the conversation history for context."
+User: "帮我"
+Expert: "你好！我可以帮你做很多事情，请告诉我你需要哪方面的帮助：\n🔍 搜索信息\n💻 编程开发\n📝 文档处理"
 {
   "contains_answer": false,
   "is_relevant": true,
-  "is_acceptable": false,
-  "critique": "The output asks the user for context instead of autonomously retrieving it from memory. As an agent, you must query your memory system to find the answer."
+  "is_clarification": true,
+  "is_acceptable": true,
+  "critique": ""
 }
 
 User: "2026年3月14日火星发生的爆炸新闻是什么？"
@@ -81,6 +92,7 @@ Expert: "经过搜索NASA、ESA等航天机构及主要新闻源，截至目前�
 {
   "contains_answer": true,
   "is_relevant": true,
+  "is_clarification": false,
   "is_acceptable": true,
   "critique": ""
 }
@@ -90,6 +102,7 @@ Expert: "抱歉，我无法获取相关信息。"
 {
   "contains_answer": false,
   "is_relevant": true,
+  "is_clarification": false,
   "is_acceptable": false,
   "critique": "The output simply states inability without any actual content. Retry with different search queries."
 }"#);
@@ -105,6 +118,7 @@ Expert: "抱歉，我无法获取相关信息。"
                 strong_reasoning: true,
             },
             budget_limit: 1000,
+            tools: None,
         };
 
         match self.gateway.generate(request.clone()).await {
@@ -295,6 +309,7 @@ User: "什么是快速排序算法？"
                 strong_reasoning: true, // We need good reasoning for routing
             },
             budget_limit: 1000,
+            tools: None,
         };
 
         match self.gateway.generate(request.clone()).await {

@@ -233,6 +233,9 @@ impl TelegramFeedbackFormatter {
                 new_level,
             } => Some(format!("📝 Log level: {:?} → {:?}", old_level, new_level)),
             AgentFeedback::Trace { .. } => None,
+            AgentFeedback::ClarificationNeeded { prompt, .. } => {
+                Some(format!("❓ <b>需要您的确认</b>\n\n{}", Self::truncate_for_telegram(prompt, 3500)))
+            }
         }
     }
 
@@ -386,28 +389,49 @@ impl TelegramBotProvider {
         if let Some(text) = msg.text() {
             let chat_id_str = msg.chat.id.to_string();
 
-            // Check for pending interaction (intervention)
+            // Check for pending interaction (clarification or intervention)
             let mut pending_map = pending_interactions.lock().await;
             if let Some((task_id, node_id)) = pending_map.remove(&chat_id_str) {
                 let client = Client::new();
-                let res = client
-                    .post(format!("{}/api/v1/intervention", daemon_url))
-                    .json(&json!({
-                        "task_id": task_id,
-                        "node_id": Some(node_id),
-                        "instruction": text
-                    }))
-                    .send()
-                    .await;
+                
+                if node_id == "clarification" {
+                    // This is a free-text clarification response
+                    let res = client
+                        .post(format!("{}/api/v1/clarify", daemon_url))
+                        .json(&json!({
+                            "task_id": task_id,
+                            "free_text": text
+                        }))
+                        .send()
+                        .await;
 
-                match res {
-                    Ok(r) if r.status().is_success() => {
-                        bot.send_message(msg.chat.id, "→ Response sent to agent.")
-                            .await?;
+                    match res {
+                        Ok(r) if r.status().is_success() => {
+                            bot.send_message(msg.chat.id, "→ 已收到您的回复。").await?;
+                        }
+                        _ => {
+                            bot.send_message(msg.chat.id, "❌ 发送回复失败。").await?;
+                        }
                     }
-                    _ => {
-                        bot.send_message(msg.chat.id, "❌ Failed to send response to daemon.")
-                            .await?;
+                } else {
+                    // Regular intervention
+                    let res = client
+                        .post(format!("{}/api/v1/intervention", daemon_url))
+                        .json(&json!({
+                            "task_id": task_id,
+                            "node_id": Some(node_id),
+                            "instruction": text
+                        }))
+                        .send()
+                        .await;
+
+                    match res {
+                        Ok(r) if r.status().is_success() => {
+                            bot.send_message(msg.chat.id, "→ Response sent to agent.").await?;
+                        }
+                        _ => {
+                            bot.send_message(msg.chat.id, "❌ Failed to send response to daemon.").await?;
+                        }
                     }
                 }
                 return Ok(());
@@ -528,6 +552,7 @@ impl TelegramBotProvider {
                                         } => task_id,
                                         AgentFeedback::NodeNeedsHelp { task_id, .. } => task_id,
                                         AgentFeedback::Output { task_id, .. } => task_id,
+                                        AgentFeedback::ClarificationNeeded { task_id, .. } => task_id,
                                         AgentFeedback::PlanCreated { task_id, .. } => task_id,
                                         AgentFeedback::NodeStarted { task_id, .. } => task_id,
                                         AgentFeedback::NodeCompleted { task_id, .. } => task_id,
@@ -591,6 +616,39 @@ impl TelegramBotProvider {
                                                         )
                                                         .await;
                                                 }
+                                            }
+                                            AgentFeedback::ClarificationNeeded {
+                                                task_id,
+                                                options,
+                                                prompt,
+                                                ..
+                                            } => {
+                                                // Build inline keyboard from options
+                                                let buttons: Vec<Vec<InlineKeyboardButton>> = options
+                                                    .chunks(2)
+                                                    .map(|chunk| {
+                                                        chunk.iter().map(|opt| {
+                                                            InlineKeyboardButton::callback(
+                                                                &opt.label,
+                                                                format!("clarify_{}_{}", task_id, opt.id),
+                                                            )
+                                                        }).collect()
+                                                    })
+                                                    .collect();
+                                                let keyboard = InlineKeyboardMarkup::new(buttons);
+                                                let escaped_prompt = teloxide::utils::html::escape(&prompt);
+                                                let _ = bot.send_message(
+                                                    chat_id,
+                                                    format!("❓ <b>需要您的确认</b>\n\n{}", escaped_prompt),
+                                                )
+                                                .parse_mode(teloxide::types::ParseMode::Html)
+                                                .reply_markup(keyboard)
+                                                .await;
+                                                // Also register for free-text fallback
+                                                pending_interactions.lock().await.insert(
+                                                    chat_id_str.clone(),
+                                                    (task_id.clone(), "clarification".to_string()),
+                                                );
                                             }
                                             _ => {
                                                 if let Some(formatted) = formatter.format(&feedback)
@@ -667,6 +725,43 @@ impl TelegramBotProvider {
 
     async fn handle_callback(bot: Bot, q: CallbackQuery, daemon_url: String) -> ResponseResult<()> {
         if let Some(data) = &q.data {
+            let client = Client::new();
+
+            // Handle clarify_ callbacks: format is "clarify_{task_id}_{option_id}"
+            if data.starts_with("clarify_") {
+                let rest = &data["clarify_".len()..];
+                // task_id contains dashes, option_id is like "opt_1"
+                // Find the last occurrence of "_opt_" to split
+                if let Some(pos) = rest.rfind("_opt_") {
+                    let task_id = &rest[..pos];
+                    let option_id = &rest[pos+1..]; // "opt_N"
+                    
+                    let res = client
+                        .post(format!("{}/api/v1/clarify", daemon_url))
+                        .json(&json!({
+                            "task_id": task_id,
+                            "selected_option_id": option_id,
+                        }))
+                        .send()
+                        .await;
+
+                    match res {
+                        Ok(r) if r.status().is_success() => {
+                            bot.answer_callback_query(q.id.clone())
+                                .text("选择已发送")
+                                .await?;
+                        }
+                        _ => {
+                            bot.answer_callback_query(q.id.clone())
+                                .text("发送选择失败")
+                                .show_alert(true)
+                                .await?;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
             let parts: Vec<&str> = data.split('_').collect();
             if parts.len() == 2 {
                 let action = parts[0];

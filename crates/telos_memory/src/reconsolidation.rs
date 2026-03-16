@@ -37,6 +37,7 @@ pub async fn consolidate_memories(
                     ],
                     required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
                     budget_limit: 100,
+                    tools: None,
                 };
 
                 if let Ok(res) = gw.generate(req).await {

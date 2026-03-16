@@ -99,6 +99,7 @@ Do not include markdown wrappers if possible, just the raw JSON."#);
                 strong_reasoning: true, // Architect prefers strong reasoning for planning MAD
             },
             budget_limit: 128_000,
+            tools: None,
         };
 
         match self.gateway.generate(req.clone()).await {
@@ -156,29 +157,98 @@ Do not include markdown wrappers if possible, just the raw JSON."#);
         }
     }
 
-    async fn summarize(&self, _input: &AgentInput, _registry: &dyn SystemRegistry) -> AgentOutput {
-        let mut final_text = String::new();
-        
-        for (node_id, output) in &_input.dependencies {
+    async fn summarize(&self, input: &AgentInput, _registry: &dyn SystemRegistry) -> AgentOutput {
+        // 1. Collect raw results from dependencies (injected by main.rs from DAG terminal nodes)
+        let mut raw_results = Vec::new();
+        for (node_id, output) in &input.dependencies {
             if let Some(val) = &output.output {
-                if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
-                    final_text.push_str(&format!("--- Output from {} ---\n{}\n\n", node_id, text));
-                } else if let Some(code) = val.get("code").and_then(|v| v.as_str()) {
-                    final_text.push_str(&format!("--- Code from {} ---\n{}\n\n", node_id, code));
-                } else {
-                    final_text.push_str(&format!("--- Result from {} ---\n{}\n\n", node_id, val));
+                let text = val.get("text").and_then(|v| v.as_str())
+                    .or_else(|| val.get("code").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| val.to_string());
+                if !text.is_empty() {
+                    raw_results.push((node_id.clone(), text));
                 }
             }
         }
-        
-        let mut final_text = final_text.trim().to_string();
-        if final_text.is_empty() {
-             final_text = "Architect successfully orchestrated the workflow, but no explicit text output was returned by sub-nodes.".to_string();
+
+        if raw_results.is_empty() {
+            return AgentOutput::success(serde_json::json!({
+                "text": "任务已执行，但子节点未产生文本输出。"
+            }));
         }
 
-        AgentOutput::success(serde_json::json!({
-            "text": final_text
-        }))
+        // 2. If there's only one result and it's already substantial, pass through directly
+        if raw_results.len() == 1 {
+            let (_, text) = &raw_results[0];
+            // Strip JSON wrapping like [node_id] prefix if present
+            let clean = text.trim_start_matches('[')
+                .find(']')
+                .map(|i| text[i+1..].trim())
+                .unwrap_or(text.as_str());
+            // If it looks like already formatted content, pass through
+            if clean.len() > 50 {
+                return AgentOutput::success(serde_json::json!({"text": clean}));
+            }
+        }
+
+        // 3. Use LLM to synthesize multiple results into a user-facing response
+        let env_context = if let Some(ctx) = _registry.get_system_context() {
+            format!("[ENVIRONMENT CONTEXT]\nLocal Time: {}\nPhysical Location: {}\n\n", ctx.current_time, ctx.location)
+        } else {
+            String::new()
+        };
+
+        let results_text = raw_results.iter()
+            .map(|(id, text)| format!("[{}]:\n{}", id, text))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+
+        let system_prompt = format!("{}You are a helpful AI assistant. Your task is to synthesize execution results into a clear, well-formatted response for the user.\n\nRules:\n- Output the final content DIRECTLY — do not say \"based on the results\" or \"the execution produced\"\n- Preserve code blocks, tables, and formatting from the source content\n- If the content is code, present it properly with explanations\n- Use the user's language (Chinese if the request is in Chinese)\n- Be concise but complete", env_context);
+
+        let req = LlmRequest {
+            session_id: format!("architect_summary_{}", input.node_id),
+            messages: vec![
+                Message { role: "system".to_string(), content: system_prompt },
+                Message {
+                    role: "user".to_string(),
+                    content: format!(
+                        "用户请求: {}\n\n执行节点输出:\n{}\n\n请整合为面向用户的完整回复。",
+                        input.task, results_text
+                    ),
+                },
+            ],
+            required_capabilities: Capability {
+                requires_vision: false,
+                strong_reasoning: false,
+            },
+            budget_limit: 4000,
+            tools: None,
+        };
+
+        match self.gateway.generate(req).await {
+            Ok(res) => {
+                let content = res.content.trim().to_string();
+                if content.is_empty() {
+                    // Fallback: return raw results
+                    let fallback = raw_results.iter()
+                        .map(|(_, text)| text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    AgentOutput::success(serde_json::json!({"text": fallback}))
+                } else {
+                    AgentOutput::success(serde_json::json!({"text": content}))
+                }
+            }
+            Err(_) => {
+                // LLM failed, fall back to raw concatenation
+                let fallback = raw_results.iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                AgentOutput::success(serde_json::json!({"text": fallback}))
+            }
+        }
     }
 }
 

@@ -19,18 +19,47 @@ pub struct Capability {
     pub strong_reasoning: bool,
 }
 
+/// Definition of a tool that can be passed to the LLM for function calling.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// A tool call request returned by the LLM when it decides to invoke a tool.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallRequest {
+    /// Unique ID for this tool call (used to match results back)
+    pub id: String,
+    /// Name of the tool to invoke
+    pub name: String,
+    /// JSON-encoded arguments string
+    pub arguments: String,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LlmRequest {
     pub session_id: String,
     pub messages: Vec<Message>,
     pub required_capabilities: Capability,
     pub budget_limit: usize,
+    /// Optional tool definitions for LLM function calling.
+    /// When provided, the LLM may return tool_calls instead of content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDefinition>>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LlmResponse {
     pub content: String,
     pub tokens_used: usize,
+    /// Tool calls requested by the LLM (empty if the LLM returned text content)
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallRequest>,
+    /// Finish reason from the API: "stop", "tool_calls", "length", etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 /// 网络错误类型细分
@@ -247,6 +276,8 @@ mod tests {
             Ok(LlmResponse {
                 content: "Success".to_string(),
                 tokens_used: req.budget_limit,
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
             })
         }
     }
@@ -257,6 +288,7 @@ mod tests {
             messages: vec![],
             required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: budget,
+            tools: None,
         }
     }
 

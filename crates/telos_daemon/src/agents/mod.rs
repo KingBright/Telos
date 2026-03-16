@@ -3,6 +3,7 @@ pub mod coder;
 pub mod evolutor;
 pub mod general;
 pub mod prompt_builder;
+pub mod react_loop;
 pub mod researcher;
 pub mod reviewer;
 pub mod router;

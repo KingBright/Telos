@@ -62,17 +62,39 @@ impl ModelProvider for GatewayAdapter {
             );
         }
 
-        match self.inner.generate_chat(messages).await {
-            Ok(content) => {
+        // Convert tools from LlmRequest to OpenAI format
+        let tools = req.tools.as_ref().map(|tool_defs| {
+            tool_defs.iter().map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters
+                    }
+                })
+            }).collect::<Vec<_>>()
+        });
+
+        match self.inner.generate_chat_with_tools(messages, tools).await {
+            Ok(resp) => {
                 // Approximate tokens: ~4 chars per token
                 let mut total_len = 0;
                 for m in &req.messages {
                     total_len += m.content.len();
                 }
-                let estimated_tokens = (total_len + content.len()) / 4;
+                let estimated_tokens = (total_len + resp.content.len()) / 4;
                 Ok(LlmResponse {
-                    content,
+                    content: resp.content,
                     tokens_used: std::cmp::min(estimated_tokens, req.budget_limit),
+                    tool_calls: resp.tool_calls.into_iter().map(|tc| {
+                        telos_model_gateway::ToolCallRequest {
+                            id: tc.id,
+                            name: tc.name,
+                            arguments: tc.arguments,
+                        }
+                    }).collect(),
+                    finish_reason: resp.finish_reason,
                 })
             }
             Err(e) => {
@@ -157,6 +179,7 @@ impl telos_dag::engine::NodeFactory for DaemonNodeFactory {
             "architect" => Some(Box::new(ArchitectAgent::new(self.gateway.clone())) as Box<dyn ExecutableNode>),
             "coder" => Some(Box::new(CoderAgent::new(
                 self.gateway.clone(),
+                self.tool_registry.clone(),
                 self.tools_dir.clone(),
             )) as Box<dyn ExecutableNode>),
             "reviewer" => Some(Box::new(ReviewAgent::new(self.gateway.clone())) as Box<dyn ExecutableNode>),
@@ -195,6 +218,175 @@ fn truncate_for_preview(s: &str, max_len: usize) -> String {
         format!("{}...", truncated)
     } else {
         s.to_string()
+    }
+}
+
+/// Parse structured clarification options from agent response text.
+/// Looks for emoji-prefixed lines like "🔍 搜索信息" or "- 搜索信息".
+/// Falls back to default options if none detected.
+fn parse_clarification_options(response: &str) -> Vec<telos_hci::ClarificationOption> {
+    let mut options = Vec::new();
+    let mut idx = 0;
+    
+    for line in response.lines() {
+        let trimmed = line.trim();
+        // Match lines starting with emoji, bullet, or number
+        let is_option = trimmed.starts_with('•') 
+            || trimmed.starts_with('-') 
+            || trimmed.starts_with('*')
+            || trimmed.chars().next().map(|c| !c.is_ascii() && !c.is_ascii_punctuation()).unwrap_or(false);
+        
+        if is_option && trimmed.len() > 2 {
+            idx += 1;
+            let label = trimmed.trim_start_matches(|c: char| c == '•' || c == '-' || c == '*' || c == ' ').trim().to_string();
+            if !label.is_empty() {
+                options.push(telos_hci::ClarificationOption {
+                    id: format!("opt_{}", idx),
+                    label: label.clone(),
+                    description: String::new(),
+                });
+            }
+        }
+    }
+    
+    // If we didn't find structured options, provide defaults
+    if options.is_empty() {
+        options = vec![
+            telos_hci::ClarificationOption { id: "opt_1".into(), label: "🔍 搜索信息".into(), description: "新闻、天气、知识问答".into() },
+            telos_hci::ClarificationOption { id: "opt_2".into(), label: "💻 编程开发".into(), description: "编写、调试、审查代码".into() },
+            telos_hci::ClarificationOption { id: "opt_3".into(), label: "📝 文档处理".into(), description: "写作、翻译、摘要".into() },
+            telos_hci::ClarificationOption { id: "opt_4".into(), label: "📅 任务规划".into(), description: "计划、日程、方案设计".into() },
+            telos_hci::ClarificationOption { id: "opt_5".into(), label: "🧮 计算分析".into(), description: "数学、数据、逻辑推理".into() },
+        ];
+    }
+    
+    options
+}
+
+/// Extracts user preferences, personal facts, and habits from a conversation
+/// using LLM, then stores new facts as UserProfile memories (with deduplication).
+async fn extract_and_store_user_profile(
+    conversation: &str,
+    gateway: Arc<GatewayManager>,
+    memory_os: std::sync::Arc<telos_memory::RedbGraphStore>,
+) {
+    use telos_model_gateway::{Capability, LlmRequest, Message, ModelGateway};
+
+    let extraction_prompt = format!(
+        r#"Analyze the following conversation between a user and an AI assistant.
+Extract ANY new personal information, preferences, habits, or facts about the user.
+
+RULES:
+- Extract ONLY facts about the USER (not the assistant)
+- Each fact should be a single, concise statement
+- Include: name, location, language preferences, work/profession, interests, habits, communication style, technical skill level, project details they mentioned
+- Do NOT extract transient requests (e.g., "user asked about weather" is NOT a preference)
+- DO extract persistent traits (e.g., "User prefers Chinese language responses", "User is a software developer", "User's project is called Telos")
+- If NO new user information is found, return an empty array
+
+Output ONLY a valid JSON object:
+{{"facts": ["fact1", "fact2", ...]}}
+
+Conversation:
+{}
+"#,
+        conversation
+    );
+
+    let request = LlmRequest {
+        session_id: "profile_extraction".to_string(),
+        messages: vec![
+            Message { role: "system".into(), content: "You are a precise information extraction system. Output only valid JSON.".into() },
+            Message { role: "user".into(), content: extraction_prompt },
+        ],
+        required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
+        budget_limit: 1000,
+        tools: None,
+    };
+
+    let llm_result = gateway.generate(request).await;
+    let response_text = match llm_result {
+        Ok(r) => r.content,
+        Err(e) => {
+            debug!("[UserProfile] LLM extraction failed: {:?}", e);
+            return;
+        }
+    };
+
+    // Parse JSON response
+    let cleaned = response_text.trim().trim_start_matches("```json").trim_end_matches("```").trim();
+    let parsed: serde_json::Value = match serde_json::from_str(cleaned) {
+        Ok(v) => v,
+        Err(_) => {
+            debug!("[UserProfile] Failed to parse LLM extraction output: {}", &response_text[..response_text.len().min(200)]);
+            return;
+        }
+    };
+
+    let facts = match parsed.get("facts").and_then(|f| f.as_array()) {
+        Some(arr) => arr,
+        None => {
+            debug!("[UserProfile] No 'facts' array in extraction output");
+            return;
+        }
+    };
+
+    if facts.is_empty() {
+        debug!("[UserProfile] No new user facts extracted from conversation");
+        return;
+    }
+
+    // Load existing UserProfile entries for deduplication
+    let existing_profiles: Vec<String> = if let Ok(results) = memory_os.retrieve(
+        telos_memory::MemoryQuery::TimeRange { start: 0, end: u64::MAX }
+    ).await {
+        results.iter()
+            .filter(|e| e.memory_type == telos_memory::MemoryType::UserProfile)
+            .map(|e| e.content.to_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let mut stored_count = 0;
+    for (i, fact_val) in facts.iter().enumerate() {
+        if let Some(fact) = fact_val.as_str() {
+            let fact_trimmed = fact.trim();
+            if fact_trimmed.is_empty() {
+                continue;
+            }
+            // Deduplication: skip if a similar fact already exists
+            let fact_lower = fact_trimmed.to_lowercase();
+            if existing_profiles.iter().any(|existing| {
+                existing.contains(&fact_lower) || fact_lower.contains(existing.as_str())
+            }) {
+                debug!("[UserProfile] Skipping duplicate fact: {}", fact_trimmed);
+                continue;
+            }
+
+            let entry = telos_memory::MemoryEntry::new(
+                format!("profile_{}_{}", timestamp, i),
+                telos_memory::MemoryType::UserProfile,
+                fact_trimmed.to_string(),
+                timestamp,
+                None, // Embedding will be auto-generated by engine.rs store()
+            );
+
+            if let Err(e) = memory_os.store(entry).await {
+                debug!("[UserProfile] Failed to store fact: {:?}", e);
+            } else {
+                stored_count += 1;
+            }
+        }
+    }
+
+    if stored_count > 0 {
+        info!("[UserProfile] ✅ Extracted and stored {} new user profile facts", stored_count);
     }
 }
 
@@ -239,6 +431,7 @@ impl ExecutableNode for LlmPromptNode {
                 strong_reasoning: false,
             },
             budget_limit: 1000,
+            tools: None,
         };
 
         match self.gateway.generate(request.clone()).await {
@@ -749,9 +942,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // This bridges headless CLI calls and daemon restarts
                                 if let Some(mem_any) = registry_clone.get_memory_os() {
                                     if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
-                                        let one_hour_ago = current_ms.saturating_sub(3600_000);
+                                        let twenty_four_hours_ago = current_ms.saturating_sub(86_400_000);
                                         if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange {
-                                            start: one_hour_ago,
+                                            start: twenty_four_hours_ago,
                                             end: current_ms,
                                         }).await {
                                             let mut interaction_entries: Vec<&telos_memory::MemoryEntry> = results.iter()
@@ -761,11 +954,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             interaction_entries.sort_by_key(|e| e.created_at);
                                             if !interaction_entries.is_empty() {
                                                 recent_history_text.push_str("[GLOBAL CONVERSATION HISTORY (from persistent memory)]\nThe user has interacted with you recently. Interactions are numbered chronologically (#1 = first/earliest). Use this to resolve references like \"第一个问题\" or \"之前\":\n");
-                                                for (i, entry) in interaction_entries.iter().take(10).enumerate() {
+                                                for (i, entry) in interaction_entries.iter().take(30).enumerate() {
                                                     recent_history_text.push_str(&format!("#{}: {}\n", i + 1, entry.content));
                                                 }
                                                 recent_history_text.push('\n');
-                                                debug!("[Daemon] Preloaded {} interaction events from persistent memory", interaction_entries.len());
+                                                debug!("[Daemon] Preloaded {} interaction events from persistent memory (24h window)", interaction_entries.len());
                                             }
                                         }
                                     }
@@ -777,6 +970,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 timestamp: current_ms,
                                 message: format!("User: {}", payload),
                             });
+                        }
+                        // ----------------------------------------
+
+                        // --- USER PROFILE INJECTION (Long-Term User Knowledge) ---
+                        {
+                            if let Some(mem_any) = registry_clone.get_memory_os() {
+                                if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+                                    // Load ALL UserProfile memories (these are permanent user facts)
+                                    if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange {
+                                        start: 0,
+                                        end: u64::MAX,
+                                    }).await {
+                                        let profile_entries: Vec<&telos_memory::MemoryEntry> = results.iter()
+                                            .filter(|e| e.memory_type == telos_memory::MemoryType::UserProfile)
+                                            .collect();
+                                        if !profile_entries.is_empty() {
+                                            recent_history_text.push_str("[USER PROFILE — PERSISTENT KNOWLEDGE ABOUT YOUR OWNER]\nThe following are facts, preferences, and personal information you have learned about the user (your 主人) through past interactions. Use this to personalize your responses:\n");
+                                            for entry in &profile_entries {
+                                                recent_history_text.push_str(&format!("• {}\n", entry.content));
+                                            }
+                                            recent_history_text.push('\n');
+                                            debug!("[Daemon] Injected {} UserProfile facts into router context", profile_entries.len());
+                                        }
+                                    }
+                                }
+                            }
                         }
                         // ----------------------------------------
 
@@ -1142,7 +1361,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if let Some(mem_any) = registry_clone.get_memory_os() {
                                         if let Ok(mem_os) = mem_any.downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
                                             let conversation = format!("[User]: {}\n[Assistant ({} Persona)]: {}", payload, config.router_persona_name, direct_reply);
-                                            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                                            let conv_for_profile = conversation.clone();
+                                            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
                                             let entry = telos_memory::MemoryEntry::new(
                                                 uuid::Uuid::new_v4().to_string(),
                                                 telos_memory::MemoryType::InteractionEvent,
@@ -1153,6 +1373,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             if let Err(e) = mem_os.store(entry).await {
                                                 error!("[Daemon] Failed to store direct reply interaction memory: {:?}", e);
                                             }
+                                            // Background: Extract user preferences from this conversation
+                                            let gw_for_profile = gateway_clone.clone();
+                                            let mem_for_profile = registry_clone.memory_os.clone();
+                                            tokio::spawn(async move {
+                                                extract_and_store_user_profile(&conv_for_profile, gw_for_profile, mem_for_profile).await;
+                                            });
                                         }
                                     }
 
@@ -1390,11 +1616,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 let summary_input = telos_core::AgentInput {
                                     node_id: "expert_summary".to_string(),
-                                    task: format!(
-                                        "Original request: {}\n\nExecution Results:\n{}",
-                                        payload, combined_result
-                                    ),
-                                    dependencies: std::collections::HashMap::new(),
+                                    task: payload.to_string(),
+                                    dependencies: {
+                                        let mut deps = std::collections::HashMap::new();
+                                        deps.insert("dag_results".to_string(), AgentOutput::success(
+                                            serde_json::json!({"text": combined_result})
+                                        ));
+                                        deps
+                                    },
                                     schema_payload: None,
                                     memory_context: router_input.memory_context.clone(),
                                     correction: None,
@@ -1442,9 +1671,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if eval_output.success {
                                     if let Some(json) = eval_output.output {
                                         let is_acceptable = json.get("is_acceptable").and_then(|v| v.as_bool()).unwrap_or(false);
+                                        let is_clarification = json.get("is_clarification").and_then(|v| v.as_bool()).unwrap_or(false);
                                         let critique = json.get("critique").and_then(|v| v.as_str()).unwrap_or("");
                                         
-                                        if is_acceptable || attempt == MAX_ATTEMPTS {
+                                        if is_clarification {
+                                            // Clarification is a valid response — send ClarificationNeeded and complete
+                                            debug!("[Daemon] QA identified clarification response — delivering to user.");
+                                            loop_qa_accepted = true;
+                                            
+                                            // Parse options from the response text — build structured options
+                                            let options = parse_clarification_options(&final_response);
+                                            broker_bg.publish_feedback(AgentFeedback::ClarificationNeeded {
+                                                task_id: trace_id.to_string(),
+                                                session_id: session_id.clone(),
+                                                prompt: final_response.clone(),
+                                                options,
+                                            });
+                                            break;
+                                        } else if is_acceptable || attempt == MAX_ATTEMPTS {
                                             loop_qa_accepted = is_acceptable;
                                             if !is_acceptable {
                                                 debug!("[Daemon] Max attempts reached despite router rejection. Proceeding anyway.");
@@ -1462,14 +1706,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 silent: false,
                                             });
                                             enriched_payload = format!(
-                                                "Task:\n{}\n\n[SYSTEM DIRECTIVE — MANDATORY]\n\
+                                                "Task:\n{}\n\n[PERSONA CONTEXT]\n{}\n\n[SYSTEM DIRECTIVE — MANDATORY]\n\
                                                  Your previous attempt was REJECTED by the QA evaluator.\n\
                                                  Critique: {}\n\n\
                                                  You MUST autonomously retry with an improved strategy.\n\
                                                  DO NOT ask the user for permission, clarification, or confirmation.\n\
                                                  DO NOT say 'if you want me to continue' or similar phrases.\n\
                                                  Execute the corrected approach IMMEDIATELY and deliver the result.",
-                                                payload, critique
+                                                payload, agents::prompt_builder::get_soul(), critique
                                             );
                                         }
                                     } else {
@@ -1506,7 +1750,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
                             // --- INTERACTION EVENT PERSISTENCE (Global Long-Term Memory) ---
                             let interaction_content = format!("User: {}\nAssistant: {}", payload, loop_final_response);
-                            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
                             let interaction_entry = telos_memory::MemoryEntry::new(
                                 format!("interaction_{}_{}", session_id, timestamp),
                                 telos_memory::MemoryType::InteractionEvent,
@@ -1516,12 +1760,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
 
                             let memory_clone = registry_clone.memory_os.clone();
+                            let session_id_for_mem = session_id.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = memory_clone.store(interaction_entry).await {
-                                    debug!("[Daemon] ⚠️ Failed to store InteractionEvent for session {}: {}", session_id, e);
+                                    debug!("[Daemon] ⚠️ Failed to store InteractionEvent for session {}: {}", session_id_for_mem, e);
                                 } else {
                                     debug!("[Daemon] 📥 Successfully archived global InteractionEvent.");
                                 }
+                            });
+
+                            // --- USER PROFILE EXTRACTION (Background) ---
+                            let gw_for_profile = gateway_clone.clone();
+                            let mem_for_profile = registry_clone.memory_os.clone();
+                            let conv_for_profile = interaction_content;
+                            tokio::spawn(async move {
+                                extract_and_store_user_profile(&conv_for_profile, gw_for_profile, mem_for_profile).await;
                             });
 
                             // --- EVOLUTION & MEMORY INTEGRATION LOOP ---
@@ -1764,6 +2017,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/run_sync", post(handle_run_sync))
         .route("/api/v1/approve", post(handle_approve))
         .route("/api/v1/intervention", post(handle_intervention))
+        .route("/api/v1/clarify", post(handle_clarify))
         .route("/api/v1/stream", get(ws_handler))
         .route("/api/v1/log-level", get(get_log_level).post(set_log_level))
         .route("/api/v1/traces", get(get_traces))
@@ -1860,6 +2114,13 @@ async fn handle_run_sync(
                         yield Ok(Event::default().event("heartbeat").data(content));
                     }
                 }
+                AgentFeedback::ClarificationNeeded { task_id, prompt, options, .. } if task_id == trace_id_str => {
+                    let data = serde_json::json!({
+                        "prompt": prompt,
+                        "options": options,
+                    });
+                    yield Ok(Event::default().event("clarification").data(data.to_string()));
+                }
                 _ => {}
             }
         }
@@ -1918,6 +2179,38 @@ async fn handle_intervention(
 
     Json(InterventionResponse {
         status: "intervention received".into(),
+    })
+}
+
+#[derive(serde::Deserialize)]
+pub struct ClarifyRequest {
+    pub task_id: String,
+    pub selected_option_id: Option<String>,
+    pub free_text: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ClarifyResponse {
+    pub status: String,
+}
+
+async fn handle_clarify(
+    State(state): State<AppState>,
+    Json(req): Json<ClarifyRequest>,
+) -> Json<ClarifyResponse> {
+    let trace_id = Uuid::new_v4();
+    let _ = state
+        .broker
+        .publish_event(AgentEvent::ClarificationResponse {
+            task_id: req.task_id,
+            selected_option_id: req.selected_option_id,
+            free_text: req.free_text,
+            trace_id,
+        })
+        .await;
+
+    Json(ClarifyResponse {
+        status: "clarification received".into(),
     })
 }
 
