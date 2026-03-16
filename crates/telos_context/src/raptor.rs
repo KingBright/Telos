@@ -1,4 +1,4 @@
-use crate::clustering::{cosine_similarity, kmeans_cluster, parse_into_edus, Edu};
+use crate::clustering::{cosine_similarity, gmm_soft_cluster, parse_into_edus, Edu};
 use crate::providers::{EmbeddingProvider, LlmProvider};
 use std::sync::Arc;
 
@@ -21,6 +21,8 @@ impl RaptorTree {
     }
 
     /// Recursively clusters and summarizes nodes to build the RAPTOR tree bottom-up.
+    /// Uses GMM soft clustering so EDUs can appear in multiple cluster summaries,
+    /// preserving cross-topic context that hard K-Means assignment would lose.
     pub async fn build(
         &mut self,
         text: &str,
@@ -57,18 +59,21 @@ impl RaptorTree {
 
             // Heuristic for k: roughly 5 items per cluster, minimum 1
             let k = (current_level_nodes.len() / 5).max(1);
-            let clusters = kmeans_cluster(&current_level_nodes, k, 10);
+            // GMM soft clustering: EDUs with responsibility > 0.15 can appear in multiple clusters
+            let clusters = gmm_soft_cluster(&current_level_nodes, k, 20, 0.15);
 
             let mut next_level_nodes = Vec::new();
 
-            for (cluster_id, edu_ids) in clusters {
-                // Gather text from all children in this cluster
+            for (cluster_id, members) in clusters {
+                // Gather text from all children in this cluster (weighted by responsibility)
                 let mut cluster_text = String::new();
-                for id in &edu_ids {
+                let mut children_ids = Vec::new();
+                for (id, _weight) in &members {
                     if let Some(node) = current_level_nodes.iter().find(|n| n.id == *id) {
                         cluster_text.push_str(&node.text);
                         cluster_text.push(' ');
                     }
+                    children_ids.push(id.clone());
                 }
 
                 // Summarize the cluster
@@ -89,7 +94,7 @@ impl RaptorTree {
                     id: new_node_id.clone(),
                     text: summary.clone(),
                     embedding: summary_embedding.clone(),
-                    children_ids: edu_ids.clone(),
+                    children_ids: children_ids.clone(),
                     level: current_level,
                 };
 

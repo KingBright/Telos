@@ -1350,6 +1350,71 @@ impl WebSearchTool {
         Ok(results)
     }
 
+    /// 使用百度资讯搜索 (Baidu News) — 适合实时天气、新闻、赛事安排
+    async fn search_baidu_news(query: &str, client: &reqwest::Client) -> Result<Vec<SearchResult>, ToolError> {
+        let encoded_query = urlencoding::encode(query);
+        // tn=news: news search, rtt=1: sort by date (newest first), bsst=1: show time, cl=2: search news
+        let search_url = format!("https://www.baidu.com/s?tn=news&rtt=1&bsst=1&cl=2&wd={}", encoded_query);
+        let html = Self::fetch_html(client, &search_url, "zh-CN,zh;q=0.9").await?;
+
+        let document = scraper::Html::parse_document(&html);
+
+        // Strategy 1: CSS selectors for Baidu News
+        let result_selectors = [".result-op", ".result"];
+        let mut results = Vec::new();
+
+        for sel_str in &result_selectors {
+            if let Ok(result_sel) = scraper::Selector::parse(sel_str) {
+                let title_sel = scraper::Selector::parse("h3.news-title a, h3.c-title a").unwrap();
+                let snippet_sel = scraper::Selector::parse(".c-summary, .news-summary, span.c-font-normal, span.c-color-text").unwrap();
+
+                for result in document.select(&result_sel).take(10) {
+                    let title_elem = result.select(&title_sel).next();
+                    let title = title_elem
+                        .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
+                        .unwrap_or_default();
+                    let url = title_elem
+                        .and_then(|e| e.value().attr("href"))
+                        .unwrap_or("")
+                        .to_string();
+                    let snippet = result.select(&snippet_sel).next()
+                        .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
+                        .unwrap_or_default();
+
+                    if !title.is_empty() {
+                        results.push(SearchResult { title, url, snippet });
+                    }
+                }
+                if !results.is_empty() {
+                    return Ok(results);
+                }
+            }
+        }
+
+        // Strategy 2: fallback string matching for news
+        debug!("[WebSearch] Baidu News CSS selectors found nothing. HTML len={}", html.len());
+        for line in html.split('\n') {
+            if line.contains("class=\"c-summary\"") || line.contains("class=\"news-title\"") {
+                let clean = line.replace("<em>", "").replace("</em>", "").replace("&nbsp;", " ");
+                let text: String = clean.chars()
+                    .skip_while(|c| *c != '>')
+                    .skip(1)
+                    .take_while(|c| *c != '<')
+                    .collect();
+                let trimmed = text.trim().to_string();
+                if !trimmed.is_empty() && trimmed.len() > 10 {
+                    results.push(SearchResult { title: String::new(), url: String::new(), snippet: trimmed });
+                }
+            }
+        }
+        if !results.is_empty() {
+            info!("[WebSearch] Baidu News fallback parser found {} results", results.len());
+        } else {
+            debug!("[WebSearch] Baidu News no results. HTML preview: {}", &html.chars().take(300).collect::<String>());
+        }
+        Ok(results)
+    }
+
     /// 使用百度搜索 — CSS selector + fallback
     async fn search_baidu(query: &str, client: &reqwest::Client) -> Result<Vec<SearchResult>, ToolError> {
         let encoded_query = urlencoding::encode(query);
@@ -1587,10 +1652,13 @@ impl ToolExecutor for WebSearchTool {
             // 1. Bing CN — ALWAYS direct (domestic, fast, 0.3s typical)
             try_engine!("Bing CN", search_bing, &direct_client);
             
-            // 2. Baidu — ALWAYS direct (domestic, reliable)
+            // 2. Baidu News — for real-time events, weather, news
+            try_engine!("Baidu News", search_baidu_news, &direct_client);
+            
+            // 3. Baidu (Web) — fallback for general knowledge
             try_engine!("Baidu", search_baidu, &direct_client);
             
-            // 3. DuckDuckGo — ONLY through proxy (blocked in China without proxy)
+            // 4. DuckDuckGo — ONLY through proxy (blocked in China without proxy)
             if let Some(ref pc) = proxy_client {
                 try_engine!("DuckDuckGo", search_duckduckgo, pc);
             }

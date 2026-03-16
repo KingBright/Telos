@@ -44,12 +44,10 @@ impl ExpertAgent for GeneralAgent {
         info!("[GeneralAgent] Discovered {} tools: {:?}", tools.len(), tools.iter().map(|t| &t.name).collect::<Vec<_>>());
 
         // 2. Build system prompt using PromptBuilder (lazy tool loading)
-        let system_prompt = PromptBuilder::new()
-            .with_identity()
-            .with_environment(_registry)
-            .with_memory(&input.memory_context)
-            .with_tools_lazy(&tools)
-            .with_role_instructions(r#"You are the GeneralAgent expert for the Telos system. Your job is to solve the user's task by planning a sequence of tool calls.
+        let soul_content = crate::agents::prompt_builder::get_soul();
+        let persona_prefix = format!("[IDENTITY & VALUES]\n{}\n\nYou MUST respond as the persona described above. NEVER call yourself 'GeneralAgent' or reveal internal agent names.\n\n", soul_content);
+
+        let role_instructions = format!(r#"{}You are an internal planning engine for the Telos system. Your job is to solve the user's task by planning a sequence of tool calls.
 
 SPECIAL AGENT TYPES:
 - agent_type "search_worker": An intelligent search agent with built-in web scraping. It supports two modes via schema_payload:
@@ -84,7 +82,14 @@ REQUIRED JSON STRUCTURE:
 {{
   "nodes": [ {{ "id": "node_1", "agent_type": "search_worker", "task": "descriptive search intent — keywords: kw1, kw2", "schema_payload": "{{\"mode\":\"direct or deep\"}}" }} ],
   "edges": [ {{ "from": "node_1", "to": "node_2", "dep_type": "Data" }} ]
-}}"#)
+}}"#, persona_prefix);
+
+        let system_prompt = PromptBuilder::new()
+            .with_identity()
+            .with_environment(_registry)
+            .with_memory(&input.memory_context)
+            .with_tools_lazy(&tools)
+            .with_role_instructions(&role_instructions)
             .build();
 
         let req = LlmRequest {
@@ -229,7 +234,8 @@ REQUIRED JSON STRUCTURE:
             String::new()
         };
         let mem_context = input.memory_context.clone().unwrap_or_default();
-        let system_prompt = format!("{}{}{}You are the GeneralAgent Synthesizer.", env_context, mem_context, if mem_context.is_empty() {""} else {"\n\n"});
+        let soul_content2 = crate::agents::prompt_builder::get_soul();
+        let system_prompt = format!("{}{}{}[IDENTITY & VALUES]\n{}\n\nYou MUST respond as the persona described above. NEVER call yourself 'GeneralAgent' or reveal internal agent names. Synthesize results into a natural, persona-consistent response.", env_context, mem_context, if mem_context.is_empty() {""} else {"\n\n"}, soul_content2);
 
         let req = LlmRequest {
             session_id: format!("summarize_{}", input.node_id),

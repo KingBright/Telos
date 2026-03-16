@@ -26,6 +26,8 @@ pub enum NodeStatus {
     Completed,
     Failed,
     WaitingForInput,
+    /// Node was skipped because an upstream dependency failed (graph pruning)
+    Skipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]

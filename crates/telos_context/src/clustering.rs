@@ -9,8 +9,14 @@ pub struct Edu {
 }
 
 /// A pure Rust text chunker that splits text into EDUs by paragraphs and sentences.
-/// This acts as a fallback for the Tree-sitter integration in a V1 MVP.
+/// Automatically detects code content and routes to the structural code parser
+/// for function/class-level splitting instead of sentence-level splitting.
 pub fn parse_into_edus(document_content: &str, base_id: &str) -> Vec<Edu> {
+    // Auto-detect: if content looks like code, use the structural code parser
+    if crate::ast_parser::is_code_content(document_content) {
+        return crate::ast_parser::parse_code_into_edus(document_content, base_id);
+    }
+
     let mut edus = Vec::new();
     let paragraphs: Vec<&str> = document_content.split("\n\n").filter(|p| !p.trim().is_empty()).collect();
 
@@ -138,6 +144,149 @@ pub fn kmeans_cluster(edus: &[Edu], k: usize, max_iterations: usize) -> HashMap<
         if !moved {
             break; // Converged
         }
+    }
+
+    clusters
+}
+
+/// Gaussian Mixture Model (GMM) soft clustering using the EM algorithm.
+/// Unlike K-Means, each EDU can belong to *multiple* clusters with different
+/// responsibilities (posterior probabilities). This preserves cross-cluster
+/// information that hard clustering would lose.
+///
+/// Returns a map of cluster ID to list of (EDU ID, responsibility weight).
+/// EDUs with responsibility > `threshold` are included in the cluster.
+pub fn gmm_soft_cluster(
+    edus: &[Edu],
+    k: usize,
+    max_iterations: usize,
+    threshold: f32,
+) -> HashMap<usize, Vec<(String, f32)>> {
+    if edus.is_empty() || k == 0 {
+        return HashMap::new();
+    }
+
+    let k = k.min(edus.len());
+    let dim = edus[0].embedding.as_ref().map_or(0, |e| e.len());
+    if dim == 0 {
+        return HashMap::new();
+    }
+
+    // Collect embeddings as references for fast access
+    let embeddings: Vec<&Vec<f32>> = edus.iter()
+        .filter_map(|e| e.embedding.as_ref())
+        .collect();
+    let n = embeddings.len();
+    if n < k {
+        return HashMap::new();
+    }
+
+    // Initialize: means from first k EDUs, uniform weights, unit variance
+    let mut means: Vec<Vec<f32>> = embeddings.iter().take(k).map(|e| (*e).clone()).collect();
+    let mut weights: Vec<f32> = vec![1.0 / k as f32; k];
+    // Diagonal covariance (variance per dimension per cluster) — avoids O(d^2) full covariance
+    let mut variances: Vec<Vec<f32>> = vec![vec![1.0; dim]; k];
+
+    // Responsibility matrix: r[i][j] = P(cluster j | point i)
+    let mut responsibilities = vec![vec![0.0f32; k]; n];
+
+    for _iter in 0..max_iterations {
+        // === E-step: compute responsibilities ===
+        for i in 0..n {
+            let emb = embeddings[i];
+            let mut log_probs = vec![0.0f64; k];
+
+            for j in 0..k {
+                // Log Gaussian with diagonal covariance:
+                // log p(x|j) = -0.5 * sum_d [ (x_d - mu_d)^2 / var_d + ln(var_d) ] + ln(weight_j)
+                let mut log_p: f64 = (weights[j] as f64).ln();
+                for d in 0..dim {
+                    let diff = emb[d] - means[j][d];
+                    let var = variances[j][d].max(1e-6); // floor to avoid division by zero
+                    log_p -= 0.5 * ((diff * diff) as f64 / var as f64 + (var as f64).ln());
+                }
+                log_probs[j] = log_p;
+            }
+
+            // Log-sum-exp for numerical stability
+            let max_log = log_probs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let sum_exp: f64 = log_probs.iter().map(|lp| (lp - max_log).exp()).sum();
+            let log_norm = max_log + sum_exp.ln();
+
+            for j in 0..k {
+                responsibilities[i][j] = ((log_probs[j] - log_norm).exp()) as f32;
+            }
+        }
+
+        // === M-step: update means, variances, weights ===
+        let mut converged = true;
+        for j in 0..k {
+            let n_j: f32 = responsibilities.iter().map(|r| r[j]).sum();
+            if n_j < 1e-8 {
+                continue; // dead cluster
+            }
+
+            // Update weight
+            weights[j] = n_j / n as f32;
+
+            // Update mean
+            let mut new_mean = vec![0.0f32; dim];
+            for i in 0..n {
+                let r = responsibilities[i][j];
+                for d in 0..dim {
+                    new_mean[d] += r * embeddings[i][d];
+                }
+            }
+            for d in 0..dim {
+                new_mean[d] /= n_j;
+            }
+
+            // Check convergence (mean shift)
+            let shift: f32 = new_mean.iter().zip(means[j].iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+                .sqrt();
+            if shift > 1e-4 {
+                converged = false;
+            }
+
+            // Update variance (diagonal)
+            let mut new_var = vec![0.0f32; dim];
+            for i in 0..n {
+                let r = responsibilities[i][j];
+                for d in 0..dim {
+                    let diff = embeddings[i][d] - new_mean[d];
+                    new_var[d] += r * diff * diff;
+                }
+            }
+            for d in 0..dim {
+                new_var[d] = (new_var[d] / n_j).max(1e-6); // floor variance
+            }
+
+            means[j] = new_mean;
+            variances[j] = new_var;
+        }
+
+        if converged {
+            break;
+        }
+    }
+
+    // Build soft cluster assignments: include EDU if responsibility > threshold
+    let mut clusters: HashMap<usize, Vec<(String, f32)>> = HashMap::new();
+    for i in 0..n {
+        for j in 0..k {
+            if responsibilities[i][j] > threshold {
+                clusters.entry(j)
+                    .or_default()
+                    .push((edus[i].id.clone(), responsibilities[i][j]));
+            }
+        }
+    }
+
+    // Sort each cluster by descending responsibility
+    for members in clusters.values_mut() {
+        members.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 
     clusters

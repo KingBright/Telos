@@ -184,20 +184,20 @@ impl ExecutableNode for RouterAgent {
                         .filter(|e| e.memory_type == telos_memory::MemoryType::UserProfile)
                         .map(|e| e.content.clone())
                         .collect();
-                let interaction_entries: Vec<String> = results.iter()
-                    .filter(|e| e.memory_type == telos_memory::MemoryType::InteractionEvent)
-                    .map(|e| e.content.clone())
-                    .collect();
-                
-                if !profile_entries.is_empty() {
-                    user_profile_context.push_str(&format!("[USER PROFILE]\n{}\n\n", profile_entries.join("\n- ")));
-                }
-                if !interaction_entries.is_empty() {
-                    user_profile_context.push_str(&format!("[PAST INTERACTIONS]\n{}\n\n", interaction_entries.join("\n- ")));
+                    let interaction_entries: Vec<String> = results.iter()
+                        .filter(|e| e.memory_type == telos_memory::MemoryType::InteractionEvent)
+                        .map(|e| e.content.clone())
+                        .collect();
+                    
+                    if !profile_entries.is_empty() {
+                        user_profile_context.push_str(&format!("[USER PROFILE & PREFERENCES]\n{}\n\n", profile_entries.join("\n- ")));
+                    }
+                    if !interaction_entries.is_empty() {
+                        user_profile_context.push_str(&format!("[PAST INTERACTIONS]\n{}\n\n", interaction_entries.join("\n- ")));
+                    }
                 }
             }
         }
-    }
         
         let mem_context = input.memory_context.clone().unwrap_or_default();
 

@@ -813,7 +813,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Evolution Evaluator
     let evaluator = Arc::new(
         telos_evolution::evaluator::ActorCriticEvaluator::new()
-            .expect("Failed to initialize ActorCriticEvaluator"),
+            .expect("Failed to initialize ActorCriticEvaluator")
+            .with_gateway(gateway.clone()),
     );
 
     // --- BACKGROUND EVENT LOOP ---
@@ -893,6 +894,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Global short-term session memory for Context/History Injection
     let global_session_logs: Arc<tokio::sync::RwLock<std::collections::VecDeque<telos_context::LogEntry>>> = Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::with_capacity(20)));
     let session_logs_loop = global_session_logs.clone();
+    let evaluator_loop = evaluator.clone();
 
     tokio::spawn(async move {
         debug!("[Daemon] Event loop started.");
@@ -921,6 +923,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let paused_tasks_bg = paused_tasks_bg.clone();
                     let distillation_tx_spawn = distillation_tx_bg.clone();
                     let session_logs_loop = session_logs_loop.clone();
+                    let evaluator_spawn = evaluator_loop.clone();
 
                     let node_factory = std::sync::Arc::new(DaemonNodeFactory {
                         gateway: gateway_clone.clone(),
@@ -930,7 +933,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new()
                         .with_node_factory(node_factory)
-                        .with_active_tasks(active_tasks_loop.clone());
+                        .with_active_tasks(active_tasks_loop.clone())
+                        .with_evaluator(evaluator_spawn);
 
                     let context_manager_spawn = context_manager.clone();
                     let active_tasks_spawn = active_tasks_loop.clone();
@@ -1347,9 +1351,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // QA Gate: evaluate direct_reply quality before accepting
                                 let qa_result = router.evaluate(&payload, direct_reply, registry_clone.as_ref()).await;
                                 let qa_accepted = if qa_result.success {
-                                    qa_result.output.as_ref()
-                                        .and_then(|json| json.get("is_acceptable").and_then(|v| v.as_bool()))
-                                        .unwrap_or(true) // default accept if parsing fails
+                                    let json = qa_result.output.as_ref();
+                                    let is_acceptable = json
+                                        .and_then(|j| j.get("is_acceptable").and_then(|v| v.as_bool()))
+                                        .unwrap_or(true);
+                                    let is_clarification = json
+                                        .and_then(|j| j.get("is_clarification").and_then(|v| v.as_bool()))
+                                        .unwrap_or(false);
+                                    is_acceptable || is_clarification
                                 } else {
                                     true // default accept if QA call itself fails
                                 };
@@ -1438,8 +1447,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
 
                             // Build context using the context manager with memory integration for the Expert
+                            let session_history: Vec<telos_context::LogEntry> = {
+                                let logs = session_logs_loop.read().await;
+                                logs.iter().cloned().collect()
+                            };
                             let raw_ctx = telos_context::RawContext {
-                                history_logs: vec![], // Could include session history here
+                                history_logs: session_history,
                                 retrieved_docs: vec![],
                             };
                             let ctx_req = telos_context::NodeRequirement {
@@ -1511,8 +1524,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
                                 // Build context using the context manager with memory integration
+                                let session_history: Vec<telos_context::LogEntry> = {
+                                    let logs = session_logs_loop.read().await;
+                                    logs.iter().cloned().collect()
+                                };
                                 let raw_ctx = telos_context::RawContext {
-                                    history_logs: vec![], // Could include session history here
+                                    history_logs: session_history,
                                     retrieved_docs: vec![],
                                 };
                                 let ctx_req = telos_context::NodeRequirement {
@@ -1867,9 +1884,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let mut execution_engine = telos_dag::engine::TokioExecutionEngine::new()
                         .with_node_factory(node_factory)
-                        .with_active_tasks(active_tasks_loop.clone());
+                        .with_active_tasks(active_tasks_loop.clone())
+                        .with_evaluator(evaluator_loop.clone());
 
                     let context_manager_approval = context_manager.clone();
+                    let session_logs_loop = session_logs_loop.clone();
                     tokio::spawn(async move {
                         let task_start_time = Instant::now();
                         debug!(
@@ -1937,8 +1956,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 completed: false,
                             };
 
+                            let session_history: Vec<telos_context::LogEntry> = {
+                                let logs = session_logs_loop.read().await;
+                                logs.iter().cloned().collect()
+                            };
                             let raw_ctx = telos_context::RawContext {
-                                history_logs: vec![],
+                                history_logs: session_history,
                                 retrieved_docs: vec![telos_context::Document {
                                     doc_id: "user_input".to_string(),
                                     content: payload.clone(),

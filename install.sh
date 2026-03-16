@@ -84,7 +84,9 @@ echo "Installation successful."
 CONFIG_FILE="$HOME/.telos/config.toml"
 OLD_CONFIG_FILE="$HOME/.telos_config.toml"
 LOG_DIR="$HOME/.telos/logs"
+WORKSPACE_DIR="$HOME/.telos/workspace"
 mkdir -p "$LOG_DIR"
+mkdir -p "$WORKSPACE_DIR"
 
 # Configure auto-start files
 if [ "$OS" = "Darwin" ]; then
@@ -106,10 +108,17 @@ if [ "$OS" = "Darwin" ]; then
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>WorkingDirectory</key>
+    <string>$WORKSPACE_DIR</string>
     <key>StandardOutPath</key>
     <string>$LOG_DIR/daemon.log</string>
     <key>StandardErrorPath</key>
     <string>$LOG_DIR/daemon.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin</string>
+    </dict>
 </dict>
 </plist>
 EOF
@@ -123,6 +132,7 @@ Description=Telos Daemon
 After=network.target
 
 [Service]
+WorkingDirectory=$WORKSPACE_DIR
 ExecStart=$HOME/.cargo/bin/telos_daemon
 Restart=always
 
@@ -137,10 +147,10 @@ if [ -f "$CONFIG_FILE" ] || [ -f "$OLD_CONFIG_FILE" ]; then
         launchctl load -w "$PLIST_PATH"
         # Wait for daemon to start and verify
         echo -n "Waiting for daemon to start"
-        for i in $(seq 1 10); do
-            if lsof -i :3000 -P 2>/dev/null | grep -q LISTEN; then
+        for i in $(seq 1 15); do
+            if curl -s http://127.0.0.1:3000/api/v1/log-level >/dev/null; then
                 echo ""
-                echo "telos_daemon started successfully and listening on port 3000."
+                echo "telos_daemon started successfully and is responding on port 3000."
                 echo "Daemon logs: $LOG_DIR/daemon.log"
                 exit 0
             fi
@@ -150,8 +160,8 @@ if [ -f "$CONFIG_FILE" ] || [ -f "$OLD_CONFIG_FILE" ]; then
         echo ""
         echo "Warning: Daemon may not have started via launchd. Starting directly..."
         nohup ~/.cargo/bin/telos_daemon >> "$LOG_DIR/daemon.log" 2>> "$LOG_DIR/daemon.err" &
-        sleep 2
-        if lsof -i :3000 -P 2>/dev/null | grep -q LISTEN; then
+        sleep 3
+        if curl -s http://127.0.0.1:3000/api/v1/log-level >/dev/null; then
             echo "telos_daemon started successfully (direct) on port 3000."
         else
             echo "Error: telos_daemon failed to start. Check logs: $LOG_DIR/daemon.err"

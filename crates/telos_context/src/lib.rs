@@ -1,6 +1,7 @@
 pub mod providers;
 pub mod clustering;
 pub mod raptor;
+pub mod ast_parser;
 
 use telos_core::NodeResult;
 use crate::providers::{EmbeddingProvider, LlmProvider};

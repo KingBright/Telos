@@ -13,6 +13,18 @@ pub struct TelosConfig {
     #[serde(default = "default_tools_dir")]
     pub tools_dir: String,
 
+    /// Optional OpenAI-compatible Audio API base URL (for STT and TTS)
+    #[serde(default)]
+    pub openai_audio_base_url: Option<String>,
+
+    /// Optional OpenAI-compatible Audio API Key
+    #[serde(default)]
+    pub openai_audio_api_key: Option<String>,
+
+    /// Voice ID for TTS (e.g., "alloy", "echo", "fable", "onyx", "nova", "shimmer")
+    #[serde(default = "default_tts_voice_id")]
+    pub tts_voice_id: String,
+
     // Optional chatbot integrations
     pub telegram_bot_token: Option<String>,
     #[serde(default)]
@@ -62,6 +74,10 @@ fn default_persona_trait() -> String {
     "聪明、活泼且不失风趣".to_string()
 }
 
+fn default_tts_voice_id() -> String {
+    "alloy".to_string()
+}
+
 fn default_max_concurrent_requests() -> usize {
     20
 }
@@ -84,7 +100,6 @@ impl TelosConfig {
         path
     }
     pub fn cleanup_orphaned_memory_files() -> std::io::Result<()> {
-        // Logic to cleanup all legacy files/directories
         let home_dir = dirs::home_dir().expect("Could not find home directory");
         
         let legacy_logs = home_dir.join(".telos_logs");
@@ -97,10 +112,6 @@ impl TelosConfig {
             return Ok(());
         }
 
-        // The current standardized path is ~/.telos/memory.redb
-        // We want to clean up any ~/.telos/memory.redb.* or ~/.telos_memory.redb.*
-        let home_dir = dirs::home_dir().expect("Could not find home directory");
-        
         let patterns = vec![
             (home.clone(), "memory.redb."),
             (home_dir, ".telos_memory.redb."),
@@ -108,14 +119,17 @@ impl TelosConfig {
 
         for (dir, prefix) in patterns {
             if !dir.exists() { continue; }
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                let file_name = entry.file_name();
-                let name_str = file_name.to_string_lossy();
-                if name_str.starts_with(prefix) {
-                    if let Ok(metadata) = entry.metadata() {
-                        if metadata.is_file() {
-                            let _ = fs::remove_file(entry.path());
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    let name_str = file_name.to_string_lossy();
+                    // Identify chunk/compaction leftover files, but NOT the main .redb file. 
+                    // e.g. .telos_memory.redb.tmp
+                    if name_str.starts_with(prefix) && name_str != prefix.trim_end_matches('.') {
+                        if let Ok(metadata) = entry.metadata() {
+                            if metadata.is_file() {
+                                let _ = fs::remove_file(entry.path());
+                            }
                         }
                     }
                 }
@@ -152,14 +166,14 @@ impl TelosConfig {
         let path = Self::config_file_path();
         let old_path = Self::old_config_file_path();
 
-        // Migration logic
+        let home = Self::telos_home();
+        if !home.exists() {
+            fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+        }
+
+        // Migration logic for config file
         if !path.exists() && old_path.exists() {
-            let home = Self::telos_home();
-            if !home.exists() {
-                fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-            }
             fs::copy(&old_path, &path).map_err(|e| format!("Failed to migrate config: {}", e))?;
-            // Delete old config after successful migration
             let _ = fs::remove_file(&old_path);
         }
 
@@ -167,19 +181,39 @@ impl TelosConfig {
             return Err("Config file not found".into());
         }
 
-        let contents = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let contents = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let mut config: TelosConfig = toml::from_str(&contents).map_err(|e| e.to_string())?;
 
-        // Standardize paths if they are still legacy
+        let mut needs_save = false;
         let home_str = dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        
+        // Standardize DB path and migrate old database file if needed
+        let new_db_path = Self::memory_db_path();
+        let old_db_path = dirs::home_dir().expect("no home").join(".telos_memory.redb");
+        
         let old_db_default = format!("{}/.telos_memory.redb", home_str);
+        
         if config.db_path == old_db_default || config.db_path.is_empty() {
-            config.db_path = Self::memory_db_path().to_string_lossy().into_owned();
+            config.db_path = new_db_path.to_string_lossy().into_owned();
+            needs_save = true;
+        }
+
+        // Physically move the legacy database file if it exists and the new one doesn't
+        if old_db_path.exists() && !new_db_path.exists() {
+            if fs::rename(&old_db_path, &new_db_path).is_ok() {
+                // Ignore cleanup errors for old chunk files
+                let _ = Self::cleanup_orphaned_memory_files();
+            }
         }
 
         let old_tools_default = format!("{}/.telos/tools", home_str);
-        if config.tools_dir == old_tools_default {
+        if config.tools_dir == old_tools_default || config.tools_dir.is_empty() {
              config.tools_dir = default_tools_dir();
+             needs_save = true;
+        }
+
+        if needs_save {
+            let _ = config.save();
         }
 
         Ok(config)

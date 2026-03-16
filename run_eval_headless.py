@@ -11,7 +11,7 @@ import requests, json, time, os, uuid, sys, re
 
 API = "http://127.0.0.1:3000/api/v1/run_sync"
 BASE_URL = "http://127.0.0.1:3000"
-ITER = 17
+ITER = 18
 TRACES_DIR = "test_traces"
 os.makedirs(TRACES_DIR, exist_ok=True)
 

@@ -7,6 +7,7 @@ use crate::{DriftWarning, Evaluator, ExecutionTrace, SynthesizedSkill};
 
 pub struct ActorCriticEvaluator {
     embedder: Option<Arc<tokio::sync::Mutex<TextEmbedding>>>,
+    gateway: Option<Arc<dyn telos_model_gateway::ModelGateway>>,
     similarity_threshold: f32,
 }
 
@@ -28,8 +29,15 @@ impl ActorCriticEvaluator {
 
         Ok(Self {
             embedder: embedder_opt,
-            similarity_threshold: 0.85, // Adjust threshold to allow slight variations in testing
+            gateway: None,
+            similarity_threshold: 0.85,
         })
+    }
+
+    /// Set an LLM gateway for LLM-powered distillation
+    pub fn with_gateway(mut self, gw: Arc<dyn telos_model_gateway::ModelGateway>) -> Self {
+        self.gateway = Some(gw);
+        self
     }
 
     fn calculate_cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
@@ -65,8 +73,9 @@ impl Evaluator for ActorCriticEvaluator {
             None => return Ok(()),
         };
 
-        // Extract text representations of the last two steps
-        let steps_text: Vec<String> = trace.steps.iter().rev().take(2).map(|step| {
+        // 5-step sliding window: compare all recent pairs for semantic loops
+        let window_size = 5.min(trace.steps.len());
+        let steps_text: Vec<String> = trace.steps.iter().rev().take(window_size).map(|step| {
             format!("Node: {}, Input: {}, Output: {:?}",
                 step.node_id,
                 step.input_data,
@@ -78,13 +87,16 @@ impl Evaluator for ActorCriticEvaluator {
         let embeddings = task::spawn_blocking(move || {
             let mut embedder_guard = embedder.blocking_lock();
             embedder_guard.embed(steps_text, None)
-        }).await.map_err(|_| DriftWarning::TargetDrift)? // Treat spawn_blocking panic as TargetDrift for simplicity
+        }).await.map_err(|_| DriftWarning::TargetDrift)?
         .map_err(|_| DriftWarning::TargetDrift)?;
 
-        if embeddings.len() >= 2 {
-            let sim = Self::calculate_cosine_similarity(&embeddings[0], &embeddings[1]);
-            if sim >= self.similarity_threshold {
-                return Err(DriftWarning::SemanticLoop);
+        // Pairwise comparison: any two steps too similar = semantic loop
+        for i in 0..embeddings.len() {
+            for j in (i+1)..embeddings.len() {
+                let sim = Self::calculate_cosine_similarity(&embeddings[i], &embeddings[j]);
+                if sim >= self.similarity_threshold {
+                    return Err(DriftWarning::SemanticLoop);
+                }
             }
         }
 
@@ -95,21 +107,70 @@ impl Evaluator for ActorCriticEvaluator {
         if !trace.success {
             return None; // Only distill successful traces
         }
-
-        // Extremely naive form of distillation for now
-        // A full actor-critic would parse multiple traces, map inputs to tools, etc.
-        // We distill the first step as a trigger, and the sequence of node_ids as code.
+        if trace.steps.is_empty() {
+            return None;
+        }
 
         let first_step = trace.steps.first()?;
-        let trigger_condition = format!("Matches input intent similar to: {}", first_step.input_data);
 
+        // Try LLM-powered distillation if gateway is available
+        if let Some(ref gw) = self.gateway {
+            let trace_summary: String = trace.steps.iter().enumerate().map(|(i, s)| {
+                let output_preview = s.output_data.as_deref()
+                    .map(|o| o.chars().take(200).collect::<String>())
+                    .unwrap_or_else(|| "None".to_string());
+                format!("Step {}: [{}] input='{}' output='{}'", i+1, s.node_id, s.input_data, output_preview)
+            }).collect::<Vec<_>>().join("\n");
+
+            let req = telos_model_gateway::LlmRequest {
+                session_id: format!("distill_{}", trace.task_id),
+                messages: vec![
+                    telos_model_gateway::Message {
+                        role: "system".to_string(),
+                        content: "You are a skill distillation engine. Analyze the execution trace and extract a reusable skill pattern. Output ONLY valid JSON:\n{\"trigger\": \"When the user asks about X or wants to Y\", \"procedure\": \"Step-by-step procedure extracted from the trace\"}\nBe concise. Focus on the PATTERN, not the specific data.".to_string(),
+                    },
+                    telos_model_gateway::Message {
+                        role: "user".to_string(),
+                        content: format!("Task: {}\n\nExecution Trace:\n{}", first_step.input_data, trace_summary),
+                    },
+                ],
+                required_capabilities: telos_model_gateway::Capability {
+                    requires_vision: false,
+                    strong_reasoning: false,
+                },
+                budget_limit: 500,
+                tools: None,
+            };
+
+            if let Ok(res) = gw.generate(req).await {
+                let content = res.content.trim();
+                if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
+                    if e > s {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content[s..=e]) {
+                            let trigger = json.get("trigger").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let procedure = json.get("procedure").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            if !trigger.is_empty() && !procedure.is_empty() {
+                                return Some(SynthesizedSkill {
+                                    trigger_condition: trigger,
+                                    executable_code: procedure,
+                                    success_rate: 1.0,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: naive distillation
+        let trigger_condition = format!("Matches input intent similar to: {}", first_step.input_data);
         let node_sequence: Vec<String> = trace.steps.iter().map(|s| s.node_id.clone()).collect();
         let executable_code = format!("Execute sequence: [{}]", node_sequence.join(" -> "));
 
         Some(SynthesizedSkill {
             trigger_condition,
             executable_code,
-            success_rate: 1.0, // Initial success rate
+            success_rate: 1.0,
         })
     }
 }

@@ -3498,6 +3498,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76979bea66e7875e7509c4ec5300112b316af87fa7a252ca91c448b32dfe3993"
+dependencies = [
+ "bitflags 2.11.0",
+ "getopts",
+ "memchr",
+ "pulldown-cmark-escape",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd348ff538bc9caeda7ee8cad2d1d48236a1f443c1fa3913c6a02fe0043b1dd3"
+
+[[package]]
 name = "pxfm"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4839,6 +4858,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "pulldown-cmark",
  "reqwest 0.11.27",
  "serde",
  "serde_json",
@@ -4945,6 +4965,7 @@ dependencies = [
  "serde_json",
  "telos_context",
  "telos_core",
+ "telos_evolution",
  "telos_hci",
  "telos_model_gateway",
  "telos_telemetry",
@@ -4960,7 +4981,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "fastembed",
+ "serde_json",
  "telos_core",
+ "telos_model_gateway",
  "tokio",
 ]
 

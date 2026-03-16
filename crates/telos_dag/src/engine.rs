@@ -142,22 +142,72 @@ pub struct TokioExecutionEngine {
     wakeup_rx: tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>,
     circuit_breaker_config: CircuitBreakerConfig,
     active_tasks: ActiveTaskRegistry,
+    checkpoint_manager: Option<crate::checkpoint::CheckpointManager>,
+    /// Optional Evolution evaluator for semantic drift detection in corrective loops
+    evaluator: Option<std::sync::Arc<dyn telos_evolution::Evaluator>>,
 }
 
 impl TokioExecutionEngine {
     pub fn new() -> Self {
         let (wakeup_tx, wakeup_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cp_mgr = std::env::var("HOME").ok()
+            .map(|h| std::path::PathBuf::from(h).join(".telos").join("checkpoints.redb"))
+            .and_then(|p| {
+                let _ = std::fs::create_dir_all(p.parent().unwrap_or(std::path::Path::new(".")));
+                crate::checkpoint::CheckpointManager::new(&p).ok()
+            });
+        if cp_mgr.is_some() {
+            info!("[DAG Engine] ✅ Checkpoint manager initialized (redb)");
+        }
         Self {
             node_factory: None,
             wakeup_tx,
             wakeup_rx,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             active_tasks: Arc::new(RwLock::new(HashMap::new())),
+            checkpoint_manager: cp_mgr,
+            evaluator: None,
         }
     }
 
     pub fn active_tasks(&self) -> ActiveTaskRegistry {
         self.active_tasks.clone()
+    }
+
+    /// Serialize and persist real graph state to redb
+    fn checkpoint_graph(&self, graph: &TaskGraph) {
+        if let Some(ref mgr) = self.checkpoint_manager {
+            let statuses: HashMap<String, String> = graph.node_statuses.iter()
+                .map(|(k, v)| (k.clone(), format!("{:?}", v)))
+                .collect();
+            let results_summary: HashMap<String, serde_json::Value> = graph.node_results.iter()
+                .map(|(k, v)| {
+                    let output_preview = v.output.as_ref()
+                        .map(|o| o.to_string().chars().take(500).collect::<String>())
+                        .unwrap_or_default();
+                    (k.clone(), serde_json::json!({
+                        "success": v.success,
+                        "output_preview": output_preview,
+                        "has_error": v.error.is_some(),
+                    }))
+                })
+                .collect();
+            let snapshot = serde_json::json!({
+                "graph_id": graph.graph_id,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs(),
+                "statuses": statuses,
+                "results": results_summary,
+                "is_running": graph.current_state.is_running,
+                "completed": graph.current_state.completed,
+            });
+            if let Ok(json) = serde_json::to_string(&snapshot) {
+                if let Err(e) = mgr.save_checkpoint(&graph.graph_id, &json) {
+                    warn!("[DAG Engine] Checkpoint save failed: {:?}", e);
+                }
+            }
+        }
     }
 
     pub fn with_active_tasks(mut self, active_tasks: ActiveTaskRegistry) -> Self {
@@ -176,9 +226,75 @@ impl TokioExecutionEngine {
         self
     }
 
+    /// Set the Evolution evaluator for semantic drift detection in corrective loops
+    pub fn with_evaluator(mut self, evaluator: std::sync::Arc<dyn telos_evolution::Evaluator>) -> Self {
+        self.evaluator = Some(evaluator);
+        self
+    }
+
     /// Get a sender to wake up nodes waiting for input
     pub fn get_wakeup_tx(&self) -> tokio::sync::mpsc::UnboundedSender<(String, String, String)> {
         self.wakeup_tx.clone()
+    }
+
+    /// Graph pruning: BFS from failed node to mark all downstream dependents as Skipped.
+    /// This prevents the DAG from hanging when a node fails and downstream nodes
+    /// can never have their in_degree decremented.
+    fn prune_downstream(
+        graph: &mut TaskGraph,
+        failed_node_id: &str,
+        broker: &dyn EventBroker,
+        graph_id: &str,
+    ) -> usize {
+        use petgraph::Direction;
+        let mut pruned_count = 0;
+        let Some(&start_idx) = graph.node_indices.get(failed_node_id) else {
+            return 0;
+        };
+
+        // BFS through all outgoing edges
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(start_idx);
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(start_idx);
+
+        while let Some(current) = queue.pop_front() {
+            for neighbor in graph.edges.neighbors_directed(current, Direction::Outgoing) {
+                if visited.contains(&neighbor) {
+                    continue;
+                }
+                visited.insert(neighbor);
+
+                // Find the node ID for this index
+                if let Some(nid) = graph.node_indices.iter()
+                    .find(|(_, &idx)| idx == neighbor)
+                    .map(|(id, _)| id.clone())
+                {
+                    let status = graph.node_statuses.get(&nid).cloned();
+                    if status == Some(NodeStatus::Pending) || status == Some(NodeStatus::WaitingForInput) {
+                        graph.node_statuses.insert(nid.clone(), NodeStatus::Skipped);
+                        pruned_count += 1;
+
+                        broker.publish_feedback(AgentFeedback::StateChanged {
+                            task_id: graph_id.to_string(),
+                            current_node: nid.clone(),
+                            status: NodeStatus::Skipped,
+                        });
+
+                        // Continue BFS — this node's children should also be skipped
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+
+        if pruned_count > 0 {
+            info!(
+                "[DAG Engine] ✂️ Pruned {} downstream nodes from failed '{}'",
+                pruned_count, failed_node_id
+            );
+        }
+        pruned_count
     }
 
     /// Calculate progress info from the graph state
@@ -206,6 +322,7 @@ impl TokioExecutionEngine {
                     }
                 }
                 NodeStatus::Failed => failed += 1,
+                NodeStatus::Skipped => completed += 1, // Skipped nodes count as resolved
                 NodeStatus::Pending => pending += 1,
                 NodeStatus::WaitingForInput => pending += 1, // Treat as pending for progress
             }
@@ -466,6 +583,9 @@ impl ExecutionEngine for TokioExecutionEngine {
                             graph.nodes.insert(node_id.clone(), node_box);
                             graph.node_results.insert(node_id.clone(), output.clone());
 
+                            // Checkpoint after each node completion for crash recovery
+                            self.checkpoint_graph(graph);
+
                             // Publish TraceLogs
                             for trace in &output.trace_logs {
                                 broker.publish_feedback(AgentFeedback::Trace {
@@ -610,6 +730,38 @@ impl ExecutionEngine for TokioExecutionEngine {
                                     let stagnated = loop_state.is_stagnated(score);
                                     let max_reached = loop_state.iteration >= loop_state.config.max_iterations;
 
+                                    // Semantic drift detection via Evolution evaluator (4th exit condition)
+                                    let semantic_loop_detected = if !should_exit && !stagnated && !max_reached {
+                                        if let Some(ref evaluator) = self.evaluator {
+                                            // Build a mini-trace from the loop's score history
+                                            let trace = telos_evolution::ExecutionTrace {
+                                                task_id: graph_id.clone(),
+                                                steps: loop_state.score_history.iter().enumerate().map(|(i, &s)| {
+                                                    telos_evolution::TraceStep {
+                                                        node_id: format!("{}__iter{}", loop_state.actor_node_id, i),
+                                                        input_data: format!("iteration_{}", i),
+                                                        output_data: Some(format!("score={:.2}", s)),
+                                                        error: None,
+                                                    }
+                                                }).collect(),
+                                                errors_encountered: vec![],
+                                                success: true,
+                                            };
+                                            match evaluator.detect_drift(&trace).await {
+                                                Err(telos_evolution::DriftWarning::SemanticLoop) => {
+                                                    warn!("[DAG Engine] 🔄🛑 Semantic loop detected by Evolution evaluator: Actor={}, iter={}",
+                                                        loop_state.actor_node_id, loop_state.iteration);
+                                                    true
+                                                }
+                                                _ => false,
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+
                                     if should_exit {
                                         info!("[DAG Engine] 🔄✅ Loop exiting (satisfied): Actor={}, iter={}, score={:.2}",
                                             loop_state.actor_node_id, loop_state.iteration, score);
@@ -619,9 +771,12 @@ impl ExecutionEngine for TokioExecutionEngine {
                                     } else if max_reached {
                                         warn!("[DAG Engine] 🔄⚠️ Loop exiting (max iterations): Actor={}, iter={}/{}",
                                             loop_state.actor_node_id, loop_state.iteration, loop_state.config.max_iterations);
+                                    } else if semantic_loop_detected {
+                                        warn!("[DAG Engine] 🔄⚠️ Loop exiting (semantic loop): Actor={}, iter={}",
+                                            loop_state.actor_node_id, loop_state.iteration);
                                     }
 
-                                    if !(should_exit || stagnated || max_reached) {
+                                    if !(should_exit || stagnated || max_reached || semantic_loop_detected) {
                                         // === Re-loop: Generate CorrectionDirective and re-queue Actor ===
                                         let diagnosis = output.output.as_ref()
                                             .and_then(|v| v.get("diagnosis").and_then(|d| d.as_str()))
@@ -739,6 +894,10 @@ impl ExecutionEngine for TokioExecutionEngine {
                                         retry_suggested: false,
                                     }),
                                 });
+
+                                // Graph pruning: mark all downstream dependents as Skipped
+                                let pruned = Self::prune_downstream(graph, &node_id, broker, &graph_id);
+                                completed_nodes += pruned; // Count pruned as resolved for loop exit
                             }
 
                             // Update active tasks map running nodes removal
@@ -824,9 +983,7 @@ impl ExecutionEngine for TokioExecutionEngine {
     }
 
     fn checkpoint(&self, graph_id: &str) -> Result<(), StorageError> {
-        let path = format!(".telos/checkpoints/{}.json", graph_id);
-        std::fs::create_dir_all(".telos/checkpoints").map_err(|_| StorageError::IoError)?;
-        std::fs::write(&path, "{\"status\": \"checkpoint_saved\"}").map_err(|_| StorageError::IoError)?;
+        // No-op — use checkpoint_graph() for full serialization
         Ok(())
     }
 }
