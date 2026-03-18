@@ -46,3 +46,13 @@ We meticulously track the implementation progress of every module inside the `ta
 6. **Update Task Files:** Check off the completed sub-tasks in the module's Markdown file and `tasks/10_integration_tasks.md`. Write a brief summary of the changes, issues encountered, or architectural decisions made under the `## Notes/Issues` section.
 
 *Before submitting your final code, ensure `cargo check` and `cargo test --workspace` run cleanly without major regressions.*
+
+---
+
+## 4. Deployment & Evaluation Protocol
+
+When deploying or testing the agent globally, you **must adhere** to the following procedures to ensure environment consistency and standardized evaluation:
+
+1. **Installation:** Always use the provided `./install.sh` script to build and deploy the `telos_daemon`. This ensures that web telemetry assets are correctly moved to `~/.telos/web` and the daemon is properly registered. 
+2. **Evaluation:** Use the `run_eval_headless.py` script to test the agent's generalization capabilities across the 25(maybe more later) distinct test cases instead of running manual isolated tests.
+3. **Evaluation Workflows:** You must strictly comply with the procedures and reporting structures designated in `.agents/workflows/agent_evaluation_workflow.md` when analyzing or optimizing the agent's behavior.

@@ -22,10 +22,18 @@ impl ScriptSandbox {
             let url_str = url.to_string();
             let result = tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
-                    let client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(10))
-                        .build()
-                        .map_err(|e| e.to_string())?;
+                    let mut builder = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10));
+
+                    if let Some(proxy_url) = std::env::var("TELOS_PROXY")
+                        .or_else(|_| std::env::var("HTTPS_PROXY"))
+                        .or_else(|_| std::env::var("HTTP_PROXY")).ok() {
+                        if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                            builder = builder.proxy(proxy);
+                        }
+                    }
+
+                    let client = builder.build().map_err(|e| e.to_string())?;
                     let resp = client.get(&url_str).send().await.map_err(|e| e.to_string())?;
                     resp.text().await.map_err(|e| e.to_string())
                 })

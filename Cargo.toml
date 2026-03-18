@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/*", "crates/telos_bot"
-, "dump_checkpoints"]
+]
 
 [workspace.dependencies]
 async-trait = "0.1.89"

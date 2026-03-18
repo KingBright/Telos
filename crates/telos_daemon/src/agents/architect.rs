@@ -93,7 +93,8 @@ Output exactly a JSON object matching this schema:
   "nodes": [ { "id": "...", "agent_type": "...", "task": "...", "schema_payload": "..." } ],
   "edges": [ { "from": "...", "to": "...", "dep_type": "Data" } ]
 }
-Do not include markdown wrappers if possible, just the raw JSON."#);
+CRITICAL FORMAT REQUIREMENT: 
+Your total response MUST be a single valid JSON object exactly matching the schema. DO NOT output any markdown (no ```json ... ```), NO conversational text, NO apologies, NO thinking process. ONLY JSON."#);
 
         let mut messages = vec![
             Message { role: "system".to_string(), content: system_prompt },
@@ -147,10 +148,19 @@ Do not include markdown wrappers if possible, just the raw JSON."#);
                             "[ArchitectAgent] ✅ Decomposition complete. Generated {} nodes.",
                             sub_graph.nodes.len()
                         );
-                        // Modify agent types to match Tier 3 Worker types if needed
+                        // Fortify agent types against LLM hallucinations
                         for node in &mut sub_graph.nodes {
-                            if node.agent_type == "coder" {
-                                node.agent_type = "coder".to_string(); 
+                            let valid_types = ["coder", "reviewer", "tester", "researcher", "general"];
+                            if !valid_types.contains(&node.agent_type.as_str()) {
+                                // Fallback mapping based on task context
+                                let task_lower = node.task.to_lowercase();
+                                if task_lower.contains("tool") || task_lower.contains("script") || task_lower.contains("code") {
+                                    tracing::warn!("[ArchitectAgent] Rewriting hallucinated agent_type '{}' to 'coder'", node.agent_type);
+                                    node.agent_type = "coder".to_string();
+                                } else {
+                                    tracing::warn!("[ArchitectAgent] Rewriting hallucinated agent_type '{}' to 'general'", node.agent_type);
+                                    node.agent_type = "general".to_string();
+                                }
                             }
                         }
                         
@@ -164,11 +174,33 @@ Do not include markdown wrappers if possible, just the raw JSON."#);
                             sub_graph,
                         ).with_trace(trace)
                     }
-                    Err(e) => parse_failure(
-                        "ArchitectParseError",
-                        &format!("无法解析规划输出: {}", e),
-                        &res.content,
-                    ).with_trace(trace),
+                    Err(e) => {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(clean_json) {
+                            if let Some(tool) = val.get("tool").and_then(|t| t.as_str()) {
+                                let sub_node = telos_core::SubGraphNode {
+                                    id: format!("direct_call_{}", tool),
+                                    agent_type: "tool".to_string(),
+                                    task: tool.to_string(), // ToolNode expects task to be EXACTLY the tool name
+                                    schema_payload: serde_json::to_string(&val).unwrap_or_default(),
+                                    loop_config: None,
+                                    is_critic: false,
+                                };
+                                let sub_graph = telos_core::AgentSubGraph {
+                                    nodes: vec![sub_node],
+                                    edges: vec![],
+                                };
+                                return AgentOutput::with_subgraph(
+                                    serde_json::json!({ "text": "SubGraph decomposition complete with 1 node" }),
+                                    sub_graph
+                                ).with_trace(trace);
+                            }
+                        }
+                        parse_failure(
+                            "ArchitectParseError",
+                            &format!("无法解析规划输出: {}", e),
+                            &res.content,
+                        ).with_trace(trace)
+                    }
                 }
             }
             Err(e) => from_gateway_error(e, "规划生成失败"),

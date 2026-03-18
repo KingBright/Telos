@@ -277,7 +277,8 @@ if __name__ == "__main__":
     results = []
     total_start = time.time()
 
-    for tc in test_cases:
+    test_cases_filtered = [tc for tc in test_cases if tc["id"] in [19, 23, 25]]
+    for tc in test_cases_filtered:
         n = tc["id"]
         print(f"━━━ Case {n:02d} [{tc['category']}] {tc['description']} ━━━")
         print(f"    Query: \"{tc['query'][:60]}{'...' if len(tc['query'])>60 else ''}\"")

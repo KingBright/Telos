@@ -32,6 +32,9 @@ pub struct TelosConfig {
 
     pub active_project_id: Option<String>,
 
+    /// Port for the telemetry web dashboard 
+    #[serde(default = "default_web_port")]
+    pub web_port: u16,
 
 
     /// Log level for feedback verbosity (quiet, normal, verbose, debug)
@@ -81,6 +84,10 @@ fn default_persona_trait() -> String {
 
 pub fn default_tts_voice_id() -> String {
     "alloy".to_string()
+}
+
+fn default_web_port() -> u16 {
+    3030
 }
 
 

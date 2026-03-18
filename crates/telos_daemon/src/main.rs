@@ -23,6 +23,51 @@ use uuid::Uuid;
 mod agents;
 pub use agents::*;
 
+// Telemetry Metrics
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub struct MetricsManager {
+    pub llm_total_requests: AtomicUsize,
+    pub llm_http_429_errors: AtomicUsize,
+    pub llm_other_api_errors: AtomicUsize,
+    
+    pub tool_execution_success: AtomicUsize,
+    pub tool_execution_failure: AtomicUsize,
+    
+    pub task_total_success: AtomicUsize,
+    pub task_total_failures: AtomicUsize,
+    
+    pub proactive_interactions: AtomicUsize,
+    pub qa_passes: AtomicUsize,
+    pub qa_failures: AtomicUsize,
+    
+    pub launch_time: std::sync::OnceLock<Instant>,
+}
+
+impl Default for MetricsManager {
+    fn default() -> Self {
+        Self {
+            llm_total_requests: AtomicUsize::new(0),
+            llm_http_429_errors: AtomicUsize::new(0),
+            llm_other_api_errors: AtomicUsize::new(0),
+            tool_execution_success: AtomicUsize::new(0),
+            tool_execution_failure: AtomicUsize::new(0),
+            task_total_success: AtomicUsize::new(0),
+            task_total_failures: AtomicUsize::new(0),
+            proactive_interactions: AtomicUsize::new(0),
+            qa_passes: AtomicUsize::new(0),
+            qa_failures: AtomicUsize::new(0),
+            launch_time: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+pub static METRICS: std::sync::LazyLock<MetricsManager> = std::sync::LazyLock::new(|| {
+    let m = MetricsManager::default();
+    m.launch_time.set(Instant::now()).unwrap();
+    m
+});
+
 // Core Traits and Primitives
 use async_trait::async_trait;
 use telos_context::providers::OpenAiProvider;
@@ -61,6 +106,8 @@ impl ModelProvider for GatewayAdapter {
                 last.content.len()
             );
         }
+
+        METRICS.llm_total_requests.fetch_add(1, Ordering::Relaxed);
 
         // Convert tools from LlmRequest to OpenAI format
         let tools = req.tools.as_ref().map(|tool_defs| {
@@ -107,6 +154,7 @@ impl ModelProvider for GatewayAdapter {
                     || error_msg.contains("429")
                 {
                     warn!("[GatewayAdapter] API Rate Limit detected: {}", e.message);
+                    METRICS.llm_http_429_errors.fetch_add(1, Ordering::Relaxed);
                     Err(GatewayError::TooManyRequests { retry_after_ms: None })
                 }
                 // Detect network-related errors for retry
@@ -120,9 +168,11 @@ impl ModelProvider for GatewayAdapter {
                     || error_msg.contains("http error")
                 {
                     warn!("[GatewayAdapter] Network error, retrying: {}", e.message);
+                    METRICS.llm_other_api_errors.fetch_add(1, Ordering::Relaxed);
                     Err(GatewayError::from_network_error(&e.message))
                 } else if error_msg.contains("503") || error_msg.contains("service unavailable") {
                     warn!("[GatewayAdapter] Service unavailable: {}", e.message);
+                    METRICS.llm_other_api_errors.fetch_add(1, Ordering::Relaxed);
                     Err(GatewayError::ServiceUnavailable { estimated_recovery_ms: None })
                 } else {
                     error!("[GatewayAdapter] Other error: {}", e.message);
@@ -1036,6 +1086,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let distillation_tx_bg = distillation_tx.clone();
     
+    // --- TELEMETRY DASHBOARD WORKER ---
+    let metrics_state = std::sync::Arc::new(tokio::sync::RwLock::new(telos_web::metrics::GlobalTelemetryMetrics::new()));
+    tokio::spawn(telos_web::start_web_server(config.web_port, metrics_state.clone()));
+
+    let mut metrics_rx = broker.subscribe_feedback();
+    let metrics_bg = metrics_state.clone();
+    tokio::spawn(async move {
+        debug!("[Daemon] 📊 Telemetry metrics aggregation loop started.");
+        while let Ok(feedback) = metrics_rx.recv().await {
+            let mut w = metrics_bg.write().await;
+            match feedback {
+                telos_hci::AgentFeedback::Trace { trace, .. } => {
+                    match trace {
+                        telos_core::TraceLog::LlmCall { .. } => {
+                            w.llm.total_requests += 1;
+                        }
+                        telos_core::TraceLog::ToolCall { .. } => {
+                            w.dynamic_tooling.execution_success += 1;
+                        }
+                    }
+                }
+                telos_hci::AgentFeedback::NodeFailed { error, .. } => {
+                    if error.error_type.contains("429") {
+                        w.llm.http_429_errors += 1;
+                    } else if error.error_type.contains("Tool") {
+                        w.dynamic_tooling.execution_failure += 1;
+                    } else {
+                        w.llm.other_api_errors += 1;
+                    }
+                }
+                telos_hci::AgentFeedback::TaskCompleted { summary, .. } => {
+                    if summary.fulfilled { 
+                        w.task_flow.total_success += 1; 
+                    } else { 
+                        w.task_flow.total_failures += 1; 
+                    }
+                }
+                telos_hci::AgentFeedback::StateChanged { status, .. } => {
+                    if matches!(status, telos_core::NodeStatus::Running) {
+                        w.task_flow.active_concurrent_tasks += 1;
+                    } else if matches!(status, telos_core::NodeStatus::Completed | telos_core::NodeStatus::Failed | telos_core::NodeStatus::Skipped) {
+                        w.task_flow.active_concurrent_tasks = w.task_flow.active_concurrent_tasks.saturating_sub(1);
+                    }
+                }
+                telos_hci::AgentFeedback::RequireHumanIntervention { .. } => {
+                     w.agent.proactive_interactions += 1;
+                }
+                _ => {}
+            }
+        }
+    });
+
     // Global active tasks registry
     let active_tasks: telos_dag::engine::ActiveTaskRegistry = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let active_tasks_loop = active_tasks.clone();
@@ -2294,11 +2396,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
 
                             let total_time_ms = task_start_time.elapsed().as_millis() as u64;
-                            let task_success = graph
-                                .node_statuses
-                                .get("llm_node")
-                                .map(|s| *s == telos_core::NodeStatus::Completed)
-                                .unwrap_or(false);
+                            let failed_nodes = graph.node_statuses.values().filter(|s| **s == telos_core::NodeStatus::Failed).count();
+                            let task_success = failed_nodes == 0;
+                            
+                            if task_success {
+                                crate::METRICS.task_total_success.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                crate::METRICS.task_total_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     });
                 }
@@ -2359,6 +2464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/log-level", get(get_log_level).post(set_log_level))
         .route("/api/v1/traces", get(get_traces))
         .route("/api/v1/tasks/active", get(get_active_tasks))
+        .route("/api/metrics", get(handle_metrics))
         .route("/ui", get(serve_ui))
         .with_state(state);
 
@@ -2384,6 +2490,82 @@ async fn get_active_tasks(State(state): State<AppState>) -> Json<serde_json::Val
     Json(serde_json::json!({
         "active_tasks": tasks
     }))
+}
+
+#[derive(Serialize)]
+struct MetricsResponse {
+    memory_os: MemoryMetrics,
+    dynamic_tooling: ToolingMetrics,
+    task_flow: TaskMetrics,
+    agent: AgentMetrics,
+    llm: LlmMetrics,
+    uptime_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct MemoryMetrics {
+    episodic_nodes: usize,
+    semantic_nodes: usize,
+    procedural_nodes: usize,
+}
+
+#[derive(Serialize)]
+struct ToolingMetrics {
+    execution_success: usize,
+    execution_failure: usize,
+}
+
+#[derive(Serialize)]
+struct TaskMetrics {
+    total_success: usize,
+    total_failures: usize,
+    active_concurrent_tasks: usize,
+}
+
+#[derive(Serialize)]
+struct AgentMetrics {
+    proactive_interactions: usize,
+    qa_passes: usize,
+    qa_failures: usize,
+}
+
+#[derive(Serialize)]
+struct LlmMetrics {
+    total_requests: usize,
+    http_429_errors: usize,
+    other_api_errors: usize,
+}
+
+async fn handle_metrics(
+    State(state): State<AppState>,
+) -> Json<MetricsResponse> {
+    let m = &METRICS;
+    let active_tasks = state.active_tasks.read().await.len();
+    let uptime = m.launch_time.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+    
+    Json(MetricsResponse {
+        memory_os: MemoryMetrics { episodic_nodes: 0, semantic_nodes: 0, procedural_nodes: 0 },
+        dynamic_tooling: ToolingMetrics {
+            execution_success: m.tool_execution_success.load(Ordering::Relaxed),
+            execution_failure: m.tool_execution_failure.load(Ordering::Relaxed),
+        },
+        task_flow: TaskMetrics {
+            total_success: m.task_total_success.load(Ordering::Relaxed),
+            total_failures: m.task_total_failures.load(Ordering::Relaxed),
+            active_concurrent_tasks: active_tasks,
+        },
+        agent: AgentMetrics {
+            proactive_interactions: m.proactive_interactions.load(Ordering::Relaxed),
+            qa_passes: m.qa_passes.load(Ordering::Relaxed),
+            qa_failures: m.qa_failures.load(Ordering::Relaxed),
+        },
+        llm: LlmMetrics {
+            total_requests: m.llm_total_requests.load(Ordering::Relaxed),
+            http_429_errors: m.llm_http_429_errors.load(Ordering::Relaxed),
+            other_api_errors: m.llm_other_api_errors.load(Ordering::Relaxed),
+        },
+        uptime_seconds: uptime,
+    })
 }
 
 async fn serve_ui() -> axum::response::Html<&'static str> {

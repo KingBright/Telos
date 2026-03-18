@@ -78,10 +78,18 @@ WORKFLOW:
 
 [TOOL_REFLECTION] SELF-EVOLUTION & DYNAMIC TOOL CREATION:
 If you find that your current tools are insufficient to solve a problem (e.g. you need a highly specific API Integration, custom data parser, or complex iterative calculation), you have the ability to create a NEW tool on the fly.
-1. Use the `create_rhai_tool` action to write a custom Rhai script. 
-2. The custom script will be automatically sandboxed, tested with your provided dummy parameters, and then permanently registered to the global `VectorToolRegistry`.
-3. Rhai scripts can use `http_get(url)` for network requests and access input parameters via the `params` hashmap. 
-4. Once successfully registered, you can immediately utilize your new tool in subsequent steps.
+1. Use the `create_rhai_tool` action to write a custom Rhai script.
+2. The custom script will be tested and permanently registered to the `VectorToolRegistry`.
+3. Rhai scripts can use `http_get(url)` for sync network requests and access input parameters via the `params` hashmap.
+4. **CRITICAL GUIDANCE**: You MUST invoke the `create_rhai_tool` using the native API action/function calling mechanism. DO NOT just print the JSON block in your chat response. Use the exact standard parameter structures:
+   Provide a strictly valid JSON string for `parameters_schema` and `test_params`. 
+   Example literal strings you would pass as arguments to the tool (not as text output):
+   name: "get_crypto_price"
+   parameters_schema: "{\"type\":\"object\",\"properties\":{\"coin_symbol\":{\"type\":\"string\"}},\"required\":[\"coin_symbol\"]}"
+   rhai_code: "let url = \"https://api.binance.com/api/v3/ticker/price?symbol=\" + params.coin_symbol + \"USDT\";\nlet response = http_get(url);\nreturn response;"
+   test_params: "{\"coin_symbol\":\"BTC\"}"
+5. Once successfully registered, you MUST immediately invoke your new tool using the native tool execution action.
+6. **NETWORK POLICY**: The system runs in a restricted network environment (GFW). When creating web-scraping or API tools, strictly prioritize domestic APIs, globally accessible unblocked enterprise APIs (like Binance `api.binance.com` over CoinGecko), or handle request errors gracefully. If an HTTP request times out or connection is refused, the domain is likely blocked. You should immediately rewrite the tool code to use an alternative endpoint.
 
 IMPORTANT RULES:
 - When using file_edit, provide search text that closely matches the existing file content

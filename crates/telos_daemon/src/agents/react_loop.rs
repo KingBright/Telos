@@ -373,13 +373,16 @@ impl ReactLoop {
 
         match result {
             Ok(Ok(bytes)) => {
+                crate::METRICS.tool_execution_success.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 String::from_utf8(bytes)
                     .map_err(|_| "Tool returned non-UTF8 output".to_string())
             }
             Ok(Err(tool_err)) => {
+                crate::METRICS.tool_execution_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err(format!("Tool error: {:?}", tool_err))
             }
             Err(_) => {
+                crate::METRICS.tool_execution_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err(format!("Tool '{}' timed out after {}s", tool_name, timeout_secs))
             }
         }

@@ -13,3 +13,4 @@ serde_json.workspace = true
 telos_model_gateway = { path = "../telos_model_gateway" }
 fastembed = "5.12.0"
 tracing.workspace = true
+dirs.workspace = true

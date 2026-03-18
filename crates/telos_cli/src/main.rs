@@ -475,6 +475,7 @@ fn check_and_init_config(force: bool) -> bool {
         openai_audio_base_url: None,
         openai_audio_api_key: None,
         tts_voice_id: telos_core::config::default_tts_voice_id(),
+        web_port: 3030,
     };
 
     match config.save() {

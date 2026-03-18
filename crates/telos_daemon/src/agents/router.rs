@@ -184,6 +184,13 @@ Expert: "抱歉，我无法获取相关信息。"
                         json["is_acceptable"] = serde_json::json!(false);
                     }
 
+                    let final_is_acceptable = json.get("is_acceptable").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if final_is_acceptable {
+                        crate::METRICS.qa_passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        crate::METRICS.qa_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+
                     if json.get("is_acceptable").is_some() || json.get("route").is_some() {
                         return AgentOutput::success(json).with_trace(trace);
                     }
@@ -383,7 +390,7 @@ User: "什么是快速排序算法？"
             },
             Message {
                 role: "user".to_string(),
-                content: full_task,
+                content: format!("{}\n\nVERY IMPORTANT: Your final response MUST be a single valid JSON object. Do not output markdown code blocks (unless inside a string value), and do not output explanations outside the JSON.", full_task),
             },
         ];
 

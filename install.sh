@@ -85,8 +85,16 @@ CONFIG_FILE="$HOME/.telos/config.toml"
 OLD_CONFIG_FILE="$HOME/.telos_config.toml"
 LOG_DIR="$HOME/.telos/logs"
 WORKSPACE_DIR="$HOME/.telos/workspace"
+WEB_DIR="$HOME/.telos/web"
 mkdir -p "$LOG_DIR"
 mkdir -p "$WORKSPACE_DIR"
+mkdir -p "$WEB_DIR"
+
+echo "Deploying Telemetry Web Assets to $WEB_DIR..."
+if [ -d "$(pwd)/crates/telos_web/static" ]; then
+    cp -r "$(pwd)/crates/telos_web/static/"* "$WEB_DIR/"
+fi
+
 
 # Configure auto-start files
 if [ "$OS" = "Darwin" ]; then

@@ -2083,8 +2083,19 @@ impl ToolExecutor for CreateRhaiTool {
             .ok_or_else(|| ToolError::ExecutionFailed("Missing 'test_params'".into()))?;
 
         // Parse schemas
-        let raw_schema: Value = serde_json::from_str(schema_str)
+        let mut raw_schema: Value = serde_json::from_str(schema_str)
             .map_err(|e| ToolError::ExecutionFailed(format!("Invalid parameter schema JSON: {}", e)))?;
+            
+        // Fortification: Handle LLM double-encoding (stringified JSON)
+        if let Value::String(s) = &raw_schema {
+            raw_schema = serde_json::from_str(s)
+                .map_err(|e| ToolError::ExecutionFailed(format!("Double-encoded schema is invalid JSON: {}", e)))?;
+        }
+        
+        if !raw_schema.is_object() {
+            return Err(ToolError::ExecutionFailed("parameters_schema must evaluate to a JSON Object, not a scalar.".into()));
+        }
+
         let test_params: Value = serde_json::from_str(test_params_str)
             .map_err(|e| ToolError::ExecutionFailed(format!("Invalid test params JSON: {}", e)))?;
 

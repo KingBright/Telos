@@ -137,7 +137,29 @@ REQUIRED JSON STRUCTURE:
                         serde_json::json!({ "text": "Research plan generated" }),
                         sub_graph
                     ).with_trace(trace),
-                    Err(e) => AgentOutput::failure("ResearchPlanParseError", &format!("Failed to parse research plan: {} (Raw: {})", e, clean_reply)).with_trace(trace),
+                    Err(e) => {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(clean_reply) {
+                            if let Some(tool) = val.get("tool").and_then(|t| t.as_str()) {
+                                let sub_node = telos_core::SubGraphNode {
+                                    id: format!("direct_call_{}", tool),
+                                    agent_type: "tool".to_string(),
+                                    task: format!("Execute tool: {}", tool),
+                                    schema_payload: serde_json::to_string(&val).unwrap_or_default(),
+                                    loop_config: None,
+                                    is_critic: false,
+                                };
+                                let sub_graph = telos_core::AgentSubGraph {
+                                    nodes: vec![sub_node],
+                                    edges: vec![],
+                                };
+                                return AgentOutput::with_subgraph(
+                                    serde_json::json!({ "text": "Research plan generated" }),
+                                    sub_graph
+                                ).with_trace(trace);
+                            }
+                        }
+                        AgentOutput::failure("ResearchPlanParseError", &format!("Failed to parse research plan: {} (Raw: {})", e, clean_reply)).with_trace(trace)
+                    }
                 }
             }
             Err(e) => AgentOutput::failure("LLMError", &format!("{:?}", e)),
