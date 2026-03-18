@@ -32,14 +32,19 @@ pub struct TelosConfig {
 
     pub active_project_id: Option<String>,
 
-    /// Maximum concurrent requests (default: 20)
-    /// Set to 0 to disable internal rate limiting
-    #[serde(default = "default_max_concurrent_requests")]
-    pub max_concurrent_requests: usize,
+
 
     /// Log level for feedback verbosity (quiet, normal, verbose, debug)
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Proactive minimum artificial delay (milliseconds) between consecutive LLM Requests to avoid 429 errors.
+    #[serde(default = "default_llm_throttle_ms")]
+    pub llm_throttle_ms: u64,
+
+    /// Global Concurrency Permits: maximum active LLM requests executing at the exact same physical time.
+    #[serde(default = "default_global_concurrency_permits")]
+    pub global_concurrency_permits: usize,
 
     /// Global prompt context for LLM (e.g., "user is in China, prefer domestic websites")
     /// This context will be injected into planning prompts to help LLM make better decisions
@@ -74,12 +79,17 @@ fn default_persona_trait() -> String {
     "聪明、活泼且不失风趣".to_string()
 }
 
-fn default_tts_voice_id() -> String {
+pub fn default_tts_voice_id() -> String {
     "alloy".to_string()
 }
 
-fn default_max_concurrent_requests() -> usize {
-    20
+
+fn default_llm_throttle_ms() -> u64 {
+    2000 // Zhipu API shared concurrency limiter sweet-spot.
+}
+
+fn default_global_concurrency_permits() -> usize {
+    3 // Very safe value for concurrent model calls to cheap tier providers.
 }
 
 fn default_log_level() -> String {

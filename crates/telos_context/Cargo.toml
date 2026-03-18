@@ -19,3 +19,6 @@ tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 telos_memory = { path = "../telos_memory" }
+
+[dev-dependencies]
+wiremock = "0.6.5"

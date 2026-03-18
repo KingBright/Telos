@@ -73,15 +73,23 @@ Output your review as a JSON object:
 
 Keep it concise. If the content is already good, approve it and pass it through."#;
 
+        let mut messages = vec![
+            Message { role: "system".to_string(), content: system_prompt.to_string() },
+        ];
+        for msg in &input.conversation_history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: format!("Task: {}\n\nContent to review:\n{}", input.task, content_to_review),
+        });
+
         let req = LlmRequest {
             session_id: format!("reviewer_{}", input.node_id),
-            messages: vec![
-                Message { role: "system".to_string(), content: system_prompt.to_string() },
-                Message {
-                    role: "user".to_string(),
-                    content: format!("Task: {}\n\nContent to review:\n{}", input.task, content_to_review),
-                },
-            ],
+            messages,
             required_capabilities: Capability {
                 requires_vision: false,
                 strong_reasoning: false,

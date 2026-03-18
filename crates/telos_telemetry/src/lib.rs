@@ -264,6 +264,7 @@ mod tests {
             steps: vec![],
             errors_encountered: vec![],
             success: true,
+            sub_graph: None,
         };
 
         provider.store_trace(trace.clone());
@@ -291,6 +292,7 @@ mod tests {
             steps: vec![step1],
             errors_encountered: vec![],
             success: true,
+            sub_graph: None,
         };
 
         provider.store_trace(trace);

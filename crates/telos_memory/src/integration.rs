@@ -22,6 +22,16 @@ pub trait MemoryIntegration: Send + Sync {
     /// Designed for explicit memory storage via tools.
     /// Allows the agent to explicitly store important facts or insights as semantic memories.
     async fn store_semantic_fact(&self, content: String) -> Result<(), String>;
+
+    /// Retrieves procedural memories (distilled skills or workflow templates) based on a query.
+    async fn retrieve_procedural_memories(&self, query_string: String) -> Result<Vec<String>, String>;
+
+    /// Designed for the Evolution module (Module 6).
+    /// Stores distilled skills/strategies as Procedural Memory (never decays).
+    async fn store_procedural_skill(&self, trigger: String, procedure: String) -> Result<(), String>;
+
+    /// Stores the topology of a successful DAG execution as a JSON Workflow Template.
+    async fn store_workflow_template(&self, description: String, template_json: String) -> Result<(), String>;
 }
 
 // Implement this trait for any system that implements `MemoryOS` (like RedbGraphStore).
@@ -87,6 +97,57 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
             timestamp,
             None,
         );
+
+        self.store(entry).await
+    }
+
+    async fn retrieve_procedural_memories(&self, query_string: String) -> Result<Vec<String>, String> {
+        // Query the memory OS specifically for Procedural memories (skills or workflow templates).
+        let query = MemoryQuery::EntityLookup { entity: query_string };
+
+        let results = self.retrieve(query).await?;
+
+        // Extract the content from the procedural memories.
+        Ok(results
+            .into_iter()
+            .filter(|e| e.memory_type == MemoryType::Procedural)
+            .map(|e| e.content)
+            .collect())
+    }
+
+    async fn store_procedural_skill(&self, trigger: String, procedure: String) -> Result<(), String> {
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let entry_id = format!("proc_skill_{}", timestamp);
+        let content = format!("[Trigger] {}\n[Procedure] {}", trigger, procedure);
+
+        let mut entry = MemoryEntry::new(
+            entry_id,
+            MemoryType::Procedural,
+            content,
+            timestamp,
+            None,
+        );
+        // High initial strength — procedural skills are valuable long-term knowledge
+        entry.base_strength = 5.0;
+        entry.current_strength = 5.0;
+
+        self.store(entry).await
+    }
+
+    async fn store_workflow_template(&self, description: String, template_json: String) -> Result<(), String> {
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let entry_id = format!("workflow_template_{}", timestamp);
+        let content = format!("[Description] {}\n[TemplateJSON]\n{}", description, template_json);
+
+        let mut entry = MemoryEntry::new(
+            entry_id,
+            MemoryType::Procedural, // Workflow templates are procedural
+            content,
+            timestamp,
+            None,
+        );
+        entry.base_strength = 5.0;
+        entry.current_strength = 5.0;
 
         self.store(entry).await
     }

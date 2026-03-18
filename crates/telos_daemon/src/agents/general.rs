@@ -92,12 +92,20 @@ REQUIRED JSON STRUCTURE:
             .with_role_instructions(&role_instructions)
             .build();
 
+        let mut messages = vec![
+            Message { role: "system".to_string(), content: system_prompt },
+        ];
+        for msg in &input.conversation_history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        messages.push(Message { role: "user".to_string(), content: format!("Task: {}", input.task) });
+
         let req = LlmRequest {
             session_id: format!("general_{}", input.node_id),
-            messages: vec![
-                Message { role: "system".to_string(), content: system_prompt },
-                Message { role: "user".to_string(), content: format!("Task: {}", input.task) },
-            ],
+            messages,
             required_capabilities: Capability {
                 requires_vision: false,
                 strong_reasoning: true,
@@ -237,12 +245,20 @@ REQUIRED JSON STRUCTURE:
         let soul_content2 = crate::agents::prompt_builder::get_soul();
         let system_prompt = format!("{}{}{}[IDENTITY & VALUES]\n{}\n\nYou MUST respond as the persona described above. NEVER call yourself 'GeneralAgent' or reveal internal agent names. Synthesize results into a natural, persona-consistent response.", env_context, mem_context, if mem_context.is_empty() {""} else {"\n\n"}, soul_content2);
 
+        let mut messages = vec![
+            Message { role: "system".to_string(), content: system_prompt },
+        ];
+        for msg in &input.conversation_history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        messages.push(Message { role: "user".to_string(), content: prompt });
+
         let req = LlmRequest {
             session_id: format!("summarize_{}", input.node_id),
-            messages: vec![
-                Message { role: "system".to_string(), content: system_prompt },
-                Message { role: "user".to_string(), content: prompt },
-            ],
+            messages,
             required_capabilities: Capability {
                 requires_vision: false,
                 strong_reasoning: false,

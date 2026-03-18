@@ -5,5 +5,8 @@ crates/telos_tooling/.fastembed_cache/
 /tests
 /reports
 /test_traces
-test_retry_output.log
-daemon_output.log
+*.log
+*.pid
+*.rhai
+test_*.*
+analyze_traces.py

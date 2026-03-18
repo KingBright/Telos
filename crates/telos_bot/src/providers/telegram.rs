@@ -212,20 +212,9 @@ impl TelegramFeedbackFormatter {
                 ))
             }
 
-            AgentFeedback::Output {
-                content, is_final, silent, ..
-            } => {
-                if *silent { return None; }
-                if !*is_final && !self.level.should_show(LogLevel::Verbose) {
-                    return None;
-                }
-                let prefix = if *is_final { "✓" } else { "→" };
-                // Escape HTML carefully because raw LLM output could contain '<', '>', '&' which crashes telegram's ParseMode::Html
-                let escaped_content = teloxide::utils::html::escape(content);
-                Some(Self::truncate_for_telegram(
-                    &format!("{} {}", prefix, escaped_content),
-                    4000,
-                ))
+            AgentFeedback::Output { .. } => {
+                // Handled directly in listen_to_daemon to allow async image sending
+                None
             }
 
             AgentFeedback::LogLevelChanged {
@@ -649,6 +638,29 @@ impl TelegramBotProvider {
                                                     chat_id_str.clone(),
                                                     (task_id.clone(), "clarification".to_string()),
                                                 );
+                                            }
+                                            AgentFeedback::Output { content, is_final, silent, .. } => {
+                                                if !*silent && (*is_final || current_level.should_show(LogLevel::Verbose)) {
+                                                    let (html_content, images) = crate::markdown_renderer::render_markdown_to_telegram(content);
+                                                    let prefix = if *is_final { "✓" } else { "→" };
+                                                    let formatted = TelegramFeedbackFormatter::truncate_for_telegram(&format!("{} {}", prefix, html_content), 4000);
+                                                    
+                                                    // Send text
+                                                    let _ = bot.send_message(chat_id, &formatted).parse_mode(teloxide::types::ParseMode::Html).await;
+                                                    
+                                                    // Send extracted images
+                                                    for img_url in images {
+                                                        if let Ok(url) = reqwest::Url::parse(&img_url) {
+                                                            let _ = bot.send_photo(chat_id, teloxide::types::InputFile::url(url)).await;
+                                                        }
+                                                    }
+                                                }
+                                                if feedback.is_final() {
+                                                    pending_interactions.lock().await.remove(&chat_id_str);
+                                                    if let Some(tid) = trace_id_to_remove.clone() {
+                                                        active_tasks.lock().await.remove(&tid);
+                                                    }
+                                                }
                                             }
                                             _ => {
                                                 if let Some(formatted) = formatter.format(&feedback)

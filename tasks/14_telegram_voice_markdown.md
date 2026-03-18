@@ -26,4 +26,11 @@ This document tracks the integration of Voice inputs/outputs and robust Markdown
 - [ ] Send the resulting audio byte stream back to the user via `bot.send_voice()`.
 
 ## Notes / Issues
+- [x] Fixed WebSearchTool falling back to Baidu/Bing string matching poorly. Updated CSS selectors to scrape Baidu accurately and resolve the 2026 West Lake Half Marathon date lookup.
+- [x] Strengthened compatibility for `search_bing` and `search_duckduckgo` by adding broader CSS selectors and a foolproof fallback mechanism to extract the entire text chunk if the specific snippet element is missing.
 - [ ] _To be filled during implementation_
+
+## 6. Deep Memory Integration V2
+- [x] Add `ConversationMessage` & `conversation_history` to `telos_core::AgentInput`
+- [x] Update `telos_daemon/src/main.rs` `/run` endpoint to map memories into `conversation_history` array
+- [x] Update `RouterAgent` and nodes (`ExpertWorker`, `Coder`, `Researcher`, `General`, `Tester`, `Architect`) to inject `conversation_history` into `LlmRequest::messages`

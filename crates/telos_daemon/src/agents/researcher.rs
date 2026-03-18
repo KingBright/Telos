@@ -89,12 +89,20 @@ REQUIRED JSON STRUCTURE:
 }}"#)
             .build();
 
+        let mut messages = vec![
+            Message { role: "system".to_string(), content: system_prompt },
+        ];
+        for msg in &input.conversation_history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        messages.push(Message { role: "user".to_string(), content: format!("Task: {}", input.task) });
+
         let req = LlmRequest {
             session_id: format!("research_{}", input.node_id),
-            messages: vec![
-                Message { role: "system".to_string(), content: system_prompt },
-                Message { role: "user".to_string(), content: format!("Task: {}", input.task) },
-            ],
+            messages,
             required_capabilities: Capability {
                 requires_vision: false,
                 strong_reasoning: true,
@@ -230,12 +238,20 @@ REQUIRED JSON STRUCTURE:
         let mem_context = input.memory_context.clone().unwrap_or_default();
         let system_prompt = format!("{}{}{}You are the DeepResearchAgent Synthesizer.", env_context, mem_context, if mem_context.is_empty() {""} else {"\n\n"});
 
+        let mut messages = vec![
+            Message { role: "system".to_string(), content: system_prompt },
+        ];
+        for msg in &input.conversation_history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        messages.push(Message { role: "user".to_string(), content: prompt });
+
         let req = LlmRequest {
             session_id: format!("summarize_{}", input.node_id),
-            messages: vec![
-                Message { role: "system".to_string(), content: system_prompt },
-                Message { role: "user".to_string(), content: prompt },
-            ],
+            messages,
             required_capabilities: Capability {
                 requires_vision: false,
                 strong_reasoning: false,

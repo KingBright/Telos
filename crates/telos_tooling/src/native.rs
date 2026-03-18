@@ -1,4 +1,4 @@
-use crate::{JsonSchema, ToolError, ToolExecutor, ToolSchema};
+use crate::{JsonSchema, ToolError, ToolExecutor, ToolRegistry, ToolSchema};
 use tracing::{info, debug, warn, error};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -1203,51 +1203,67 @@ impl WebSearchTool {
             let document = scraper::Html::parse_document(&html);
 
             // Strategy 1: CSS selectors
-            let result_sel = scraper::Selector::parse(".result").unwrap();
-            let title_sel = scraper::Selector::parse(".result__a").unwrap();
-            let snippet_sel = scraper::Selector::parse(".result__snippet").unwrap();
-            let url_sel = scraper::Selector::parse(".result__url").unwrap();
-
+            let result_selectors = [".result", "div.result", "div[class*=\"result\"]", "tr"];
             let mut results = Vec::new();
-            for result in document.select(&result_sel).take(10) {
-                let title = result.select(&title_sel).next()
-                    .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
-                    .unwrap_or_default();
-                let url = result.select(&title_sel).next()
-                    .and_then(|e| e.value().attr("href"))
-                    .map(|href| {
-                        if let Some(pos) = href.find("uddg=") {
-                            urlencoding::decode(&href[pos + 5..]).unwrap_or_default().to_string()
-                        } else if href.starts_with("http") {
-                            href.to_string()
-                        } else {
-                            result.select(&url_sel).next()
-                                .map(|e| {
-                                    let u = e.text().collect::<String>().trim().to_string();
-                                    if !u.starts_with("http") { format!("https://{}", u) } else { u }
-                                })
-                                .unwrap_or_default()
+
+            for sel_str in &result_selectors {
+                if let Ok(result_sel) = scraper::Selector::parse(sel_str) {
+                    let title_sel = scraper::Selector::parse(".result__a, h2 a, a.result-snippet, a[class*=\"title\"]").unwrap();
+                    let snippet_sel = scraper::Selector::parse(".result__snippet, .result-snippet, td.result-snippet, div[class*=\"snippet\"]").unwrap();
+                    let url_sel = scraper::Selector::parse(".result__url").unwrap();
+
+                    for result in document.select(&result_sel).take(10) {
+                        let title = result.select(&title_sel).next()
+                            .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
+                            .unwrap_or_default();
+                        let url = result.select(&title_sel).next()
+                            .and_then(|e| e.value().attr("href"))
+                            .map(|href| {
+                                if let Some(pos) = href.find("uddg=") {
+                                    urlencoding::decode(&href[pos + 5..]).unwrap_or_default().to_string()
+                                } else if href.starts_with("http") {
+                                    href.to_string()
+                                } else {
+                                    result.select(&url_sel).next()
+                                        .map(|e| {
+                                            let u = e.text().collect::<String>().trim().to_string();
+                                            if !u.starts_with("http") { format!("https://{}", u) } else { u }
+                                        })
+                                        .unwrap_or_default()
+                                }
+                            })
+                            .unwrap_or_default();
+                        let mut snippet = result.select(&snippet_sel).next()
+                            .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
+                            .unwrap_or_default();
+                            
+                        if snippet.is_empty() {
+                            let full_text = SearchResult::clean_text(&result.text().collect::<String>());
+                            if full_text.len() > title.len() {
+                                let mut stripped = full_text.replace(&title, "");
+                                // DDG adds URLs to text sometimes
+                                if let Some(url_idx) = stripped.find("http") {
+                                    stripped = stripped[..url_idx].to_string();
+                                }
+                                snippet = stripped.trim().to_string();
+                            }
                         }
-                    })
-                    .unwrap_or_default();
-                let snippet = result.select(&snippet_sel).next()
-                    .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
-                    .unwrap_or_default();
 
-                if !title.is_empty() && !snippet.is_empty() {
-                    results.push(SearchResult { title, url, snippet });
+                        if !title.is_empty() && (!snippet.is_empty() || !url.is_empty()) {
+                            results.push(SearchResult { title, url, snippet });
+                        }
+                    }
+                    if !results.is_empty() {
+                        return Ok(results);
+                    }
                 }
-            }
-
-            if !results.is_empty() {
-                return Ok(results);
             }
 
             // Strategy 2: Fallback — old line-based string matching (for HTML structure changes)
             debug!("[WebSearch] DDG CSS selectors found nothing, trying string fallback. HTML len={}", html.len());
             let mut fallback_results = Vec::new();
             for line in html.split('\n') {
-                if line.contains("result__snippet") || line.contains("result-snippet") {
+                if line.contains("result__snippet") || line.contains("result-snippet") || line.contains("class=\"snippet\"") || line.contains("class=\"result-link\"") || line.contains("class=\"link-text\"") {
                     let text = line.replace("<b>", "").replace("</b>", "").replace("<a", "").replace("</a>", "");
                     let clean: String = text
                         .split('>')
@@ -1255,29 +1271,13 @@ impl WebSearchTool {
                         .collect::<Vec<&str>>()
                         .join("")
                         .trim().to_string();
-                    if !clean.is_empty() && clean.len() > 20 {
+                    if !clean.is_empty() && clean.len() > 10 {
                         fallback_results.push(SearchResult { title: String::new(), url: String::new(), snippet: clean });
                     }
                 }
             }
             if !fallback_results.is_empty() {
                 info!("[WebSearch] DDG fallback parser found {} results", fallback_results.len());
-                return Ok(fallback_results);
-            }
-
-            // If lite endpoint HTML has results in <td> tags (lite format)
-            for line in html.split('\n') {
-                if line.contains("class=\"result-link\"") || line.contains("class=\"link-text\"") {
-                    let text: String = line.split('>').skip(1)
-                        .flat_map(|s| s.split('<').next().unwrap_or("").chars())
-                        .collect();
-                    let trimmed = text.trim().to_string();
-                    if !trimmed.is_empty() && trimmed.len() > 10 {
-                        fallback_results.push(SearchResult { title: trimmed, url: String::new(), snippet: String::new() });
-                    }
-                }
-            }
-            if !fallback_results.is_empty() {
                 return Ok(fallback_results);
             }
 
@@ -1295,13 +1295,13 @@ impl WebSearchTool {
         let document = scraper::Html::parse_document(&html);
 
         // Strategy 1: CSS selectors (try multiple known selectors)
-        let result_selectors = [".b_algo", "li.b_algo", ".b_results .b_algo"];
+        let result_selectors = [".b_algo", "li.b_algo", ".b_results .b_algo", "li[class*=\"algo\"]", "div[class*=\"algo\"]"];
         let mut results = Vec::new();
 
         for sel_str in &result_selectors {
             if let Ok(result_sel) = scraper::Selector::parse(sel_str) {
                 let title_sel = scraper::Selector::parse("h2 a").unwrap();
-                let snippet_sel = scraper::Selector::parse("p, .b_caption p, .b_lineclamp2, .b_algoSlug").unwrap();
+                let snippet_sel = scraper::Selector::parse("p, .b_caption p, .b_lineclamp2, .b_algoSlug, div[class*=\"lineclamp\"], div[class*=\"caption\"]").unwrap();
 
                 for result in document.select(&result_sel).take(10) {
                     let title_elem = result.select(&title_sel).next();
@@ -1312,9 +1312,17 @@ impl WebSearchTool {
                         .and_then(|e| e.value().attr("href"))
                         .unwrap_or("")
                         .to_string();
-                    let snippet = result.select(&snippet_sel).next()
+                    let mut snippet = result.select(&snippet_sel).next()
                         .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
                         .unwrap_or_default();
+                        
+                    if snippet.is_empty() {
+                        let full_text = SearchResult::clean_text(&result.text().collect::<String>());
+                        if full_text.len() > title.len() {
+                            // Bing sometimes prepends "Web" or appends the URL
+                            snippet = full_text.replace(&title, "").replace("Web", "").trim().to_string();
+                        }
+                    }
 
                     if !title.is_empty() && !url.is_empty() {
                         results.push(SearchResult { title, url, snippet });
@@ -1329,8 +1337,8 @@ impl WebSearchTool {
         // Strategy 2: Fallback string matching
         debug!("[WebSearch] Bing CSS selectors found nothing. HTML len={}", html.len());
         for line in html.split('\n') {
-            if line.contains("class=\"b_caption\"") || line.contains("class=\"b_algoSlug\"") || line.contains("class=\"b_lineclamp") {
-                let clean = line.replace("<p>", "").replace("</p>", "").replace("<strong>", "").replace("</strong>", "");
+            if line.contains("class=\"b_caption\"") || line.contains("class=\"b_algoSlug\"") || line.contains("class=\"b_lineclamp") || line.contains("class=\"algo") || line.contains("caption") {
+                let clean = line.replace("<p>", "").replace("</p>", "").replace("<strong>", "").replace("</strong>", "").replace("<span>", "").replace("</span>", "");
                 let text: String = clean
                     .split('>')
                     .skip(1)
@@ -1360,13 +1368,13 @@ impl WebSearchTool {
         let document = scraper::Html::parse_document(&html);
 
         // Strategy 1: CSS selectors for Baidu News
-        let result_selectors = [".result-op", ".result"];
+        let result_selectors = [".result-op", ".result", "div[class*=\"result\"]"];
         let mut results = Vec::new();
 
         for sel_str in &result_selectors {
             if let Ok(result_sel) = scraper::Selector::parse(sel_str) {
-                let title_sel = scraper::Selector::parse("h3.news-title a, h3.c-title a").unwrap();
-                let snippet_sel = scraper::Selector::parse(".c-summary, .news-summary, span.c-font-normal, span.c-color-text").unwrap();
+                let title_sel = scraper::Selector::parse("h3 a").unwrap();
+                let snippet_sel = scraper::Selector::parse(".c-summary, .news-summary, span.c-font-normal, span.c-color-text, div.c-span-last").unwrap();
 
                 for result in document.select(&result_sel).take(10) {
                     let title_elem = result.select(&title_sel).next();
@@ -1381,7 +1389,7 @@ impl WebSearchTool {
                         .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
                         .unwrap_or_default();
 
-                    if !title.is_empty() {
+                    if !title.is_empty() && !snippet.is_empty() {
                         results.push(SearchResult { title, url, snippet });
                     }
                 }
@@ -1394,7 +1402,7 @@ impl WebSearchTool {
         // Strategy 2: fallback string matching for news
         debug!("[WebSearch] Baidu News CSS selectors found nothing. HTML len={}", html.len());
         for line in html.split('\n') {
-            if line.contains("class=\"c-summary\"") || line.contains("class=\"news-title\"") {
+            if line.contains("class=\"c-summary\"") || line.contains("class=\"news-title\"") || line.contains("c-span-last") {
                 let clean = line.replace("<em>", "").replace("</em>", "").replace("&nbsp;", " ");
                 let text: String = clean.chars()
                     .skip_while(|c| *c != '>')
@@ -1424,13 +1432,13 @@ impl WebSearchTool {
         let document = scraper::Html::parse_document(&html);
 
         // Strategy 1: CSS selectors
-        let result_selectors = [".result.c-container", ".c-container", "div.result"];
+        let result_selectors = [".result.c-container", ".c-container", "div[class*=\"result\"]"];
         let mut results = Vec::new();
 
         for sel_str in &result_selectors {
             if let Ok(result_sel) = scraper::Selector::parse(sel_str) {
                 let title_sel = scraper::Selector::parse("h3 a").unwrap();
-                let snippet_sel = scraper::Selector::parse(".c-abstract, .c-span-last, .content-right_8Sakl").unwrap();
+                let snippet_sel = scraper::Selector::parse(".c-abstract, .c-span-last, .content-right_8Sakl, div[class*=\"content-right\"], div.c-span18").unwrap();
 
                 for result in document.select(&result_sel).take(10) {
                     let title_elem = result.select(&title_sel).next();
@@ -1445,7 +1453,7 @@ impl WebSearchTool {
                         .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
                         .unwrap_or_default();
 
-                    if !title.is_empty() {
+                    if !title.is_empty() && !snippet.is_empty() {
                         results.push(SearchResult { title, url, snippet });
                     }
                 }
@@ -1458,7 +1466,7 @@ impl WebSearchTool {
         // Strategy 2: fallback string matching
         debug!("[WebSearch] Baidu CSS selectors found nothing. HTML len={}", html.len());
         for line in html.split('\n') {
-            if line.contains("class=\"c-abstract\"") || line.contains("class=\"content-right") {
+            if line.contains("class=\"c-abstract\"") || line.contains("class=\"content-right") || line.contains("c-span-last") {
                 let clean = line.replace("<em>", "").replace("</em>", "").replace("&nbsp;", " ");
                 let text: String = clean.chars()
                     .skip_while(|c| *c != '>')
@@ -1649,14 +1657,14 @@ impl ToolExecutor for WebSearchTool {
                 tokio::time::sleep(sleep_time).await;
             }
 
-            // 1. Bing CN — ALWAYS direct (domestic, fast, 0.3s typical)
-            try_engine!("Bing CN", search_bing, &direct_client);
-            
-            // 2. Baidu News — for real-time events, weather, news
+            // 1. Baidu News — for real-time events, weather, news (Best for Chinese events)
             try_engine!("Baidu News", search_baidu_news, &direct_client);
             
-            // 3. Baidu (Web) — fallback for general knowledge
+            // 2. Baidu (Web) — fallback for general knowledge
             try_engine!("Baidu", search_baidu, &direct_client);
+
+            // 3. Bing CN — fast, but sometimes returns off-topic SEO results
+            try_engine!("Bing CN", search_bing, &direct_client);
             
             // 4. DuckDuckGo — ONLY through proxy (blocked in China without proxy)
             if let Some(ref pc) = proxy_client {
@@ -2015,6 +2023,104 @@ impl GetTimeTool {
             },
             risk_level: RiskLevel::Normal,
             ..Default::default()
+        }
+    }
+}
+
+// 17. Create Rhai Tool
+#[derive(Clone)]
+#[cfg(feature = "full")]
+pub struct CreateRhaiTool {
+    registry: std::sync::Arc<dyn ToolRegistry>,
+}
+
+#[cfg(feature = "full")]
+impl CreateRhaiTool {
+    pub fn new(registry: std::sync::Arc<dyn ToolRegistry>) -> Self {
+        Self { registry }
+    }
+
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "create_rhai_tool".into(),
+            description: "Creates and permanently registers a new Rhai script tool. The script will be tested first. Requires 'name', 'description', 'parameters_schema', 'rhai_code', and 'test_params'. \
+            The parameters_schema must be a valid JSON Schema string. \
+            The rhai_code must use the `params` HashMap as input, e.g., `let my_var = params.my_var;`, and implicitly return a value at the end. \
+            You can use the built-in `http_get(url)` function in your script to perform HTTP requests. \
+            Provide valid dummy `test_params` json string to verify it works before registration.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Snake_case name of the new tool, e.g. 'fetch_crypto_price'." },
+                        "description": { "type": "string", "description": "Detailed description of what the tool does." },
+                        "parameters_schema": { "type": "string", "description": "JSON string of the tool's input schema." },
+                        "rhai_code": { "type": "string", "description": "The actual Rhai script code." },
+                        "test_params": { "type": "string", "description": "JSON string of dummy parameters to test the script with before registering." }
+                    },
+                    "required": ["name", "description", "parameters_schema", "rhai_code", "test_params"]
+                }),
+            },
+            risk_level: RiskLevel::HighRisk,
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(feature = "full")]
+#[async_trait]
+impl ToolExecutor for CreateRhaiTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let name = params.get("name").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'name'".into()))?.to_string();
+        let description = params.get("description").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'description'".into()))?.to_string();
+        let schema_str = params.get("parameters_schema").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'parameters_schema'".into()))?;
+        let rhai_code = params.get("rhai_code").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'rhai_code'".into()))?.to_string();
+        let test_params_str = params.get("test_params").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'test_params'".into()))?;
+
+        // Parse schemas
+        let raw_schema: Value = serde_json::from_str(schema_str)
+            .map_err(|e| ToolError::ExecutionFailed(format!("Invalid parameter schema JSON: {}", e)))?;
+        let test_params: Value = serde_json::from_str(test_params_str)
+            .map_err(|e| ToolError::ExecutionFailed(format!("Invalid test params JSON: {}", e)))?;
+
+        // 1. Run the test in Sandbox
+        use crate::script_sandbox::{ScriptSandbox, ScriptExecutor};
+        use std::sync::Arc;
+        
+        let sandbox = Arc::new(ScriptSandbox::new());
+        match sandbox.execute(&rhai_code, test_params) {
+            Ok(test_result) => {
+                info!("[CreateRhaiTool] Test passed for {}. Result: {}", name, test_result);
+                
+                let new_schema = ToolSchema {
+                    name: name.clone(),
+                    description,
+                    parameters_schema: JsonSchema { raw_schema },
+                    risk_level: RiskLevel::Normal,
+                    ..Default::default()
+                };
+                
+                let new_executor = Arc::new(ScriptExecutor::new(rhai_code, sandbox));
+                
+                if let Err(e) = self.registry.register_dynamic_tool(new_schema, new_executor) {
+                    return Err(ToolError::ExecutionFailed(format!("Failed to register tool into VectorToolRegistry: {}", e)));
+                }
+                
+                let out = serde_json::json!({
+                    "status": "success",
+                    "message": format!("Tool '{}' correctly tested and permanently registered.", name),
+                    "test_output": test_result
+                });
+                return Ok(serde_json::to_vec(&out).unwrap());
+            }
+            Err(e) => {
+                return Err(ToolError::ExecutionFailed(format!("Script Sandbox test failed: {:?}", e)));
+            }
         }
     }
 }

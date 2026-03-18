@@ -17,6 +17,7 @@ pub struct ExecutionTrace {
     pub steps: Vec<TraceStep>,
     pub errors_encountered: Vec<NodeError>,
     pub success: bool,
+    pub sub_graph: Option<telos_core::AgentSubGraph>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

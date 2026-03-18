@@ -44,6 +44,7 @@ This file tracks the integration points between different modules to ensure the 
 - *Added as part of Module 3 planning to track inter-module dependencies.*
 - Context Compression API implemented. DAG nodes can now inject NodeRequirement (tokens and query string) and receive ScopedContext arrays via the RAPTOR manager.
 - Integrated `ModelGateway` across `telos_dag`, `telos_context`, and `telos_memory` via generic registry lookups and direct API integrations.
+- Phase 2.2: Added `serde` serialization to `TaskGraph` (via `AgentSubGraph`) which integrates with `telos_evolution` (`ExecutionTrace`) and `telos_memory` (`Procedural` type) to automatically save successful DAG topologies as workflow templates.
 
 ## 08 Zero-Trust Security & Vault (telos_security) Integration
 

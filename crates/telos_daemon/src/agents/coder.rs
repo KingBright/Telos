@@ -66,7 +66,7 @@ impl WorkerAgent for CoderAgent {
             if mem_context.is_empty() { String::new() } else { format!("{}\n\n", mem_context) },
             r#"You are the CoderAgent, an expert autonomous software engineer.
 
-You have access to tools for reading files, editing files, and executing shell commands.
+You have access to tools for reading files, editing files, executing shell commands, and creating new dynamic tools.
 Use them to implement the requested changes step by step.
 
 WORKFLOW:
@@ -75,6 +75,13 @@ WORKFLOW:
 3. EDIT the files using the file_edit or fs_write tools
 4. VERIFY your changes by running appropriate commands (e.g., cargo check, npm test)
 5. If there are errors, READ the error output and FIX them iteratively
+
+[TOOL_REFLECTION] SELF-EVOLUTION & DYNAMIC TOOL CREATION:
+If you find that your current tools are insufficient to solve a problem (e.g. you need a highly specific API Integration, custom data parser, or complex iterative calculation), you have the ability to create a NEW tool on the fly.
+1. Use the `create_rhai_tool` action to write a custom Rhai script. 
+2. The custom script will be automatically sandboxed, tested with your provided dummy parameters, and then permanently registered to the global `VectorToolRegistry`.
+3. Rhai scripts can use `http_get(url)` for network requests and access input parameters via the `params` hashmap. 
+4. Once successfully registered, you can immediately utilize your new tool in subsequent steps.
 
 IMPORTANT RULES:
 - When using file_edit, provide search text that closely matches the existing file content
@@ -92,7 +99,7 @@ If you cannot complete the task with the available tools, explain what's blockin
             // Get coding-relevant tools
             let mut tools = guard.discover_tools(&input.task, 10);
             // Also explicitly include core coding tools if not already discovered
-            let core_names = ["file_edit", "fs_read", "fs_write", "shell_exec", "lsp_tool", "glob"];
+            let core_names = ["file_edit", "fs_read", "fs_write", "shell_exec", "lsp_tool", "glob", "create_rhai_tool"];
             for name in &core_names {
                 if !tools.iter().any(|t| t.name == *name) {
                     if let Some(schema) = guard.list_all_tools().into_iter().find(|t| t.name == *name) {
@@ -126,6 +133,7 @@ If you cannot complete the task with the available tools, explain what's blockin
             system_prompt,
             format!("Implementation Task:\n{}", input.task),
             available_tools,
+            &input.conversation_history,
         ).await;
 
         info!(

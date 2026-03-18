@@ -8,13 +8,14 @@ telos_core = { path = "../telos_core" }
 telos_hci = { path = "../telos_hci" }
 telos_context = { path = "../telos_context" }
 async-trait.workspace = true
-petgraph.workspace = true
+petgraph = { workspace = true, features = ["serde-1"] }
 redb.workspace = true
 lru = "0.16.3"
 tokio.workspace = true
 futures.workspace = true
 uuid = { version = "1.21.0", features = ["v4"] }
 telos_model_gateway = { path = "../telos_model_gateway" }
+serde.workspace = true
 serde_json.workspace = true
 telos_telemetry = { path = "../telos_telemetry" }
 telos_evolution = { path = "../telos_evolution" }

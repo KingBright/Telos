@@ -231,7 +231,7 @@ async fn test_checkpoint_recovery() {
 #[tokio::test]
 async fn test_llm_node_integration() {
     let provider = Arc::new(DummyModelProvider);
-    let gateway = Arc::new(telos_model_gateway::gateway::GatewayManager::new(provider, 100));
+    let gateway = Arc::new(telos_model_gateway::gateway::GatewayManager::new(provider, 0, 3));
     let registry = GatewayRegistry { gateway: gateway.clone() };
 
     let mut graph = TaskGraph::new("llm_graph".into());

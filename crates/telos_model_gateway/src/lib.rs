@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-pub mod rate_limiter;
+
 pub mod backoff;
 pub mod gateway;
 
@@ -256,7 +256,6 @@ mod tests {
     use tokio::sync::Mutex;
     use std::time::Instant;
     use crate::gateway::{GatewayManager, ModelProvider};
-    use crate::rate_limiter::SimpleRateLimiter;
 
     // --- Mock Provider ---
     struct MockProvider {
@@ -292,38 +291,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_simple_rate_limiter_basic() {
-        // capacity of 3
-        let mut limiter = SimpleRateLimiter::new(3);
 
-        // consume 3 tokens (one at a time, each consumes 1)
-        assert!(limiter.try_consume());
-        assert!(limiter.try_consume());
-        assert!(limiter.try_consume());
 
-        // try consume 1 more, should fail
-        assert!(!limiter.try_consume());
-    }
 
-    #[tokio::test]
-    async fn test_gateway_rate_limit_rejection() {
-        let provider = Arc::new(MockProvider {
-            fail_count: Mutex::new(0),
-            error_to_return: GatewayError::TooManyRequests { retry_after_ms: None },
-        });
-
-        // 1 capacity - only one concurrent request per session
-        let gateway = GatewayManager::new(provider, 1);
-
-        // First request works
-        let res1 = gateway.generate(dummy_req(100)).await;
-        assert!(res1.is_ok());
-
-        // Second request gets rate limited immediately without hitting provider
-        let res2 = gateway.generate(dummy_req(1)).await;
-        assert!(matches!(res2.unwrap_err(), GatewayError::TooManyRequests { .. }));
-    }
 
     #[tokio::test]
     async fn test_gateway_exponential_backoff_success() {
@@ -332,7 +302,7 @@ mod tests {
             error_to_return: GatewayError::ServiceUnavailable { estimated_recovery_ms: None },
         });
 
-        let gateway = GatewayManager::new(provider, 1000);
+        let gateway = GatewayManager::new(provider, 0, 3);
 
         let start = Instant::now();
         let res = gateway.generate(dummy_req(10)).await;
@@ -356,7 +326,7 @@ mod tests {
         });
 
         // Use with_concurrency to set a low rate_limit_max_retries for fast test execution
-        let gateway = GatewayManager::with_concurrency(provider, 1000, 3, 3);
+        let gateway = GatewayManager::with_concurrency(provider, 3, 3, 0);
 
         let res = gateway.generate(dummy_req(10)).await;
 
@@ -371,7 +341,7 @@ mod tests {
             error_to_return: GatewayError::Other { message: "".to_string(), is_retryable: false },
         });
 
-        let gateway = GatewayManager::new(provider, 1000);
+        let gateway = GatewayManager::new(provider, 0, 3);
 
         let start = Instant::now();
         let res = gateway.generate(dummy_req(10)).await;

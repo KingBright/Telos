@@ -52,7 +52,19 @@ impl ExpertAgent for ArchitectAgent {
         };
         let mem_context = input.memory_context.clone().unwrap_or_default();
 
-        let system_prompt = format!("{}{}{}", env_context, mem_context, r#"You are the ArchitectAgent, a master system planner.
+        let mut template_context = String::new();
+        if let Some(mem_any) = _registry.get_memory_os() {
+            if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+                use telos_memory::integration::MemoryIntegration;
+                if let Ok(templates) = mem_os.retrieve_procedural_memories(input.task.clone()).await {
+                    if !templates.is_empty() {
+                        template_context = format!("[LEARNED WORKFLOW TEMPLATES & STRATEGIES]\nIf any of the following procedural templates match the user's current goal, you MUST reuse its node topology (agent types, edges). You must instantiate the template by replacing specific placeholder arguments (like filenames or test targets) with the parameters from the current task.\n\n{}\n\n", templates.join("\n---\n"));
+                    }
+                }
+            }
+        }
+
+        let system_prompt = format!("{}{}{}{}", env_context, mem_context, template_context, r#"You are the ArchitectAgent, a master system planner.
 Your goal is to decompose the user's complex task into a Directed Acyclic Graph (DAG) of micro-tasks.
 You must use Maximal Agentic Decomposition (MAD) to assign precise, scoped tasks to specialized expert agents.
 
@@ -83,17 +95,23 @@ Output exactly a JSON object matching this schema:
 }
 Do not include markdown wrappers if possible, just the raw JSON."#);
 
-        let prompt = format!(
-            "System: {}\n\nUser Task:\n{}{}\n\nPlease generate the SubGraph plan.",
-            system_prompt, input.task, deps_context
-        );
+        let mut messages = vec![
+            Message { role: "system".to_string(), content: system_prompt },
+        ];
+        for msg in &input.conversation_history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: format!("User Task:\n{}{}\n\nPlease generate the SubGraph plan.", input.task, deps_context),
+        });
 
         let req = LlmRequest {
             session_id: format!("architect_{}", input.node_id),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: prompt,
-            }],
+            messages,
             required_capabilities: Capability {
                 requires_vision: false,
                 strong_reasoning: true, // Architect prefers strong reasoning for planning MAD
@@ -206,18 +224,26 @@ Do not include markdown wrappers if possible, just the raw JSON."#);
 
         let system_prompt = format!("{}You are a helpful AI assistant. Your task is to synthesize execution results into a clear, well-formatted response for the user.\n\nRules:\n- Output the final content DIRECTLY — do not say \"based on the results\" or \"the execution produced\"\n- Preserve code blocks, tables, and formatting from the source content\n- If the content is code, present it properly with explanations\n- Use the user's language (Chinese if the request is in Chinese)\n- Be concise but complete", env_context);
 
+        let mut messages = vec![
+            Message { role: "system".to_string(), content: system_prompt },
+        ];
+        for msg in &input.conversation_history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: format!(
+                "用户请求: {}\n\n执行节点输出:\n{}\n\n请整合为面向用户的完整回复。",
+                input.task, results_text
+            ),
+        });
+
         let req = LlmRequest {
             session_id: format!("architect_summary_{}", input.node_id),
-            messages: vec![
-                Message { role: "system".to_string(), content: system_prompt },
-                Message {
-                    role: "user".to_string(),
-                    content: format!(
-                        "用户请求: {}\n\n执行节点输出:\n{}\n\n请整合为面向用户的完整回复。",
-                        input.task, results_text
-                    ),
-                },
-            ],
+            messages,
             required_capabilities: Capability {
                 requires_vision: false,
                 strong_reasoning: false,

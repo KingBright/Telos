@@ -28,7 +28,7 @@ impl SearchWorkerAgent {
     }
 
     /// Phase 1: Use LLM to generate multiple search queries from a natural language intent
-    async fn generate_search_queries(&self, intent: &str) -> Vec<String> {
+    async fn generate_search_queries(&self, intent: &str, history: &[telos_core::ConversationMessage]) -> Vec<String> {
         let prompt = format!(
             r#"You are a search keyword engineer. Given the user's search intent, generate 3-5 high-quality search queries.
 
@@ -45,13 +45,23 @@ Search Intent: "{}"
 Output ONLY a JSON object: {{ "queries": ["query1", "query2", ...] }}"#,
             intent
         );
+        
+        let mut messages = vec![
+            Message { role: "system".to_string(), content: "You are a search keyword engineer. Output ONLY valid JSON.".to_string() }
+        ];
+        
+        for msg in history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        
+        messages.push(Message { role: "user".to_string(), content: prompt });
 
         let req = LlmRequest {
             session_id: "search_worker_keygen".to_string(),
-            messages: vec![
-                Message { role: "system".to_string(), content: "You are a search keyword engineer. Output ONLY valid JSON.".to_string() },
-                Message { role: "user".to_string(), content: prompt },
-            ],
+            messages,
             required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: 500,
             tools: None,
@@ -236,6 +246,7 @@ Output JSON:
         &self,
         intent: &str,
         correction: &telos_core::CorrectionDirective,
+        history: &[telos_core::ConversationMessage],
     ) -> Vec<String> {
         let corrections_text = if correction.correction_instructions.is_empty() {
             "No specific corrections provided.".to_string()
@@ -273,12 +284,22 @@ Output ONLY a JSON object: {{ "queries": ["query1", "query2", ...] }}"#,
             corrections_text
         );
 
+        let mut messages = vec![
+            Message { role: "system".to_string(), content: "You are a search keyword engineer. Output ONLY valid JSON.".to_string() }
+        ];
+        
+        for msg in history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        
+        messages.push(Message { role: "user".to_string(), content: prompt });
+
         let req = LlmRequest {
             session_id: "search_worker_corrected_keygen".to_string(),
-            messages: vec![
-                Message { role: "system".to_string(), content: "You are a search keyword engineer. Output ONLY valid JSON.".to_string() },
-                Message { role: "user".to_string(), content: prompt },
-            ],
+            messages,
             required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: 500,
             tools: None,
@@ -408,9 +429,9 @@ impl ExecutableNode for SearchWorkerAgent {
         let queries = if let Some(ref correction) = input.correction {
             info!("[SearchWorker] 🔄 Iteration {} — applying corrections. Diagnosis: {}",
                 correction.iteration, correction.diagnosis);
-            self.generate_corrected_queries(intent, correction).await
+            self.generate_corrected_queries(intent, correction, &input.conversation_history).await
         } else {
-            self.generate_search_queries(intent).await
+            self.generate_search_queries(intent, &input.conversation_history).await
         };
 
         // Phase 2: Execute all queries, collect structured results

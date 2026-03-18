@@ -48,7 +48,7 @@ pub enum NodeError {
 // Sub-DAG Primitives for Advanced Agentic Decompositions
 // ============================================================================
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SubGraphNode {
     pub id: String,
     pub agent_type: String, // e.g., "coder", "reviewer", "tester"
@@ -63,14 +63,14 @@ pub struct SubGraphNode {
     pub is_critic: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SubGraphEdge {
     pub from: String,
     pub to: String,
     pub dep_type: DependencyType,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentSubGraph {
     pub nodes: Vec<SubGraphNode>,
     pub edges: Vec<SubGraphEdge>,
@@ -81,7 +81,7 @@ pub struct AgentSubGraph {
 // ============================================================================
 
 /// Configuration for a corrective loop node
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoopConfig {
     /// Hard upper bound on iteration count (circuit breaker)
     pub max_iterations: usize,
@@ -92,7 +92,7 @@ pub struct LoopConfig {
 }
 
 /// Condition that terminates the loop
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ExitCondition {
     /// Exit when Critic's satisfaction_score >= threshold
     SatisfactionThreshold(f32),
@@ -124,6 +124,12 @@ pub struct CorrectionDirective {
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConversationMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentInput {
     /// 节点ID
     pub node_id: String,
@@ -135,7 +141,10 @@ pub struct AgentInput {
     /// 节点特定的 JSON 负载负载（可选）
     #[serde(default)]
     pub schema_payload: Option<String>,
-    /// 注入的长期记忆事实文本（可选）
+    /// 短期工作记忆：多轮原生的用户与助手对话历史 (取代之前拼接大字符串的方式)
+    #[serde(default)]
+    pub conversation_history: Vec<ConversationMessage>,
+    /// 注入的长期记忆事实文本（可选）：仅用于存放 UserProfile 和 Episodic Summaries
     #[serde(default)]
     pub memory_context: Option<String>,
     /// Corrective feedback from the Critic node in a loop iteration.

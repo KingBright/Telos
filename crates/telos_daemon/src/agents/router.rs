@@ -23,14 +23,33 @@ impl RouterAgent {
             String::new()
         };
 
-        let system_prompt = format!("{}{}", env_context, r#"You are the Telos Master Router acting as a strict Quality Assurance supervisor.
+        // Inject memory context so QA knows about the user's stored preferences
+        let mut memory_context_for_qa = String::new();
+        if let Some(mem_any) = _registry.get_memory_os() {
+            if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+                if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::EntityLookup { entity: "user".to_string() }).await {
+                    let profile_entries: Vec<String> = results.iter()
+                        .filter(|e| e.memory_type == telos_memory::MemoryType::UserProfile)
+                        .map(|e| e.content.clone())
+                        .collect();
+                    if !profile_entries.is_empty() {
+                        memory_context_for_qa = format!("[USER MEMORY CONTEXT — verified stored data]\n{}\n\n", profile_entries.join("\n- "));
+                    }
+                }
+            }
+        }
+
+        let system_prompt = format!("{}{}{}", env_context, memory_context_for_qa, r#"You are the Telos Master Router acting as a strict Quality Assurance supervisor.
 Your job is to evaluate whether the Expert Agent's final output fully satisfies the User's original request.
+
+IMPORTANT SYSTEM CAPABILITY: This AI system HAS persistent memory storage. The Expert Agent can store and retrieve user preferences, past interactions, and personal information using memory tools. If the Expert references user preferences or past interactions, verify against the [USER MEMORY CONTEXT] provided above rather than assuming hallucination. If no memory context is provided but the Expert claims to remember something, check if the claim is plausible given the conversation flow.
 
 You MUST evaluate on FIVE dimensions:
 
 1. "contains_answer" (bool): Does the output ACTUALLY CONTAIN a direct answer or result for the user's question?
    - TRUE: The output includes specific data, facts, a plan, calculation result, or actionable content.
    - TRUE ALSO: A definitive negative conclusion counts as an answer. If the output states "after searching X/Y/Z sources, this event does not exist / has not been reported", that IS an answer (confirming non-existence).
+   - TRUE ALSO: If the Expert correctly recalls user preferences from memory storage, this IS a valid answer.
    - FALSE: The output is meta-commentary like "I couldn't find...", "Please provide...", "I need more context...", or similar deflections WITHOUT a definitive conclusion. An output that only describes what it tried but provides no actual answer is FALSE.
    - KEY DISTINCTION: "No verified reports exist about X" (contains_answer: true) vs "I was unable to find information" (contains_answer: false).
 
@@ -54,6 +73,7 @@ CRITICAL RULES:
 - DO NOT INCLUDE ANY CONVERSATIONAL TEXT outside the JSON.
 - is_acceptable can NEVER be true if contains_answer is false AND is_clarification is false.
 - is_clarification should be true ONLY when the user's input is genuinely ambiguous — NOT when the Expert lazily asks follow-up questions to a clear request.
+- DO NOT penalize the Expert for referencing user memory/preferences — this system has persistent memory capabilities.
 
 --- EXAMPLES ---
 
@@ -83,6 +103,16 @@ Expert: "你好！我可以帮你做很多事情，请告诉我你需要哪方�
   "contains_answer": false,
   "is_relevant": true,
   "is_clarification": true,
+  "is_acceptable": true,
+  "critique": ""
+}
+
+User: "你还记得我喜欢什么颜色吗？"
+Expert: "当然记得！你最喜欢的颜色是蓝色。"
+{
+  "contains_answer": true,
+  "is_relevant": true,
+  "is_clarification": false,
   "is_acceptable": true,
   "critique": ""
 }
@@ -201,10 +231,45 @@ impl ExecutableNode for RouterAgent {
         
         let mem_context = input.memory_context.clone().unwrap_or_default();
 
+        // Build conversation history as a reference block for the system prompt
+        // CRITICAL: History goes into the system prompt as context, NOT as actual
+        // user/assistant multi-turn messages. This prevents the LLM from treating
+        // prior Q&A pairs as an ongoing conversation that needs continuation.
+        let mut conversation_history_block = String::new();
+        if !input.conversation_history.is_empty() {
+            conversation_history_block.push_str("[CONVERSATION HISTORY]\n");
+            conversation_history_block.push_str("The following are past exchanges in this session. Use them to:\n");
+            conversation_history_block.push_str("- Understand references like \"再搜一次\" (search again), \"上面那个\" (the one above)\n");
+            conversation_history_block.push_str("- Resolve pronouns and context (\"it\", \"that\", \"those\")\n");
+            conversation_history_block.push_str("- Answer questions the user asks about these past exchanges (e.g., \"what did we just talk about?\", \"what port did you use?\")\n");
+            conversation_history_block.push_str("NOTE: Answer the user's CURRENT question. Do not spontaneously re-answer a past question unless the user asks you to.\n\n");
+            for msg in &input.conversation_history {
+                let role_label = match msg.role.as_str() {
+                    "user" => "User",
+                    "assistant" => "Assistant",
+                    _ => "System",
+                };
+                conversation_history_block.push_str(&format!("[{}]: {}\n", role_label, msg.content));
+            }
+            conversation_history_block.push_str("\n[END OF CONVERSATION HISTORY]\n\n");
+        }
+
+        let mut learned_strategies_context = String::new();
+        if let Some(mem_any) = _registry.get_memory_os() {
+            if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+                use telos_memory::integration::MemoryIntegration;
+                if let Ok(strategies) = mem_os.retrieve_procedural_memories(input.task.clone()).await {
+                    if !strategies.is_empty() {
+                        learned_strategies_context.push_str(&format!("[LEARNED STRATEGIES & WORKFLOW TEMPLATES]\nConsult these past successful strategies to guide your routing and direct reply decisions.\n{}\n\n", strategies.join("\n- ")));
+                    }
+                }
+            }
+        }
+
         // Build persona from SOUL.md (loaded at daemon startup)
         let soul_content = crate::agents::prompt_builder::get_soul();
         let persona_intro = format!("Your name is {}. Your personality traits: {}.\n\n[IDENTITY & VALUES]\n{}\n\nYou are the user's private AI assistant. Behind the scenes, you may delegate tasks to specialized internal modules, but the user should feel they are talking to ONE unified assistant.\n\n", self.persona_name, self.persona_trait, soul_content);
-        let system_prompt = format!("{}{}{}{}{}", env_context, user_profile_context, mem_context, persona_intro, r#"Available Experts:
+        let system_prompt = format!("{}{}{}{}{}{}{}", env_context, user_profile_context, mem_context, learned_strategies_context, conversation_history_block, persona_intro, r#"Available Experts:
 - "software_expert": For tasks requiring writing, modifying, or executing programming code, or software architecture.
 - "research_expert": For tasks requiring deep, iterative information gathering via search engines (e.g., current events, fact-checking, real-time data).
 - "qa_expert": For tasks heavily focused on writing tests, finding edge cases, or breaking code.
@@ -223,9 +288,9 @@ CRITICAL RULES:
       - Code explanation, concept clarification, knowledge Q&A
       - General planning based on common knowledge
    d) If the task requires ANY external/real-time data or tool use, ALWAYS route to an expert.
-   Output EXACTLY ONE key: "direct_reply" containing your complete answer (with reasoning steps if applicable) in your Persona.
-4. If you need to access historical facts or past conversational context to route accurately or answer the user directly, you may query your vector memory database. Output EXACTLY TWO keys: "tool": "memory_read" and "query": "<search text>". You will receive the memory contents and be prompted again.
-5. For all other actionable tasks, output EXACTLY TWO keys: "route" and "reason" to pick the best expert.
+   Output EXACTLY ONE key: "direct_reply" containing your COMPLETE answer to the user's CURRENT request ONLY (with reasoning steps if applicable), in your Persona. NEVER re-answer previous conversation turns.
+4. Check the [CONVERSATION HISTORY] block provided above BEFORE querying memory. If the history already contains the answer (e.g., recent context), use "direct_reply" immediately. If you need older historical facts NOT in the history, you may query your vector memory database by outputting EXACTLY TWO keys: "tool": "memory_read" and "query": "<search text>".
+5. For all other actionable tasks, output EXACTLY THREE keys: "route" to pick the best expert, "reason" for the choice, and "enriched_task". The "enriched_task" MUST be a rewritten version of the user's prompt where you resolve any missing context (e.g. "search again") using the [CONVERSATION HISTORY]. If no rewrite is needed, simply output the user's original task.
 6. CHOOSE "research_expert" FOR ANY QUERY REQUIRING REAL-TIME OR EXTERNAL DATA.
 7. IF THE REQUEST IS UNCLEAR OR BROAD (but not chitchat), PICK "general_expert". NEVER REFUSE.
 
@@ -236,6 +301,8 @@ ROUTING DISTINCTION FOR CODING TASKS:
 - "Build a complete multi-file application" → software_expert (needs file system)
 - "Debug a specific file or codebase" → software_expert (needs file access + shell)
 8. If you have attempted to use memory_read but could not find sufficient information, you SHOULD still provide your best direct_reply based on whatever you DID find (even if partial or uncertain), or route to an appropriate expert agent if you believe only a deeper search pipeline can answer the question. NEVER return an empty response or give up silently.
+
+FOCUS RULE: Your JSON output must address ONLY the user's CURRENT request (the message below). The [CONVERSATION HISTORY] above is reference material — do NOT repeat or re-answer any of it.
 
 --- EXAMPLES ---
 
@@ -258,19 +325,22 @@ User: "帮我写一个Python函数，输入一个列表，返回其中所有偶�
 User: "修改我项目中的 main.py 文件，添加日志功能"
 {
   "route": "software_expert",
-  "reason": "Request involves modifying an existing file in a project, needs file I/O tools."
+  "reason": "Request involves modifying an existing file in a project, needs file I/O tools.",
+  "enriched_task": "修改我项目中的 main.py 文件，添加日志功能"
 }
 
 User: "What were the major news events yesterday?"
 {
   "route": "research_expert",
-  "reason": "Request involves retrieving recent current events requiring search tools."
+  "reason": "Request involves retrieving recent current events requiring search tools.",
+  "enriched_task": "What were the major news events yesterday?"
 }
 
 User: "Help me plan a generic schedule."
 {
   "route": "general_expert",
-  "reason": "General reasoning query."
+  "reason": "General reasoning query.",
+  "enriched_task": "Help me plan a generic schedule."
 }
 
 User: "计算 25 的平方根加上 150 的 15%"
@@ -305,18 +375,21 @@ User: "什么是快速排序算法？"
 
         let full_task = format!("{}{}", input.task, deps_context);
 
+        // Messages: system prompt (with history as reference block) + single user message (current task only)
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: system_prompt.to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: full_task,
+            },
+        ];
+
         let request = LlmRequest {
             session_id: format!("router_{}", input.node_id),
-            messages: vec![
-                Message {
-                    role: "system".to_string(),
-                    content: system_prompt.to_string(),
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: format!("Task: {}", full_task),
-                },
-            ],
+            messages,
             required_capabilities: Capability {
                 requires_vision: false,
                 strong_reasoning: true, // We need good reasoning for routing
@@ -351,7 +424,7 @@ User: "什么是快速排序算法？"
                     .trim();
 
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(clean_reply) {
-                    if json.get("route").is_some() || json.get("direct_reply").is_some() {
+                    if json.get("route").is_some() || json.get("direct_reply").is_some() || json.get("tool").is_some() {
                         return AgentOutput::success(json).with_trace(trace);
                     }
                 }

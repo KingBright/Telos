@@ -35,7 +35,7 @@
 
     #[test]
     fn test_vector_tool_retrieval() {
-        let mut registry = VectorToolRegistry::new();
+        let mut registry = VectorToolRegistry::new_for_test();
 
         registry.register_tool(ToolSchema {
             name: "calculator".into(),

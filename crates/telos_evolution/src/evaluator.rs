@@ -15,6 +15,8 @@ impl ActorCriticEvaluator {
     pub fn new() -> anyhow::Result<Self> {
         let model = std::panic::catch_unwind(|| {
             let mut options = InitOptions::new(EmbeddingModel::AllMiniLML6V2);
+            let cache_dir = dirs::home_dir().map(|h| h.join(".telos").join("models")).unwrap_or_else(|| std::path::PathBuf::from(".fastembed_cache"));
+            options = options.with_cache_dir(cache_dir);
             options.show_download_progress = false;
             TextEmbedding::try_new(options)
         });
@@ -206,6 +208,7 @@ mod tests {
             steps: vec![step1, step2],
             errors_encountered: vec![],
             success: false,
+            sub_graph: None,
         };
 
         let result = evaluator.detect_drift(&trace).await;
@@ -237,6 +240,7 @@ mod tests {
             steps: vec![step1, step2],
             errors_encountered: vec![],
             success: true,
+            sub_graph: None,
         };
 
         let skill = evaluator.distill_experience(&trace).await.expect("Should distill successfully");

@@ -101,17 +101,26 @@ impl ReactLoop {
         system_prompt: String,
         user_message: String,
         available_tools: Vec<ToolSchema>,
+        conversation_history: &[telos_core::ConversationMessage],
     ) -> ReactResult {
         let mut messages = vec![
             Message {
                 role: "system".to_string(),
                 content: system_prompt,
             },
-            Message {
-                role: "user".to_string(),
-                content: user_message,
-            },
         ];
+        
+        for msg in conversation_history {
+            messages.push(Message {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        
+        messages.push(Message {
+            role: "user".to_string(),
+            content: user_message,
+        });
 
         // Convert ToolSchema → ToolDefinition for the LLM
         let tool_defs: Vec<ToolDefinition> = available_tools.iter().map(|t| {

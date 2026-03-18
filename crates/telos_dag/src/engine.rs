@@ -482,6 +482,7 @@ impl ExecutionEngine for TokioExecutionEngine {
                     let metadata = graph.node_metadata.get(&node_id).cloned().unwrap_or_default();
                     let task_type = metadata.task_type.clone();
                     let prompt_preview = metadata.prompt_preview.clone();
+                    let full_task = metadata.full_task.clone();
 
                     graph.node_statuses.insert(node_id.clone(), NodeStatus::Running);
                     let dependencies = Self::collect_dependency_outputs(graph, &node_id);
@@ -555,9 +556,10 @@ impl ExecutionEngine for TokioExecutionEngine {
 
                         let agent_input = AgentInput {
                             node_id: id_clone.clone(),
-                            task: prompt_preview.clone(),
+                            task: full_task.clone(),
                             dependencies,
                             schema_payload: graph.node_metadata.get(&node_id).and_then(|m| m.schema_payload.clone()),
+                            conversation_history: graph.conversation_history.clone(),
                             memory_context,
                             correction,
                         };
@@ -664,7 +666,8 @@ impl ExecutionEngine for TokioExecutionEngine {
                                                 executable,
                                                 crate::NodeMetadata {
                                                     task_type: sg_node.agent_type.clone(),
-                                                    prompt_preview: combined_task,
+                                                    prompt_preview: Self::truncate(&combined_task, 100),
+                                                    full_task: combined_task.clone(),
                                                     tool_name: None,
                                                     schema_payload: if sg_node.schema_payload.is_empty() { None } else { Some(sg_node.schema_payload.clone()) },
                                                 },
@@ -746,6 +749,7 @@ impl ExecutionEngine for TokioExecutionEngine {
                                                 }).collect(),
                                                 errors_encountered: vec![],
                                                 success: true,
+                                                sub_graph: None,
                                             };
                                             match evaluator.detect_drift(&trace).await {
                                                 Err(telos_evolution::DriftWarning::SemanticLoop) => {

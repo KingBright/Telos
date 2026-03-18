@@ -147,10 +147,10 @@ if [ -f "$CONFIG_FILE" ] || [ -f "$OLD_CONFIG_FILE" ]; then
         launchctl load -w "$PLIST_PATH"
         # Wait for daemon to start and verify
         echo -n "Waiting for daemon to start"
-        for i in $(seq 1 15); do
-            if curl -s http://127.0.0.1:3000/api/v1/log-level >/dev/null; then
+        for i in $(seq 1 60); do
+            if curl -s http://127.0.0.1:8321/api/v1/log-level >/dev/null; then
                 echo ""
-                echo "telos_daemon started successfully and is responding on port 3000."
+                echo "telos_daemon started successfully and is responding on port 8321."
                 echo "Daemon logs: $LOG_DIR/daemon.log"
                 exit 0
             fi
@@ -161,8 +161,8 @@ if [ -f "$CONFIG_FILE" ] || [ -f "$OLD_CONFIG_FILE" ]; then
         echo "Warning: Daemon may not have started via launchd. Starting directly..."
         nohup ~/.cargo/bin/telos_daemon >> "$LOG_DIR/daemon.log" 2>> "$LOG_DIR/daemon.err" &
         sleep 3
-        if curl -s http://127.0.0.1:3000/api/v1/log-level >/dev/null; then
-            echo "telos_daemon started successfully (direct) on port 3000."
+        if curl -s http://127.0.0.1:8321/api/v1/log-level >/dev/null; then
+            echo "telos_daemon started successfully (direct) on port 8321."
         else
             echo "Error: telos_daemon failed to start. Check logs: $LOG_DIR/daemon.err"
         fi

@@ -265,6 +265,127 @@ fn parse_clarification_options(response: &str) -> Vec<telos_hci::ClarificationOp
 
 /// Extracts user preferences, personal facts, and habits from a conversation
 /// using LLM, then stores new facts as UserProfile memories (with deduplication).
+/// Compress a long assistant response for session_logs storage.
+/// Short responses (≤500 chars) are returned as-is.
+/// Long responses are summarized via LLM to preserve key facts while reducing token usage.
+async fn compress_for_session_log(
+    response: &str,
+    gateway: &Arc<GatewayManager>,
+) -> String {
+    const MAX_UNCOMPRESSED: usize = 500;
+
+    if response.len() <= MAX_UNCOMPRESSED {
+        return response.to_string();
+    }
+
+    use telos_model_gateway::{Capability, LlmRequest, Message, ModelGateway};
+
+    let request = LlmRequest {
+        session_id: "session_compress".to_string(),
+        messages: vec![
+            Message {
+                role: "system".into(),
+                content: "You are a concise summarizer. Compress the assistant's response into a SHORT summary (max 200 chars). \
+                         PRESERVE ALL: specific numbers, port numbers, filenames, function names, variable names, URLs, calculations, and key facts. \
+                         Drop verbose explanations and formatting. \
+                         Output the summary only, no prefix.".into(),
+            },
+            Message {
+                role: "user".into(),
+                content: format!("Compress this response:\n{}", &response[..response.len().min(2000)]),
+            },
+        ],
+        required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
+        budget_limit: 200,
+        tools: None,
+    };
+
+    match gateway.generate(request).await {
+        Ok(res) => {
+            let summary = res.content.trim().to_string();
+            tracing::info!("[Compression] Summary length: {}, Content: {}", summary.len(), summary);
+            if summary.is_empty() {
+                // Fallback: truncate
+                format!("[摘要] {}...", &response[..response.len().min(200)])
+            } else {
+                format!("[摘要] {}", summary)
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[Compression] LLM compression failed: {:?}", e);
+            // Fallback: simple truncation if LLM fails
+            format!("[摘要] {}...", &response[..response.len().min(200)])
+        }
+    }
+}
+
+// --- App State ---
+#[derive(Debug, Clone, Default)]
+struct SessionState {
+    logs: std::collections::VecDeque<telos_context::LogEntry>,
+    evicted_buffer: Vec<telos_context::LogEntry>,
+    rolling_summary: String,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        Self {
+            logs: std::collections::VecDeque::with_capacity(20),
+            evicted_buffer: Vec::new(),
+            rolling_summary: String::new(),
+        }
+    }
+}
+
+// --- Helper: Summarize evicted session logs ---
+async fn summarize_evicted_logs(gateway: &std::sync::Arc<GatewayManager>, previous_summary: &str, new_logs: &[telos_context::LogEntry]) -> String {
+    use telos_model_gateway::{Capability, LlmRequest, Message, ModelGateway};
+
+    if new_logs.is_empty() {
+        return previous_summary.to_string();
+    }
+
+    let mut logs_text = String::new();
+    for log in new_logs {
+        logs_text.push_str(&format!("{}: {}\n", log.timestamp, log.message));
+    }
+
+    let prompt = format!(
+        "Please update the running [SESSION SUMMARY] of the ongoing conversation.\n\
+         You are provided with the [PREVIOUS SUMMARY] and a [NEW LOG BATCH].\n\
+         Merge the new information into the summary concisely.\n\
+         Retain specific facts, user preferences, names, numbers, and decisions.\n\n\
+         [PREVIOUS SUMMARY]\n{}\n\n\
+         [NEW LOG BATCH]\n{}\n\n\
+         Respond with ONLY the updated summary text.",
+        if previous_summary.is_empty() { "None." } else { previous_summary },
+        logs_text
+    );
+
+    let request = LlmRequest {
+        session_id: "rolling_summary".to_string(),
+        messages: vec![
+            Message { role: "system".into(), content: "You are a seamless context window summarizer. Capture continuity logically without omitting key facts. Be as concise as possible.".into() },
+            Message { role: "user".into(), content: prompt },
+        ],
+        required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
+        budget_limit: 400,
+        tools: None,
+    };
+
+    match gateway.generate(request).await {
+        Ok(res) => {
+            let res_text = res.content.trim().to_string();
+            tracing::info!("[RollingSummary] generated, len: {}", res_text.len());
+            res_text
+        },
+        Err(e) => {
+            tracing::warn!("[RollingSummary] Failed: {:?}. Keeping previous.", e);
+            previous_summary.to_string()
+        }
+    }
+}
+
 async fn extract_and_store_user_profile(
     conversation: &str,
     gateway: Arc<GatewayManager>,
@@ -467,22 +588,23 @@ struct ToolNode {
 #[async_trait]
 impl ExecutableNode for ToolNode {
     async fn execute(&self, input: AgentInput, _registry: &dyn SystemRegistry) -> AgentOutput {
-        let registry_guard = self.tool_registry.read().await;
-        let executor = match registry_guard.get_executor(&self.tool_name) {
-            Some(e) => e,
-            None => {
-                return AgentOutput::failure(
-                    "ToolNotFoundError",
-                    &format!("Tool '{}' not found in registry", self.tool_name),
-                );
-            }
-        };
-        drop(registry_guard);
-
         // Tool input is expected to be a JSON object in schema_payload
-        let params: serde_json::Value = if let Some(ref payload) = input.schema_payload {
-            match serde_json::from_str(payload) {
-                Ok(p) => p,
+        let mut actual_tool_name = self.tool_name.clone();
+        let mut actual_params = serde_json::json!({});
+
+        if let Some(ref payload) = input.schema_payload {
+            match serde_json::from_str::<serde_json::Value>(payload) {
+                Ok(mut p) => {
+                    // If the LLM outputted {"tool_name": "...", "parameters": {...}}, extract them.
+                    if let Some(t) = p.get("tool_name").and_then(|v| v.as_str()) {
+                        actual_tool_name = t.to_string();
+                    }
+                    if let Some(params) = p.get_mut("parameters") {
+                        actual_params = params.take();
+                    } else {
+                        actual_params = p; // fallback to the raw payload if 'parameters' wrapper not found
+                    }
+                }
                 Err(e) => {
                     return AgentOutput::failure(
                         "PayloadParseError",
@@ -490,13 +612,23 @@ impl ExecutableNode for ToolNode {
                     );
                 }
             }
-        } else {
-            serde_json::json!({})
+        }
+
+        let registry_guard = self.tool_registry.read().await;
+        let executor = match registry_guard.get_executor(&actual_tool_name) {
+            Some(e) => e,
+            None => {
+                return AgentOutput::failure(
+                    "ToolNotFoundError",
+                    &format!("Tool '{}' not found in registry (Task alias: '{}')", actual_tool_name, self.tool_name),
+                );
+            }
         };
+        drop(registry_guard);
 
-        info!("[ToolNode] 🛠️  Executing tool: {} with params: {}", self.tool_name, params);
+        info!("[ToolNode] 🛠️  Executing tool: {} with params: {}", actual_tool_name, actual_params);
 
-        match executor.call(params.clone()).await {
+        match executor.call(actual_params.clone()).await {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes).to_string();
                 let (json_result, is_json) = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -506,8 +638,8 @@ impl ExecutableNode for ToolNode {
                 };
 
                 let trace = telos_core::TraceLog::ToolCall {
-                    name: self.tool_name.clone(),
-                    params: params.clone(),
+                    name: actual_tool_name.clone(),
+                    params: actual_params.clone(),
                     result: json_result.clone(),
                 };
 
@@ -628,10 +760,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway_adapter = Arc::new(GatewayAdapter {
         inner: openai_provider.clone(),
     });
-    // Use max_concurrent_requests from config (0 = unlimited, default 20)
     let gateway = Arc::new(GatewayManager::new(
         gateway_adapter,
-        config.max_concurrent_requests,
+        config.llm_throttle_ms,
+        config.global_concurrency_permits,
     ));
 
     // Initialize VectorToolRegistry with Native Tools
@@ -710,6 +842,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wrap registry in Arc<RwLock<...>> early so we can pass it to WASM executors
     let tool_registry = std::sync::Arc::new(tokio::sync::RwLock::new(tool_registry));
+
+    // Register CreateRhaiTool which needs a reference to the registry itself
+    {
+        let wrapped_registry = telos_tooling::wrap_tool_registry(tool_registry.clone());
+        let create_rhai = telos_tooling::native::CreateRhaiTool::new(wrapped_registry);
+        if let Ok(guard) = tool_registry.try_read() {
+            guard.register_tool(telos_tooling::native::CreateRhaiTool::schema(), Some(std::sync::Arc::new(create_rhai)));
+        }
+    }
 
     // --- Auto-Load Persisted Tools on Startup ---
     let target_dir = std::path::Path::new(&config.tools_dir);
@@ -846,18 +987,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             debug!("[Daemon] 🧠 Evolution worker processing trace {}...", trace_id);
             
+            if trace.success {
+                if let Some(sub_graph) = &trace.sub_graph {
+                    if let Ok(json_str) = serde_json::to_string_pretty(sub_graph) {
+                        let desc = trace.steps.first()
+                            .map(|s| s.input_data.clone())
+                            .unwrap_or_else(|| "Unknown Execution".to_string());
+                        let _ = registry_worker.memory_os.store_workflow_template(desc, json_str).await;
+                        info!("[Daemon] 📥 Graph Topology archived as Procedural Workflow Template for task {}.", trace_id);
+                    }
+                }
+            }
+
             if let Some(skill) = evaluator_worker.distill_experience(&trace).await {
                 info!("[Daemon] 🧠 Telos distilled a new SynthesizedSkill from task {}!", trace_id);
                 
-                let skill_string = format!(
-                    "Distilled Skill for task '{}':\nTrigger: {}\nCode:\n{}",
-                    trace.steps.first().map(|s| s.input_data.as_str()).unwrap_or("Unknown"),
+                let _ = registry_worker.memory_os.store_procedural_skill(
                     skill.trigger_condition,
-                    skill.executable_code
-                );
-                
-                let _ = registry_worker.memory_os.store_semantic_fact(skill_string).await;
-                debug!("[Daemon] 📥 Distilled skill securely archived in Long-Term Memory.");
+                    skill.executable_code,
+                ).await;
+                debug!("[Daemon] 📥 Distilled skill archived as Procedural Memory (permanent).");
             }
         }
     });
@@ -892,7 +1041,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let active_tasks_loop = active_tasks.clone();
 
     // Global short-term session memory for Context/History Injection
-    let global_session_logs: Arc<tokio::sync::RwLock<std::collections::VecDeque<telos_context::LogEntry>>> = Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::with_capacity(20)));
+    let global_session_logs: Arc<tokio::sync::RwLock<SessionState>> = Arc::new(tokio::sync::RwLock::new(SessionState::new()));
     let session_logs_loop = global_session_logs.clone();
     let evaluator_loop = evaluator.clone();
 
@@ -947,21 +1096,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let current_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
 
                         // -- GLOBAL SESSION HISTORY INJECTION --
-                        let mut recent_history_text = String::new();
+                        // -- GLOBAL SESSION HISTORY INJECTION (Native Working Memory) --
+                        let mut conversation_history_vec = Vec::new();
+                        let mut memory_context_text = String::new();
                         {
                             let mut logs_w = session_logs_loop.write().await;
                             
-                            // Maintain max 20 turns
-                            while logs_w.len() > 20 {
-                                logs_w.pop_front();
+                            // Maintain max 20 turns, capture evicted items into buffer
+                            let mut evicted = Vec::new();
+                            while logs_w.logs.len() > 20 {
+                                if let Some(front) = logs_w.logs.pop_front() {
+                                    logs_w.evicted_buffer.push(front);
+                                }
+                            }
+                            if logs_w.evicted_buffer.len() >= 6 {
+                                evicted = std::mem::take(&mut logs_w.evicted_buffer);
                             }
 
-                            if !logs_w.is_empty() {
-                                recent_history_text.push_str("[GLOBAL CONVERSATION HISTORY]\nThe user has interacted with you previously in this session. Interactions are numbered chronologically (#1 = first/earliest). Use this to resolve pronouns, references like \"第一个问题\", and maintain context:\n");
-                                for (i, log) in logs_w.iter().enumerate() {
-                                    recent_history_text.push_str(&format!("#{}: {}\n", i + 1, log.message));
+                            if !logs_w.logs.is_empty() {
+                                for log in logs_w.logs.iter() {
+                                    let (role, content) = if log.message.starts_with("User: ") {
+                                        ("user", log.message.trim_start_matches("User: "))
+                                    } else if log.message.starts_with("Assistant: ") {
+                                        ("assistant", log.message.trim_start_matches("Assistant: "))
+                                    } else {
+                                        ("system", log.message.as_str())
+                                    };
+                                    conversation_history_vec.push(telos_core::ConversationMessage {
+                                        role: role.to_string(),
+                                        content: content.to_string(),
+                                    });
                                 }
-                                recent_history_text.push('\n');
                             } else {
                                 // Session memory is empty — preload from persistent memory (telos_memory)
                                 // This bridges headless CLI calls and daemon restarts
@@ -978,12 +1143,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             // Sort chronologically: oldest first
                                             interaction_entries.sort_by_key(|e| e.created_at);
                                             if !interaction_entries.is_empty() {
-                                                recent_history_text.push_str("[GLOBAL CONVERSATION HISTORY (from persistent memory)]\nThe user has interacted with you recently. Interactions are numbered chronologically (#1 = first/earliest). Use this to resolve references like \"第一个问题\" or \"之前\":\n");
-                                                for (i, entry) in interaction_entries.iter().take(30).enumerate() {
-                                                    recent_history_text.push_str(&format!("#{}: {}\n", i + 1, entry.content));
+                                                for entry in interaction_entries.iter().take(30) {
+                                                    let (role, content) = if entry.content.starts_with("User: ") {
+                                                        ("user", entry.content.trim_start_matches("User: "))
+                                                    } else if entry.content.starts_with("Assistant: ") {
+                                                        ("assistant", entry.content.trim_start_matches("Assistant: "))
+                                                    } else {
+                                                        ("system", entry.content.as_str())
+                                                    };
+                                                    conversation_history_vec.push(telos_core::ConversationMessage {
+                                                        role: role.to_string(),
+                                                        content: content.to_string(),
+                                                    });
                                                 }
-                                                recent_history_text.push('\n');
-                                                debug!("[Daemon] Preloaded {} interaction events from persistent memory (24h window)", interaction_entries.len());
+                                                debug!("[Daemon] Preloaded {} native interaction events from persistent memory (24h window)", interaction_entries.len());
                                             }
                                         }
                                     }
@@ -991,10 +1164,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             
                             // Immediately append the user's new query so it's logged
-                            logs_w.push_back(telos_context::LogEntry {
+                            logs_w.logs.push_back(telos_context::LogEntry {
                                 timestamp: current_ms,
                                 message: format!("User: {}", payload),
                             });
+
+                            if !logs_w.rolling_summary.is_empty() {
+                                memory_context_text.push_str("\n[SESSION CONTEXT SUMMARY — 更早的对话概要]\n");
+                                memory_context_text.push_str(&logs_w.rolling_summary);
+                                memory_context_text.push_str("\n[END SESSION CONTEXT SUMMARY]\n\n");
+                            }
+
+                            if !evicted.is_empty() {
+                                let gw_for_sum = gateway_clone.clone();
+                                let state_for_sum = session_logs_loop.clone();
+                                let prev_sum = logs_w.rolling_summary.clone();
+                                tokio::spawn(async move {
+                                    let new_sum = summarize_evicted_logs(&gw_for_sum, &prev_sum, &evicted).await;
+                                    let mut state_w = state_for_sum.write().await;
+                                    state_w.rolling_summary = new_sum;
+                                });
+                            }
                         }
                         // ----------------------------------------
 
@@ -1011,12 +1201,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             .filter(|e| e.memory_type == telos_memory::MemoryType::UserProfile)
                                             .collect();
                                         if !profile_entries.is_empty() {
-                                            recent_history_text.push_str("[USER PROFILE — PERSISTENT KNOWLEDGE ABOUT YOUR OWNER]\nThe following are facts, preferences, and personal information you have learned about the user (your 主人) through past interactions. Use this to personalize your responses:\n");
+                                            memory_context_text.push_str("[USER PROFILE — PERSISTENT KNOWLEDGE ABOUT YOUR OWNER]\nThe following are facts, preferences, and personal information you have learned about the user (your 主人) through past interactions. Use this to personalize your responses:\n");
                                             for entry in &profile_entries {
-                                                recent_history_text.push_str(&format!("• {}\n", entry.content));
+                                                memory_context_text.push_str(&format!("• {}\n", entry.content));
                                             }
-                                            recent_history_text.push('\n');
-                                            debug!("[Daemon] Injected {} UserProfile facts into router context", profile_entries.len());
+                                            memory_context_text.push('\n');
+                                            debug!("[Daemon] Injected {} UserProfile facts into memory context", profile_entries.len());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // ----------------------------------------
+
+                        // --- PROCEDURAL MEMORY INJECTION (Learned Strategies) ---
+                        {
+                            if let Some(mem_any) = registry_clone.get_memory_os() {
+                                if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+                                    if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange {
+                                        start: 0,
+                                        end: u64::MAX,
+                                    }).await {
+                                        let procedural_entries: Vec<&telos_memory::MemoryEntry> = results.iter()
+                                            .filter(|e| e.memory_type == telos_memory::MemoryType::Procedural)
+                                            .collect();
+                                        if !procedural_entries.is_empty() {
+                                            memory_context_text.push_str("[LEARNED STRATEGIES — distilled from past successful task executions]\n");
+                                            for entry in procedural_entries.iter().take(10) { // Cap at 10 most recent
+                                                memory_context_text.push_str(&format!("• {}\n", entry.content));
+                                            }
+                                            memory_context_text.push('\n');
+                                            debug!("[Daemon] Injected {} Procedural skills into memory context", procedural_entries.len());
                                         }
                                     }
                                 }
@@ -1056,6 +1271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
 
                             let mut graph = TaskGraph::new(trace_id.to_string());
+                            graph.conversation_history = conversation_history_vec.clone();
                             graph.add_node_with_metadata(
                                 "replan_architect".to_string(),
                                 Box::new(agents::architect::ArchitectAgent::new(
@@ -1064,6 +1280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 NodeMetadata {
                                     task_type: "architect".to_string(),
                                     prompt_preview: truncate_for_preview(&payload, 100),
+                                    full_task: payload.clone(),
                                     tool_name: None,
                                     schema_payload: None,
                                 },
@@ -1207,7 +1424,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 task: enriched_payload.clone(),
                                 dependencies: Default::default(),
                                 schema_payload: None,
-                                memory_context: Some(recent_history_text.clone()),
+                                conversation_history: conversation_history_vec.clone(),
+                                memory_context: if memory_context_text.is_empty() { None } else { Some(memory_context_text.clone()) },
                                 correction: None,
                             };
 
@@ -1372,7 +1590,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         is_final: true,
                                         silent: false,
                                     });
-                                    
+
+                                    // --- PUSH ASSISTANT RESPONSE TO SESSION LOGS (two-phase to avoid race conditions) ---
+                                    {
+                                        let reply_text = direct_reply.to_string();
+                                        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                                        
+                                        // Phase 1: Synchronously push the uncompressed (or placeholder) response
+                                        // This ensures the VERY NEXT request sees exactly what the assistant said immediately
+                                        {
+                                            let mut state_w = session_logs_loop.write().await;
+                                            state_w.logs.push_back(telos_context::LogEntry {
+                                                timestamp,
+                                                message: format!("Assistant: {}", reply_text),
+                                            });
+                                        }
+
+                                        // Phase 2: Asynchronously compress and replace the log entry
+                                        let gw_for_compress = gateway_clone.clone();
+                                        let logs_for_push = session_logs_loop.clone();
+                                        tokio::spawn(async move {
+                                            let compressed = compress_for_session_log(&reply_text, &gw_for_compress).await;
+                                            
+                                            // Find the specific entry by timestamp and replace it
+                                            let mut state_w = logs_for_push.write().await;
+                                            for entry in state_w.logs.iter_mut().rev() {
+                                                if entry.timestamp == timestamp {
+                                                    entry.message = format!("Assistant: {}", compressed);
+                                                    break;
+                                                }
+                                            }
+                                        });
+                                    }
+
                                     broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
                                         task_id: trace_id.to_string(),
                                         summary: TaskSummary {
@@ -1437,6 +1687,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             let expert_route = route_data.get("route").and_then(|v| v.as_str()).unwrap_or("general_expert");
                             let route_reason = route_data.get("reason").and_then(|v| v.as_str()).unwrap_or("Fallback to general expert.");
+                            let enriched_task = route_data.get("enriched_task").and_then(|v| v.as_str()).unwrap_or(&enriched_payload);
+                            enriched_payload = enriched_task.to_string();
 
                             broker_bg.publish_feedback(AgentFeedback::Output {
                                 task_id: trace_id.to_string(),
@@ -1448,11 +1700,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             // Build context using the context manager with memory integration for the Expert
                             let session_history: Vec<telos_context::LogEntry> = {
-                                let logs = session_logs_loop.read().await;
-                                logs.iter().cloned().collect()
+                                let state = session_logs_loop.read().await;
+                                state.logs.iter().cloned().collect()
                             };
                             let raw_ctx = telos_context::RawContext {
-                                history_logs: session_history,
+                                history_logs: session_history.clone(),
                                 retrieved_docs: vec![],
                             };
                             let ctx_req = telos_context::NodeRequirement {
@@ -1486,12 +1738,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut loop_summary = String::new();
                             let mut total_time_ms = 0;
                             let mut loop_final_trace_steps = Vec::new();
+                            let mut loop_final_sub_graph = None;
 
                             while attempt < MAX_ATTEMPTS {
                                 attempt += 1;
                                 debug!("[Daemon] Starting execution attempt {}/{}", attempt, MAX_ATTEMPTS);
 
                                 let mut graph = TaskGraph::new(trace_id.to_string());
+                                graph.conversation_history = conversation_history_vec.clone();
                                 let mut terminal_nodes = vec![];
 
                                 // Instantiate the specific expert dynamically.
@@ -1512,6 +1766,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     NodeMetadata {
                                         task_type: expert_route.to_string(),
                                         prompt_preview: truncate_for_preview(&enriched_payload, 100),
+                                        full_task: enriched_payload.clone(),
                                         tool_name: None,
                                         schema_payload: None,
                                     },
@@ -1525,8 +1780,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // Build context using the context manager with memory integration
                                 let session_history: Vec<telos_context::LogEntry> = {
-                                    let logs = session_logs_loop.read().await;
-                                    logs.iter().cloned().collect()
+                                    let state = session_logs_loop.read().await;
+                                    state.logs.iter().cloned().collect()
                                 };
                                 let raw_ctx = telos_context::RawContext {
                                     history_logs: session_history,
@@ -1594,6 +1849,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             if !output_str.contains("Research plan generated")
                                                 && !output_str.contains("execution stub")
                                                 && !output_str.contains("SubGraph decomposition complete")
+                                                && !output_str.contains("Plan generated")
                                             {
                                                 if res.success {
                                                     final_results.push(format!("[{}] {}", node_id, output_str));
@@ -1666,6 +1922,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         deps
                                     },
                                     schema_payload: None,
+                                    conversation_history: router_input.conversation_history.clone(),
                                     memory_context: router_input.memory_context.clone(),
                                     correction: None,
                                 };
@@ -1706,6 +1963,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         error: error_opt,
                                     });
                                 }
+                                loop_final_sub_graph = Some(graph.to_subgraph());
 
                                 // --- ROUTER EVALUATION ---
                                 let eval_output = router.evaluate(&payload, &final_response, registry_clone.as_ref()).await;
@@ -1775,6 +2033,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 silent: false,
                             });
 
+                            // --- PUSH ASSISTANT RESPONSE TO SESSION LOGS (two-phase to avoid race conditions) ---
+                            {
+                                let response_text = loop_final_response.clone();
+                                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+
+                                // Phase 1: Synchronously push the uncompressed response
+                                {
+                                    let mut state_w = session_logs_loop.write().await;
+                                    state_w.logs.push_back(telos_context::LogEntry {
+                                        timestamp,
+                                        message: format!("Assistant: {}", response_text),
+                                    });
+                                }
+
+                                // Phase 2: Asynchronously compress and replace
+                                let gw_for_compress = gateway_clone.clone();
+                                let logs_for_push = session_logs_loop.clone();
+                                tokio::spawn(async move {
+                                    let compressed = compress_for_session_log(&response_text, &gw_for_compress).await;
+                                    
+                                    let mut state_w = logs_for_push.write().await;
+                                    for entry in state_w.logs.iter_mut().rev() {
+                                        if entry.timestamp == timestamp {
+                                            entry.message = format!("Assistant: {}", compressed);
+                                            break;
+                                        }
+                                    }
+                                });
+                            }
+
                             // Publish TaskCompleted feedback LAST, which breaks the CLI stream
                             broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
                                 task_id: trace_id.to_string(),
@@ -1824,6 +2112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 steps: loop_final_trace_steps,
                                 errors_encountered: vec![],
                                 success: loop_qa_accepted,
+                                sub_graph: loop_final_sub_graph,
                             };
                             
                                 // Send trace to asynchronous Evolution worker for Skill Distillation
@@ -1947,6 +2236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 NodeMetadata {
                                     task_type: "LLM".to_string(),
                                     prompt_preview: truncate_for_preview(&payload, 100),
+                                    full_task: format!("Execute the following elevated user command: {}", payload),
                                     tool_name: None,
                                     schema_payload: None,
                                 },
@@ -1957,8 +2247,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
 
                             let session_history: Vec<telos_context::LogEntry> = {
-                                let logs = session_logs_loop.read().await;
-                                logs.iter().cloned().collect()
+                                let state = session_logs_loop.read().await;
+                                state.logs.iter().cloned().collect()
                             };
                             let raw_ctx = telos_context::RawContext {
                                 history_logs: session_history,
@@ -2020,8 +2310,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start Bot Provider in background if configured
     if let Some(bot_token) = config.telegram_bot_token.clone() {
         info!("Starting Telegram Bot Provider from Daemon...");
-        let daemon_url = "http://127.0.0.1:3000".to_string();
-        let daemon_ws_url = "ws://127.0.0.1:3000/api/v1/stream".to_string();
+        let daemon_url = "http://127.0.0.1:8321".to_string();
+        let daemon_ws_url = "ws://127.0.0.1:8321/api/v1/stream".to_string();
         let send_state_changes = config.bot_send_state_changes;
 
         tokio::spawn(async move {
@@ -2072,8 +2362,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/ui", get(serve_ui))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    info!("Telos Daemon listening on ws://0.0.0.0:3000/api/v1/stream");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8321").await?;
+    info!("Telos Daemon listening on ws://0.0.0.0:8321/api/v1/stream");
 
     axum::serve(listener, app).await?;
 

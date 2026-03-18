@@ -159,7 +159,7 @@ impl<T: ToolRegistry + ?Sized> ToolRegistry for SharedToolRegistry<T> {
     }
 
     fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String> {
-        if let Ok(mut guard) = self.inner.try_write() {
+        if let Ok(guard) = self.inner.try_read() {
             guard.register_dynamic_tool(schema, executor)
         } else {
             Err("Registry is locked".into())

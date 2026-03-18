@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore, OwnedSemaphorePermit};
 use async_trait::async_trait;
@@ -6,7 +6,7 @@ use tracing::{warn, info};
 
 use crate::{
     LlmRequest, LlmResponse, GatewayError, QuotaExceededError, ModelGateway,
-    rate_limiter::SimpleRateLimiter,
+
     backoff::ExponentialBackoff,
 };
 
@@ -156,8 +156,6 @@ impl Default for CircuitBreaker {
 pub struct GatewayManager {
     provider: Arc<dyn ModelProvider>,
     backoff: ExponentialBackoff,
-    rate_limiters: Mutex<HashMap<String, SimpleRateLimiter>>,
-    max_concurrent_requests: usize, // 0 = unlimited
     circuit_breaker: Mutex<CircuitBreaker>,
     /// Global concurrency semaphore: serializes all LLM requests to prevent
     /// concurrent 429 storms from overwhelming the API provider.
@@ -165,53 +163,56 @@ pub struct GatewayManager {
     /// Maximum number of retries specifically for 429 rate-limit errors.
     /// After this many retries, the error is returned instead of retrying forever.
     rate_limit_max_retries: u32,
+    /// Proactive throttle in milliseconds to inject before every active request.
+    throttle_ms: u64,
 }
 
 impl GatewayManager {
-    pub fn new(provider: Arc<dyn ModelProvider>, max_concurrent_requests: usize) -> Self {
-        Self {
-            provider,
-            backoff: ExponentialBackoff::default(),
-            rate_limiters: Mutex::new(HashMap::new()),
-            max_concurrent_requests,
-            circuit_breaker: Mutex::new(CircuitBreaker::default()),
-            global_concurrency: Arc::new(Semaphore::new(3)),
-            rate_limit_max_retries: 10,
-        }
-    }
-
-    /// 创建带自定义熔断器配置的 GatewayManager
-    pub fn with_circuit_breaker(
+    pub fn new(
         provider: Arc<dyn ModelProvider>,
-        max_concurrent_requests: usize,
-        config: CircuitBreakerConfig,
+        throttle_ms: u64,
+        global_permits: usize,
     ) -> Self {
         Self {
             provider,
             backoff: ExponentialBackoff::default(),
-            rate_limiters: Mutex::new(HashMap::new()),
-            max_concurrent_requests,
-            circuit_breaker: Mutex::new(CircuitBreaker::new(config)),
-            global_concurrency: Arc::new(Semaphore::new(3)),
+            circuit_breaker: Mutex::new(CircuitBreaker::default()),
+            global_concurrency: Arc::new(Semaphore::new(global_permits)),
             rate_limit_max_retries: 10,
+            throttle_ms,
+        }
+    }
+
+    pub fn with_circuit_breaker(
+        provider: Arc<dyn ModelProvider>,
+        config: CircuitBreakerConfig,
+        throttle_ms: u64,
+        global_permits: usize,
+    ) -> Self {
+        Self {
+            provider,
+            backoff: ExponentialBackoff::default(),
+            circuit_breaker: Mutex::new(CircuitBreaker::new(config)),
+            global_concurrency: Arc::new(Semaphore::new(global_permits)),
+            rate_limit_max_retries: 10,
+            throttle_ms,
         }
     }
 
     /// Create with custom concurrency limits
     pub fn with_concurrency(
         provider: Arc<dyn ModelProvider>,
-        max_concurrent_requests: usize,
         global_permits: usize,
         rate_limit_max_retries: u32,
+        throttle_ms: u64,
     ) -> Self {
         Self {
             provider,
             backoff: ExponentialBackoff::default(),
-            rate_limiters: Mutex::new(HashMap::new()),
-            max_concurrent_requests,
             circuit_breaker: Mutex::new(CircuitBreaker::default()),
             global_concurrency: Arc::new(Semaphore::new(global_permits)),
             rate_limit_max_retries,
+            throttle_ms,
         }
     }
 
@@ -264,23 +265,18 @@ impl GatewayManager {
 
                         retries += 1;
                         info!(
-                            "[Gateway] Request Rate Limited (attempt {}/{}), releasing permit and backing off...",
+                            "[Gateway] Request Rate Limited (attempt {}/{}), holding permit and sleeping...",
                             retries, self.rate_limit_max_retries
                         );
 
-                        // CRITICAL: Release semaphore permit BEFORE sleeping.
-                        // This lets other queued tasks proceed while we wait,
-                        // avoiding a deadlock where all permits are held by sleeping tasks.
-                        drop(_permit);
+                        // CRITICAL FIX: DO NOT release the permit here.
+                        // Since 429 means the global API channel is saturated, holding this permit
+                        // acts as a natural system-wide pause, preventing a "thundering herd" of
+                        // queued agents from waking up just to hit immediate 429s and uselessly escalating
+                        // their retry timers.
                         self.backoff.wait(retries).await;
-
-                        // Re-acquire permit after backoff
-                        _permit = self.global_concurrency.clone().acquire_owned().await
-                            .map_err(|_| GatewayError::Other {
-                                message: "Global concurrency semaphore closed during retry".to_string(),
-                                is_retryable: false,
-                            })?;
-                        // Continue the loop with the new permit
+                        
+                        // Continue the loop while still holding the original permit
                     } else {
                         // Non-rate-limit retryable error: standard max_retries
                         if retries >= self.backoff.get_max_retries() {
@@ -321,19 +317,7 @@ impl ModelGateway for GatewayManager {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
-        // 2. 强制速率限制 (0 = 无限制)
-        if self.max_concurrent_requests > 0 {
-            let mut limiters = self.rate_limiters.lock().await;
-            let limiter = limiters.entry(req.session_id.clone()).or_insert_with(|| {
-                SimpleRateLimiter::new(self.max_concurrent_requests)
-            });
-
-            if !limiter.try_consume() {
-                return Err(GatewayError::TooManyRequests { retry_after_ms: None });
-            }
-        }
-
-        // 3. Acquire global concurrency semaphore permit.
+        // 2. Acquire global concurrency semaphore permit.
         //    This serializes all LLM requests system-wide, preventing concurrent
         //    429 storms from overwhelming the API provider.
         let permit = self.global_concurrency.clone().acquire_owned().await
@@ -341,6 +325,12 @@ impl ModelGateway for GatewayManager {
                 message: "Global concurrency semaphore closed".to_string(),
                 is_retryable: false,
             })?;
+
+        // 3. [THROTTLING] Proactively pace requests to avoid Zhipu API strict RPS limits.
+        // Even when holding a permit, wait before firing.
+        if self.throttle_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.throttle_ms)).await;
+        }
 
         // 4. Execute with the held permit
         self.generate_with_permit(&req, permit, 0).await

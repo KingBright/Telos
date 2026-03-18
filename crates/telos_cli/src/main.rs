@@ -314,7 +314,7 @@ async fn handle_log_level(level: &Option<String>) -> Result<(), Box<dyn std::err
         Some(level_str) => {
             // Set log level
             let res = client
-                .post("http://127.0.0.1:3000/api/v1/log-level")
+                .post("http://127.0.0.1:8321/api/v1/log-level")
                 .json(&json!({ "level": level_str }))
                 .send()
                 .await?;
@@ -333,7 +333,7 @@ async fn handle_log_level(level: &Option<String>) -> Result<(), Box<dyn std::err
         None => {
             // Get current log level
             let res = client
-                .get("http://127.0.0.1:3000/api/v1/log-level")
+                .get("http://127.0.0.1:8321/api/v1/log-level")
                 .send()
                 .await?;
 
@@ -361,8 +361,8 @@ async fn handle_telegram_bot() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting Telegram Bot Adapter...");
 
-    let daemon_url = "http://127.0.0.1:3000".to_string();
-    let daemon_ws_url = "ws://127.0.0.1:3000/api/v1/stream".to_string();
+    let daemon_url = "http://127.0.0.1:8321".to_string();
+    let daemon_ws_url = "ws://127.0.0.1:8321/api/v1/stream".to_string();
 
     let provider = TelegramBotProvider::new(
         token,
@@ -464,13 +464,17 @@ fn check_and_init_config(force: bool) -> bool {
         telegram_bot_token,
         bot_send_state_changes,
         active_project_id: None,
-        max_concurrent_requests: 20,
+        global_concurrency_permits: 3,
         log_level: "normal".to_string(),
+        llm_throttle_ms: 2000,
         global_prompt: None,
         proxy: None,
         router_persona_name: "小特".to_string(),
         router_persona_trait: "聪明、活泼且不失风趣".to_string(),
         default_location: None,
+        openai_audio_base_url: None,
+        openai_audio_api_key: None,
+        tts_voice_id: telos_core::config::default_tts_voice_id(),
     };
 
     match config.save() {
@@ -518,13 +522,13 @@ fn start_daemon() {
 
 async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     let trace_id = uuid::Uuid::new_v4().to_string();
-    let ws_url = format!("ws://127.0.0.1:3000/api/v1/stream?trace_id={}", trace_id);
+    let ws_url = format!("ws://127.0.0.1:8321/api/v1/stream?trace_id={}", trace_id);
     println!("Connecting to Feedback Stream at {} ...", ws_url);
 
     // Get current log level from daemon
     let client = Client::new();
     let current_level = match client
-        .get("http://127.0.0.1:3000/api/v1/log-level")
+        .get("http://127.0.0.1:8321/api/v1/log-level")
         .send()
         .await
     {
@@ -566,7 +570,7 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let res = client
-        .post("http://127.0.0.1:3000/api/v1/run")
+        .post("http://127.0.0.1:8321/api/v1/run")
         .json(&payload)
         .send()
         .await?;
@@ -607,7 +611,7 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
                     let approved = input.trim().eq_ignore_ascii_case("y");
 
                     let res = client
-                        .post("http://127.0.0.1:3000/api/v1/approve")
+                        .post("http://127.0.0.1:8321/api/v1/approve")
                         .json(&json!({ "task_id": task_id, "approved": approved }))
                         .send()
                         .await?;
@@ -632,7 +636,7 @@ async fn handle_run(task: &str) -> Result<(), Box<dyn std::error::Error>> {
 
                     if !instruction.is_empty() {
                         let res = client
-                            .post("http://127.0.0.1:3000/api/v1/intervention")
+                            .post("http://127.0.0.1:8321/api/v1/intervention")
                             .json(&json!({
                                 "task_id": task_id,
                                 "node_id": Some(node_id),
@@ -678,7 +682,7 @@ async fn handle_run_headless(config: &TelosConfig, task: &str) -> Result<(), Box
     // No hard timeout — we use idle-based timeout instead.
     // The SSE stream will send heartbeat events as the system works.
     let res = client
-        .post("http://127.0.0.1:3000/api/v1/run_sync")
+        .post("http://127.0.0.1:8321/api/v1/run_sync")
         .json(&payload)
         .send()
         .await?;

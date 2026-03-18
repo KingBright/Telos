@@ -186,9 +186,25 @@ impl OpenAiProvider {
         llm_model: String,
         embedding_model: String,
     ) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        // Mimic OpenClaw's network profile for coding LLMs (e.g. Z.AI/Kimi)
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static("claude-code/0.1.0"),
+        );
+        headers.insert(
+            reqwest::header::REFERER,
+            reqwest::header::HeaderValue::from_static("https://openclaw.ai"),
+        );
+        headers.insert(
+            "X-Title",
+            reqwest::header::HeaderValue::from_static("OpenClaw"),
+        );
+
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))  // 2 minutes for LLM API calls
+                .timeout(std::time::Duration::from_secs(120)) // 2 minutes for LLM API calls
+                .default_headers(headers)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             api_key,
@@ -431,6 +447,8 @@ impl LlmProvider for OpenAiProvider {
 }
 
 use std::sync::Arc;
+#[cfg(feature = "local-embeddings")]
+use tokio::sync::Mutex;
 
 
 /// A Local Provider that uses ONNX Runtime (`fastembed`) for high-performance,
@@ -549,5 +567,52 @@ impl LlmProvider for GatewayLlmProvider {
             })?;
 
         Ok(response.content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn test_openclaw_spoofed_headers_are_injected() {
+        let mock_server = MockServer::start().await;
+
+        let provider = OpenAiProvider::new(
+            "test_api_key".to_string(),
+            mock_server.uri(),
+            "glm-5-turbo".to_string(),
+            "embedding-model".to_string(),
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("User-Agent", "claude-code/0.1.0"))
+            .and(header("Referer", "https://openclaw.ai"))
+            .and(header("X-Title", "OpenClaw"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "glm-5-turbo",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello! I am answering from the mock server."
+                    },
+                    "logprobs": null,
+                    "finish_reason": "stop"
+                }]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let res = provider.chat_completion("Hello").await;
+        assert!(res.is_ok(), "Request failed: {:?}", res.unwrap_err());
+        assert_eq!(res.unwrap(), "Hello! I am answering from the mock server.");
     }
 }

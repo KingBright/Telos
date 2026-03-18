@@ -11,10 +11,11 @@ pub mod engine;
 mod tests;
 
 /// Metadata for a node in the execution graph
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct NodeMetadata {
     pub task_type: String,         // "LLM" or "TOOL"
     pub prompt_preview: String,    // Truncated prompt for display
+    pub full_task: String,         // Full un-truncated payload for execution
     pub tool_name: Option<String>, // For TOOL type nodes
     pub schema_payload: Option<String>,
 }
@@ -25,15 +26,17 @@ pub trait ExecutableNode: Send + Sync {
     async fn execute(&self, input: AgentInput, registry: &dyn SystemRegistry) -> AgentOutput;
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GraphState {
     pub is_running: bool,
     pub completed: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TaskGraph {
     pub graph_id: String,
     // Original mapping of node ID to ExecutableNode logic
+    #[serde(skip)]
     pub nodes: HashMap<String, Box<dyn ExecutableNode>>,
     // Directed graph where weights are the string node IDs
     pub edges: DiGraph<String, ()>,
@@ -48,6 +51,7 @@ pub struct TaskGraph {
     // Metadata for each node (task_type, prompt_preview, etc.)
     pub node_metadata: HashMap<String, NodeMetadata>,
     pub current_state: GraphState,
+    pub conversation_history: Vec<telos_core::ConversationMessage>,
 }
 
 impl TaskGraph {
@@ -65,6 +69,7 @@ impl TaskGraph {
                 is_running: false,
                 completed: false,
             },
+            conversation_history: Vec::new(),
         }
     }
 
@@ -155,6 +160,31 @@ impl TaskGraph {
             }
         }
         deps
+    }
+
+    /// Converts the current TaskGraph and its metadata into a serializable AgentSubGraph
+    /// which can be stored as a Procedural Workflow Template.
+    pub fn to_subgraph(&self) -> telos_core::AgentSubGraph {
+        let mut nodes = Vec::new();
+        for (id, meta) in &self.node_metadata {
+            nodes.push(telos_core::SubGraphNode {
+                id: id.clone(),
+                agent_type: meta.task_type.clone(),
+                task: meta.full_task.clone(),
+                schema_payload: meta.schema_payload.clone().unwrap_or_default(),
+                loop_config: None,
+                is_critic: false,
+            });
+        }
+        let mut edges = Vec::new();
+        for ((from, to), dep_type) in &self.edge_types {
+            edges.push(telos_core::SubGraphEdge {
+                from: from.clone(),
+                to: to.clone(),
+                dep_type: *dep_type,
+            });
+        }
+        telos_core::AgentSubGraph { nodes, edges }
     }
 }
 

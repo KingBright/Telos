@@ -1,5 +1,6 @@
 pub mod providers;
 pub mod traits;
+pub mod markdown_renderer;
 
 pub use traits::*;
 

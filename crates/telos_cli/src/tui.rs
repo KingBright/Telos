@@ -68,7 +68,7 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
 
     // 3. Spawns
     let tx_ws = tx.clone();
-    let ws_url = "ws://127.0.0.1:3000/api/v1/stream";
+    let ws_url = "ws://127.0.0.1:8321/api/v1/stream";
     tokio::spawn(async move {
         // Try to connect repeatedly
         loop {
@@ -90,7 +90,7 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
     tokio::spawn(async move {
         let client = Client::new();
         loop {
-            if let Ok(res) = client.get("http://127.0.0.1:3000/api/v1/tasks/active").send().await {
+            if let Ok(res) = client.get("http://127.0.0.1:8321/api/v1/tasks/active").send().await {
                 if let Ok(body) = res.json::<serde_json::Value>().await {
                     if let Some(tasks) = body.get("active_tasks").and_then(|v| v.as_array()) {
                         let mut parsed_tasks = Vec::new();
@@ -131,7 +131,7 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
         let req_client = client.clone();
         tokio::spawn(async move {
             let res = req_client
-                .post("http://127.0.0.1:3000/api/v1/run")
+                .post("http://127.0.0.1:8321/api/v1/run")
                 .json(&payload)
                 .send()
                 .await;
@@ -173,7 +173,7 @@ pub async fn run_tui(config: TelosConfig, initial_task: Option<String>) -> Resul
                                 let req_client = client.clone();
                                 tokio::spawn(async move {
                                     let res = req_client
-                                        .post("http://127.0.0.1:3000/api/v1/run")
+                                        .post("http://127.0.0.1:8321/api/v1/run")
                                         .json(&payload)
                                         .send()
                                         .await;

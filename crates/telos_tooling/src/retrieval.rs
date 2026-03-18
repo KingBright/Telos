@@ -5,11 +5,11 @@ use std::path::{PathBuf, Path};
 use tokio::fs;
 
 pub struct VectorToolRegistry {
-    tools: HashMap<String, ToolSchema>,
-    executors: HashMap<String, std::sync::Arc<dyn ToolExecutor>>,
+    tools: std::sync::RwLock<HashMap<String, ToolSchema>>,
+    executors: std::sync::RwLock<HashMap<String, std::sync::Arc<dyn ToolExecutor>>>,
     plugins_dir: PathBuf,
     #[cfg(feature = "local-embeddings")]
-    embeddings_cache: HashMap<String, Vec<f32>>,
+    embeddings_cache: std::sync::RwLock<HashMap<String, Vec<f32>>>,
     #[cfg(feature = "local-embeddings")]
     model: Option<std::sync::RwLock<fastembed::TextEmbedding>>,
 }
@@ -19,19 +19,20 @@ impl VectorToolRegistry {
         #[cfg(feature = "local-embeddings")]
         {
             let model_result = std::panic::catch_unwind(|| {
+                let cache_dir = dirs::home_dir().map(|h| h.join(".telos").join("models")).unwrap_or_else(|| std::path::PathBuf::from(".fastembed_cache"));
                 fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
                     fastembed::EmbeddingModel::AllMiniLML6V2,
-                ))
+                ).with_cache_dir(cache_dir))
             });
 
             match model_result {
                 Ok(Ok(model)) => {
                     info!("[ToolRegistry] Fastembed model loaded successfully.");
                     let mut registry = Self {
-                        tools: HashMap::new(),
-                        executors: HashMap::new(),
+                        tools: std::sync::RwLock::new(HashMap::new()),
+                        executors: std::sync::RwLock::new(HashMap::new()),
                         plugins_dir: Self::get_default_plugins_dir(),
-                        embeddings_cache: HashMap::new(),
+                        embeddings_cache: std::sync::RwLock::new(HashMap::new()),
                         model: Some(std::sync::RwLock::new(model)),
                     };
                     registry.load_saved_plugins();
@@ -83,11 +84,11 @@ impl VectorToolRegistry {
     pub fn new_keyword_only() -> Self {
         info!("[ToolRegistry] Using keyword-only tool discovery.");
         let mut registry = Self {
-            tools: HashMap::new(),
-            executors: HashMap::new(),
+            tools: std::sync::RwLock::new(HashMap::new()),
+            executors: std::sync::RwLock::new(HashMap::new()),
             plugins_dir: Self::get_default_plugins_dir(),
             #[cfg(feature = "local-embeddings")]
-            embeddings_cache: HashMap::new(),
+            embeddings_cache: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "local-embeddings")]
             model: None,
         };
@@ -95,8 +96,22 @@ impl VectorToolRegistry {
         registry
     }
 
+    /// Create a registry exclusively for isolated testing without plugin loading.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            tools: std::sync::RwLock::new(HashMap::new()),
+            executors: std::sync::RwLock::new(HashMap::new()),
+            plugins_dir: std::env::temp_dir().join("telos_test_plugins"),
+            #[cfg(feature = "local-embeddings")]
+            embeddings_cache: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "local-embeddings")]
+            model: None,
+        }
+    }
+
     pub fn register_tool(
-        &mut self,
+        &self,
         schema: ToolSchema,
         executor: Option<std::sync::Arc<dyn ToolExecutor>>,
     ) {
@@ -106,17 +121,23 @@ impl VectorToolRegistry {
             if let Ok(mut m) = model.write() {
                 if let Ok(embeddings) = m.embed(vec![text_to_embed], None) {
                     if let Some(embedding) = embeddings.into_iter().next() {
-                        self.embeddings_cache.insert(schema.name.clone(), embedding);
+                        if let Ok(mut cache) = self.embeddings_cache.write() {
+                            cache.insert(schema.name.clone(), embedding);
+                        }
                     }
                 }
             }
         }
 
         if let Some(exec) = executor {
-            self.executors.insert(schema.name.clone(), exec);
+            if let Ok(mut execs) = self.executors.write() {
+                execs.insert(schema.name.clone(), exec);
+            }
         }
 
-        self.tools.insert(schema.name.clone(), schema);
+        if let Ok(mut tools) = self.tools.write() {
+            tools.insert(schema.name.clone(), schema);
+        }
     }
 
     #[cfg(feature = "local-embeddings")]
@@ -143,41 +164,38 @@ impl VectorToolRegistry {
         let query_lower = intent.to_lowercase().replace('_', " ").replace('-', " ");
         let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
-        let mut scored: Vec<(&String, f32)> = self
-            .tools
-            .iter()
+        let mut all_tools = Vec::new();
+        if let Ok(guard) = self.tools.read() {
+            for (name, schema) in guard.iter() {
+                all_tools.push((name.clone(), schema.clone()));
+            }
+        }
+
+        let mut scored: Vec<(ToolSchema, f32)> = all_tools
+            .into_iter()
             .map(|(name, schema)| {
                 let haystack = format!("{} {}", name, schema.description).to_lowercase();
-                let score: f32 =
-                    query_words.iter().filter(|w| haystack.contains(*w)).count() as f32;
-                debug!(
-                    "[ToolRegistry] Checking '{}' against words {:?} -> score {}",
-                    name, query_words, score
-                );
-                (name, score)
+                let score: f32 = query_words.iter().filter(|w| haystack.contains(*w)).count() as f32;
+                (schema, score)
             })
             .collect();
 
-        if scored.iter().all(|(_, s)| *s == 0.0) {
-            debug!(
-                "[ToolRegistry] No matches at all for query words: {:?}",
-                query_words
-            );
-        }
-
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
         scored
             .into_iter()
             .filter(|&(_, score)| score > 0.0)
             .take(limit)
-            .filter_map(|(name, _)| self.tools.get(name).cloned())
+            .map(|(schema, _)| schema)
             .collect()
     }
 
     /// List all registered tools with their schemas
     pub fn list_all_tools(&self) -> Vec<ToolSchema> {
-        self.tools.values().cloned().collect()
+        if let Ok(guard) = self.tools.read() {
+            guard.values().cloned().collect()
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -192,24 +210,27 @@ impl ToolRegistry for VectorToolRegistry {
             if let Ok(mut m) = model.write() {
                 if let Ok(embeddings) = m.embed(vec![intent.to_string()], None) {
                     if let Some(query_embedding) = embeddings.into_iter().next() {
-                        let mut scored_tools: Vec<(&String, f32)> = self
-                            .embeddings_cache
-                            .iter()
-                            .map(|(name, emb)| {
-                                let score = Self::cosine_similarity(&query_embedding, emb);
-                                (name, score)
-                            })
-                            .collect();
+                        let mut scored_tools: Vec<(String, f32)> = if let Ok(guard) = self.embeddings_cache.read() {
+                            guard.iter().map(|(name, emb)| {
+                                (name.clone(), Self::cosine_similarity(&query_embedding, emb))
+                            }).collect()
+                        } else {
+                            vec![]
+                        };
 
                         scored_tools.sort_by(|a, b| {
                             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                         });
 
-                        return scored_tools
-                            .into_iter()
-                            .take(limit)
-                            .filter_map(|(name, _)| self.tools.get(name).cloned())
-                            .collect();
+                        let mut results = Vec::new();
+                        if let Ok(tools_guard) = self.tools.read() {
+                            for (name, _) in scored_tools.into_iter().take(limit) {
+                                if let Some(schema) = tools_guard.get(&name) {
+                                    results.push(schema.clone());
+                                }
+                            }
+                        }
+                        return results;
                     }
                 }
             }
@@ -219,11 +240,15 @@ impl ToolRegistry for VectorToolRegistry {
     }
 
     fn get_executor(&self, tool_name: &str) -> Option<std::sync::Arc<dyn ToolExecutor>> {
-        self.executors.get(tool_name).cloned()
+        if let Ok(guard) = self.executors.read() {
+            guard.get(tool_name).cloned()
+        } else {
+            None
+        }
     }
 
     fn list_all_tools(&self) -> Vec<ToolSchema> {
-        self.tools.values().cloned().collect()
+        self.list_all_tools()
     }
 
     fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String> {
@@ -246,24 +271,72 @@ impl ToolRegistry for VectorToolRegistry {
             info!("Plugin safely installed to: {:?}", plugin_path);
         }
 
-        // To mutate internal maps, we would need interior mutability on VectorToolRegistry itself.
-        // Wait, VectorToolRegistry tools and executors maps are NOT in a RwLock.
-        // But the current implementation of `ToolRegistry` trait for `VectorToolRegistry` 
-        // implies read-only operations for discover_tools and get_executor.
-        // How does it register native tools? It does it via `pub fn register_tool(&mut self)` 
-        // DURING initialization before being wrapped in Arc<RwLock>.
-        // Since `register_dynamic_tool` needs to mutate, and it takes `&self` on the trait, 
-        // VectorToolRegistry MUST wrap its maps in RwLock or Mutex.
-        // Quick fix: return an error for now because this trait method is currently implemented in SharedToolRegistry!
-        // Actually, `SharedToolRegistry<T>` implements `ToolRegistry` by calling `T`'s mutable methods via `try_write().guard.register_dynamic_tool()`.
-        // Wait, `SharedToolRegistry<T>` expects `T` to have `register_dynamic_tool(&mut self)`? No, it calls `guard.register_dynamic_tool` which goes to the trait implementation.
-        // Let me just fix the trait to match `VectorToolRegistry`'s interior mutability needs.
-        Err("Cannot register dynamically to a non-shared registry directly".into())
+        // Register it natively using the RwLock
+        self.register_tool(schema, Some(executor));
+        Ok(())
     }
 }
 
 impl Default for VectorToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::script_sandbox::{ScriptSandbox, ScriptExecutor};
+    use crate::{JsonSchema, RiskLevel};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_dynamic_tool_registration_and_execution() {
+        // 1. Setup a fresh registry
+        let registry = VectorToolRegistry::new_keyword_only();
+        
+        // 2. Define a dummy schema
+        let schema = ToolSchema {
+            name: "calculate_tax".into(),
+            description: "Calculates 20% tax on an amount integer-wise".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "amount": { "type": "integer" }
+                    },
+                    "required": ["amount"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+            ..Default::default()
+        };
+
+        // 3. Define the Rhai Executor (Integer arithmetic)
+        let rhai_code = r#"
+            let amt = params.amount;
+            return amt / 5;
+        "#.to_string();
+        
+        let sandbox = Arc::new(ScriptSandbox::new());
+        let executor = Arc::new(ScriptExecutor::new(rhai_code.clone(), sandbox));
+
+        // 4. Register dynamically
+        let res = registry.register_dynamic_tool(schema.clone(), executor);
+        assert!(res.is_ok(), "Registration should succeed");
+
+        // 5. Verify it's discoverable
+        let discovered = registry.discover_tools("tax", 5);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name, "calculate_tax");
+
+        // 6. Verify it's executable via the registry reference
+        let retrieved_executor = registry.get_executor("calculate_tax").expect("Executor must exist");
+        
+        let params = serde_json::json!({ "amount": 100 });
+        let exec_result = retrieved_executor.call(params).await.expect("Execution should not fail");
+        
+        let out_str = String::from_utf8(exec_result).unwrap();
+        assert_eq!(out_str, "20");
     }
 }
