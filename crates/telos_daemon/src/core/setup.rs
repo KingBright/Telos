@@ -3,9 +3,12 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use telos_core::config::TelosConfig;
 use telos_tooling::retrieval::VectorToolRegistry;
+use telos_model_gateway::gateway::GatewayManager;
+use crate::core::mutate_tool::MutateTool;
 
 pub async fn build_tool_registry(
     config: &TelosConfig,
+    gateway: Arc<GatewayManager>,
 ) -> Arc<RwLock<VectorToolRegistry>> {
     let tool_registry = VectorToolRegistry::new_keyword_only();
 
@@ -71,11 +74,17 @@ pub async fn build_tool_registry(
     // Register CreateRhaiTool (needs reference to registry)
     {
         let wrapped_registry = telos_tooling::wrap_tool_registry(tool_registry.clone());
-        let create_rhai = telos_tooling::native::CreateRhaiTool::new(wrapped_registry);
+        let create_rhai = telos_tooling::native::CreateRhaiTool::new(wrapped_registry.clone());
         let list_rhai = telos_tooling::native::ListRhaiTools::new(config.tools_dir.clone());
+        let discover_tools = telos_tooling::native::DiscoverTools::new(wrapped_registry.clone());
+        let attach_note = telos_tooling::native::AttachToolNote::new(wrapped_registry.clone());
+        let mutate_tool = MutateTool::new(wrapped_registry.clone(), gateway.clone(), config.tools_dir.clone());
         if let Ok(guard) = tool_registry.try_read() {
             guard.register_tool(telos_tooling::native::CreateRhaiTool::schema(), Some(std::sync::Arc::new(create_rhai)));
             guard.register_tool(telos_tooling::native::ListRhaiTools::schema(), Some(std::sync::Arc::new(list_rhai)));
+            guard.register_tool(telos_tooling::native::DiscoverTools::schema(), Some(std::sync::Arc::new(discover_tools)));
+            guard.register_tool(telos_tooling::native::AttachToolNote::schema(), Some(std::sync::Arc::new(attach_note)));
+            guard.register_tool(MutateTool::schema(), Some(std::sync::Arc::new(mutate_tool)));
         }
     }
 

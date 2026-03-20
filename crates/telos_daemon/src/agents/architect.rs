@@ -53,14 +53,45 @@ impl ExpertAgent for ArchitectAgent {
         let mem_context = input.memory_context.clone().unwrap_or_default();
 
         let mut template_context = String::new();
-        let mut reused_template_count = 0usize;
+        let mut template_descriptions: Vec<String> = Vec::new();
         if let Some(mem_any) = _registry.get_memory_os() {
             if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
                 use telos_memory::integration::MemoryIntegration;
                 if let Ok(templates) = mem_os.retrieve_procedural_memories(input.task.clone()).await {
                     if !templates.is_empty() {
-                        reused_template_count = templates.len();
-                        template_context = format!("[LEARNED WORKFLOW TEMPLATES & STRATEGIES]\nIf any of the following procedural templates match the user's current goal, you MUST reuse its node topology (agent types, edges). You must instantiate the template by replacing specific placeholder arguments (like filenames or test targets) with the parameters from the current task.\n\n{}\n\n", templates.join("\n---\n"));
+                        // Extract descriptions for tracking which templates were offered
+                        for t in &templates {
+                            if let Some(desc_line) = t.lines().find(|l| l.starts_with("[Description] ")) {
+                                template_descriptions.push(desc_line.trim_start_matches("[Description] ").to_string());
+                            }
+                        }
+                        // Parse and inject failure notes as warnings
+                        let mut templates_with_warnings = Vec::new();
+                        for t in &templates {
+                            let failure_notes: Vec<&str> = t.lines()
+                                .filter(|l| l.starts_with("[FailureNote] "))
+                                .collect();
+                            if failure_notes.is_empty() {
+                                templates_with_warnings.push(t.clone());
+                            } else {
+                                let warnings = failure_notes.iter()
+                                    .map(|n| format!("  ⚠️ KNOWN LIMITATION: {}", n.trim_start_matches("[FailureNote] ")))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                templates_with_warnings.push(format!("{}\n{}", t, warnings));
+                            }
+                        }
+                        template_context = format!(
+                            "[LEARNED WORKFLOW TEMPLATES & STRATEGIES]\n\
+                             The following are procedural templates from past successful executions.\n\
+                             IMPORTANT: First evaluate whether each template is RELEVANT to the current task.\n\
+                             - If a template's structure clearly fits the current goal, adopt it and adapt its node topology.\n\
+                             - If a template is NOT relevant (different domain, different task type), IGNORE it completely.\n\
+                             - If a template has KNOWN LIMITATIONS (⚠️ warnings), consider whether those limitations apply.\n\
+                             You MUST declare which templates you adopted in your output (see schema).\n\n\
+                             {}\n\n",
+                            templates_with_warnings.join("\n---\n")
+                        );
                     }
                 }
             }
@@ -93,8 +124,10 @@ Rules for planning:
 Output exactly a JSON object matching this schema:
 {
   "nodes": [ { "id": "...", "agent_type": "...", "task": "...", "schema_payload": "..." } ],
-  "edges": [ { "from": "...", "to": "...", "dep_type": "Data" } ]
+  "edges": [ { "from": "...", "to": "...", "dep_type": "Data" } ],
+  "adopted_templates": ["description of adopted template 1", ...]
 }
+NOTE: "adopted_templates" is an array of template descriptions you actually adopted. If no templates were relevant, use an empty array [].
 CRITICAL FORMAT REQUIREMENT: 
 Your total response MUST be a single valid JSON object exactly matching the schema. DO NOT output any markdown (no ```json ... ```), NO conversational text, NO apologies, NO thinking process. ONLY JSON."#);
 
@@ -144,7 +177,23 @@ Your total response MUST be a single valid JSON object exactly matching the sche
                     .trim_end_matches("```")
                     .trim();
 
-                match serde_json::from_str::<AgentSubGraph>(clean_json) {
+                match serde_json::from_str::<serde_json::Value>(clean_json) {
+                    Ok(full_json) => {
+                        // Extract adopted_templates before parsing as AgentSubGraph
+                        let adopted_templates: Vec<String> = full_json.get("adopted_templates")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect())
+                            .unwrap_or_default();
+                        
+                        if !adopted_templates.is_empty() {
+                            info!("[ArchitectAgent] 📋 Adopted {} workflow templates: {:?}", 
+                                adopted_templates.len(), adopted_templates);
+                        }
+                        
+                        // Now parse the SubGraph structure (clone since from_value consumes)
+                        match serde_json::from_value::<AgentSubGraph>(full_json.clone()) {
                     Ok(mut sub_graph) => {
                         info!(
                             "[ArchitectAgent] ✅ Decomposition complete. Generated {} nodes.",
@@ -172,31 +221,30 @@ Your total response MUST be a single valid JSON object exactly matching the sche
                         AgentOutput::with_subgraph(
                             serde_json::json!({
                                 "text": format!("SubGraph decomposition complete with {} nodes", sub_graph.nodes.len()),
-                                "reused_workflow_count": reused_template_count,
+                                "adopted_templates": adopted_templates,
                             }),
                             sub_graph,
                         ).with_trace(trace)
                     }
                     Err(e) => {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(clean_json) {
-                            if let Some(tool) = val.get("tool").and_then(|t| t.as_str()) {
-                                let sub_node = telos_core::SubGraphNode {
-                                    id: format!("direct_call_{}", tool),
-                                    agent_type: "tool".to_string(),
-                                    task: tool.to_string(), // ToolNode expects task to be EXACTLY the tool name
-                                    schema_payload: serde_json::to_string(&val).unwrap_or_default(),
-                                    loop_config: None,
-                                    is_critic: false,
-                                };
-                                let sub_graph = telos_core::AgentSubGraph {
-                                    nodes: vec![sub_node],
-                                    edges: vec![],
-                                };
-                                return AgentOutput::with_subgraph(
-                                    serde_json::json!({ "text": "SubGraph decomposition complete with 1 node" }),
-                                    sub_graph
-                                ).with_trace(trace);
-                            }
+                        // AgentSubGraph parse failed, but we have valid JSON — check for direct tool call
+                        if let Some(tool) = full_json.get("tool").and_then(|t| t.as_str()) {
+                            let sub_node = telos_core::SubGraphNode {
+                                id: format!("direct_call_{}", tool),
+                                agent_type: "tool".to_string(),
+                                task: tool.to_string(),
+                                schema_payload: serde_json::to_string(&full_json).unwrap_or_default(),
+                                loop_config: None,
+                                is_critic: false,
+                            };
+                            let sub_graph = telos_core::AgentSubGraph {
+                                nodes: vec![sub_node],
+                                edges: vec![],
+                            };
+                            return AgentOutput::with_subgraph(
+                                serde_json::json!({ "text": "SubGraph decomposition complete with 1 node" }),
+                                sub_graph
+                            ).with_trace(trace);
                         }
                         parse_failure(
                             "ArchitectParseError",
@@ -204,7 +252,16 @@ Your total response MUST be a single valid JSON object exactly matching the sche
                             &res.content,
                         ).with_trace(trace)
                     }
-                }
+                    } // end inner match from_value
+                    } // end Ok(full_json)
+                    Err(e) => {
+                        parse_failure(
+                            "ArchitectParseError",
+                            &format!("无法解析规划输出为JSON: {}", e),
+                            &res.content,
+                        ).with_trace(trace)
+                    }
+                } // end outer match from_str
             }
             Err(e) => from_gateway_error(e, "规划生成失败"),
         }

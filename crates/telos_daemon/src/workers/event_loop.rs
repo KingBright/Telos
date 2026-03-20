@@ -540,7 +540,7 @@ pub async fn run_event_loop(
                                 status: telos_core::NodeStatus::Running,
                             });
 
-                            let router = agents::router::RouterAgent::new(gateway_clone.clone(), config.router_persona_name.clone(), config.router_persona_trait.clone());
+                            let router = agents::router::RouterAgent::new(gateway_clone.clone(), config.router_persona_name.clone(), config.router_persona_trait.clone(), tool_registry.clone());
                             let combined_memory_context = {
                                 let mut ctx = String::new();
                                 if !custom_tools_context.is_empty() {
@@ -970,7 +970,7 @@ pub async fn run_event_loop(
                                         prompt_preview: truncate_for_preview(&enriched_payload, 100),
                                         full_task: enriched_payload.clone(),
                                         tool_name: None,
-                                        schema_payload: None,
+                                        schema_payload: route_data.get("auto_discovered_tools").map(|v| v.to_string()),
                                     },
                                 );
                                 graph.current_state = GraphState {
@@ -1319,24 +1319,29 @@ pub async fn run_event_loop(
                             });
 
                             // --- EVOLUTION & MEMORY INTEGRATION LOOP ---
-                            // Detect workflow reuse from architect output metadata in trace steps
+                            // Detect workflow reuse from architect's explicit adopted_templates declaration
                             let mut reused_wf_ids: Vec<String> = Vec::new();
                             for step in &loop_final_trace_steps {
                                 if let Some(ref output_str) = step.output_data {
                                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(output_str) {
-                                        if let Some(count) = json.get("reused_workflow_count").and_then(|v| v.as_u64()) {
-                                            if count > 0 {
-                                                reused_wf_ids.push(step.node_id.clone());
+                                        // New: read adopted_templates (Architect explicitly declares which templates it used)
+                                        if let Some(adopted) = json.get("adopted_templates").and_then(|v| v.as_array()) {
+                                            for template_desc in adopted {
+                                                if let Some(desc) = template_desc.as_str() {
+                                                    reused_wf_ids.push(desc.to_string());
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                            // If architect was the expert itself, check route_data
+                            // Fallback: check route_data for adopted_templates from software_expert
                             if reused_wf_ids.is_empty() && expert_route == "software_expert" {
-                                if let Some(count) = route_data.get("reused_workflow_count").and_then(|v| v.as_u64()) {
-                                    if count > 0 {
-                                        reused_wf_ids.push(trace_id.to_string());
+                                if let Some(adopted) = route_data.get("adopted_templates").and_then(|v| v.as_array()) {
+                                    for template_desc in adopted {
+                                        if let Some(desc) = template_desc.as_str() {
+                                            reused_wf_ids.push(desc.to_string());
+                                        }
                                     }
                                 }
                             }

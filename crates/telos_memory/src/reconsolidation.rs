@@ -57,6 +57,7 @@ pub async fn consolidate_memories(
                 embedding: entry.embedding.clone(),
                 access_count: 0,
                 confidence: 1.0, // Freshly consolidated = full confidence
+                similarity_score: None,
             };
 
             newly_consolidated.push(semantic_entry);

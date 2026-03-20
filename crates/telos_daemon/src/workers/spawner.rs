@@ -27,6 +27,7 @@ pub fn spawn_background_tasks(
     let registry_worker = registry.clone();
     
     tokio::spawn(async move {
+        use telos_model_gateway::ModelGateway; // needed for .generate() on GatewayManager
         debug!("[Daemon] 🧵 Evolution worker thread started, listening for traces...");
         while let Some(trace) = distillation_rx.recv().await {
             let trace_id = trace.task_id.clone();
@@ -45,10 +46,23 @@ pub fn spawn_background_tasks(
                             .map(|s| s.input_data.clone())
                             .unwrap_or_else(|| "Unknown Execution".to_string());
                         
+                        let mut required_tools = Vec::new();
+                        for step in &trace.steps {
+                            if let Some(out) = &step.output_data {
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(out) {
+                                    if let Some(tool_name) = val.get("tool").and_then(|t| t.as_str()) {
+                                        if !required_tools.contains(&tool_name.to_string()) {
+                                            required_tools.push(tool_name.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
                         if has_reused_workflows {
                             // Reused a workflow and succeeded → UPGRADE the template
                             let json_str_clone = json_str.clone();
-                            match registry_worker.memory_os.upgrade_workflow_template(desc.clone(), json_str).await {
+                            match registry_worker.memory_os.upgrade_workflow_template(desc.clone(), json_str, required_tools.clone()).await {
                                 Ok(upgraded) => {
                                     if upgraded {
                                         info!("[Daemon] 🔄 Workflow template upgraded for task {}.", trace_id);
@@ -58,12 +72,12 @@ pub fn spawn_background_tasks(
                                 }
                                 Err(e) => {
                                     warn!("[Daemon] ⚠️ Workflow upgrade failed: {}, storing as new.", e);
-                                    let _ = registry_worker.memory_os.store_workflow_template(desc.clone(), json_str_clone).await;
+                                    let _ = registry_worker.memory_os.store_workflow_template(desc.clone(), json_str_clone, required_tools.clone()).await;
                                 }
                             }
                         } else {
                             // Brand new workflow → store as new template
-                            let _ = registry_worker.memory_os.store_workflow_template(desc.clone(), json_str).await;
+                            let _ = registry_worker.memory_os.store_workflow_template(desc.clone(), json_str, required_tools.clone()).await;
                             info!("[Daemon] 📥 Graph Topology archived as Procedural Workflow Template for task {}.", trace_id);
                             
                             // Emit WorkflowStore metric event (only for new templates)
@@ -115,7 +129,31 @@ pub fn spawn_background_tasks(
                 let _ = registry_worker.memory_os.store_semantic_fact(summary).await;
                 debug!("[Daemon] 💡 Semantic fact extracted from successful task {}.", trace_id);
             } else if has_reused_workflows {
-                // --- WORKFLOW REUSE FAILURE EVENT ---
+                // --- WORKFLOW REUSE FAILURE: ATTACH NOTES + PENALTY ---
+                // Build failure note from trace errors
+                let failure_note = if !trace.errors_encountered.is_empty() {
+                    trace.errors_encountered.iter()
+                        .map(|e| format!("{:?}", e))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                } else {
+                    let failed_steps: Vec<String> = trace.steps.iter()
+                        .filter(|s| s.error.is_some())
+                        .map(|s| format!("[{}] {:?}", s.node_id, s.error.as_ref().unwrap()))
+                        .collect();
+                    if failed_steps.is_empty() {
+                        "Task rejected by QA evaluator — output did not meet quality standards.".to_string()
+                    } else {
+                        failed_steps.join("; ")
+                    }
+                };
+                
+                let task_desc = trace.steps.first()
+                    .map(|s| s.input_data.clone())
+                    .unwrap_or_else(|| "Unknown task".to_string());
+                let note_with_context = format!("Failed on task '{}': {}", 
+                    &task_desc[..task_desc.len().min(100)], failure_note);
+                
                 for wf_id in &trace.reused_workflow_ids {
                     crate::core::metrics_store::record(
                         crate::core::metrics_store::MetricEvent::WorkflowReuse {
@@ -125,8 +163,109 @@ pub fn spawn_background_tasks(
                             success: false,
                         }
                     );
+                    
+                    // Attach failure note to the template so the Architect can see warnings
+                    let failure_count = match registry_worker.memory_os.attach_failure_note(
+                        wf_id.clone(), note_with_context.clone()
+                    ).await {
+                        Ok(count) => count,
+                        Err(e) => {
+                            warn!("[Daemon] ⚠️ Failed to attach failure note: {}", e);
+                            0
+                        }
+                    };
+                    
+                    // Apply mild strength penalty (-0.3, floored at 1.0)
+                    if let Err(e) = registry_worker.memory_os.penalize_workflow_template(
+                        wf_id.clone()
+                    ).await {
+                        warn!("[Daemon] ⚠️ Failed to penalize template: {}", e);
+                    }
+                    
+                    // --- SPECIES DIVERGENCE: ≥2 cumulative failures triggers variant generation ---
+                    if failure_count >= 2 {
+                        info!("[Daemon] 🧬 Template '{}' has {} failures — triggering species divergence.", 
+                            &wf_id[..wf_id.len().min(60)], failure_count);
+                        
+                        // Retrieve the original template to pass to LLM
+                        if let Ok(templates) = registry_worker.memory_os.retrieve_procedural_memories(wf_id.clone()).await {
+                            if let Some(original_template) = templates.first() {
+                                let diverge_prompt = format!(
+                                    "You are a workflow evolution engine. A workflow template has failed {} times.\n\n\
+                                     ORIGINAL TEMPLATE:\n{}\n\n\
+                                     The template contains [FailureNote] lines describing what went wrong.\n\
+                                     Generate an ADAPTED VARIANT that avoids the failure patterns.\n\n\
+                                     Rules:\n\
+                                     1. Keep the same general structure but adjust the failing parts\n\
+                                     2. Add error handling or fallback nodes where failures occurred\n\
+                                     3. If a node type consistently fails, replace it with an alternative approach\n\
+                                     4. Output ONLY the [Description] line and the [TemplateJSON] block\n\n\
+                                     Format:\n[Description] <new adapted description>\n[TemplateJSON]\n<adapted JSON>",
+                                    failure_count, original_template
+                                );
+                                
+                                let req = telos_model_gateway::LlmRequest {
+                                    session_id: format!("diverge_{}", trace_id),
+                                    messages: vec![
+                                        telos_model_gateway::Message {
+                                            role: "system".to_string(),
+                                            content: "You are a workflow template evolution system. Output only the requested format.".to_string(),
+                                        },
+                                        telos_model_gateway::Message {
+                                            role: "user".to_string(),
+                                            content: diverge_prompt,
+                                        },
+                                    ],
+                                    required_capabilities: telos_model_gateway::Capability {
+                                        requires_vision: false,
+                                        strong_reasoning: true,
+                                    },
+                                    budget_limit: 2000,
+                                    tools: None,
+                                };
+                                
+                                match registry_worker.gateway.generate(req).await {
+                                    Ok(res) => {
+                                        let content = res.content.trim()
+                                            .trim_start_matches("```json").trim_start_matches("```")
+                                            .trim_end_matches("```").trim();
+                                        
+                                        // Parse out [Description] and [TemplateJSON]
+                                        let desc = content.lines()
+                                            .find(|l: &&str| l.starts_with("[Description] "))
+                                            .map(|l: &str| l.trim_start_matches("[Description] ").to_string())
+                                            .unwrap_or_else(|| format!("Variant of: {}", &wf_id[..wf_id.len().min(60)]));
+                                        
+                                        let template_json = if let Some(pos) = content.find("[TemplateJSON]") {
+                                            content[pos + "[TemplateJSON]".len()..].trim().to_string()
+                                        } else {
+                                            content.to_string()
+                                        };
+                                        
+                                        if !template_json.is_empty() {
+                                            let variant_desc = format!("[Variant] {} (diverged from failures)", desc);
+                                            match registry_worker.memory_os.store_workflow_template(
+                                                variant_desc.clone(), template_json, Vec::new()
+                                            ).await {
+                                                Ok(()) => {
+                                                    info!("[Daemon] 🧬 Species divergence complete — new variant stored: {}", 
+                                                        &variant_desc[..variant_desc.len().min(80)]);
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Daemon] ⚠️ Failed to store diverged variant: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[Daemon] ⚠️ Species divergence LLM call failed: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                warn!("[Daemon] ⚠️ Workflow reuse FAILED for task {} ({} template(s)). Templates NOT upgraded.", trace_id, trace.reused_workflow_ids.len());
+                warn!("[Daemon] ⚠️ Workflow reuse FAILED for task {} ({} template(s)). Failure notes attached, strength penalized.", trace_id, trace.reused_workflow_ids.len());
             }
 
             if let Some(skill) = evaluator_worker.distill_experience(&trace).await {

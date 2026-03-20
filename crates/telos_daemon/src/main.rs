@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.global_concurrency_permits,
     ));
 
-    let tool_registry = crate::core::setup::build_tool_registry(&config).await;
+    let tool_registry = crate::core::setup::build_tool_registry(&config, gateway.clone()).await;
 
     // Initialize MemoryOS - we no longer use PID-suffix fallbacks to avoid file sprawl.
     let memory_os_instance = match RedbGraphStore::new(&config.db_path) {

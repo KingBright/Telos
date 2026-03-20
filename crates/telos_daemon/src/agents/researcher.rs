@@ -30,17 +30,32 @@ impl ExpertAgent for DeepResearchAgent {
 
         // 1. Discover available tools
         let tools = {
-            let guard = self.tool_registry.read().await;
-            guard.discover_tools(&input.task, 5)
+            let mut extracted_tools = None;
+            if let Some(ref payload) = input.schema_payload {
+                if let Ok(schemas) = serde_json::from_str::<Vec<telos_tooling::ToolSchema>>(payload) {
+                    extracted_tools = Some(schemas);
+                }
+            }
+            if let Some(t) = extracted_tools {
+                t
+            } else {
+                let guard = self.tool_registry.read().await;
+                guard.discover_tools(&input.task, 5)
+            }
         };
         info!("[DeepResearchAgent] Discovered {} tools: {:?}", tools.len(), tools.iter().map(|t| &t.name).collect::<Vec<_>>());
+
+        let all_tools = {
+            let guard = self.tool_registry.read().await;
+            guard.list_all_tools()
+        };
 
         // 2. Build system prompt using PromptBuilder (lazy tool loading)
         let system_prompt = PromptBuilder::new()
             .with_identity()
             .with_environment(_registry)
             .with_memory(&input.memory_context)
-            .with_tools_lazy(&tools)
+            .with_default_core_tools(&all_tools, &tools)
             .with_role_instructions(r#"You are the DeepResearchAgent expert for the Telos system. Your job is to gather deep information for the user by planning search and retrieval tasks.
 
 SPECIAL AGENT TYPES:

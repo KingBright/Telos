@@ -11,7 +11,7 @@ import requests, json, time, os, uuid, sys, re
 
 API = "http://127.0.0.1:8321/api/v1/run_sync"
 BASE_URL = "http://127.0.0.1:8321"
-ITER = 27
+ITER = 29
 TRACES_DIR = "test_traces"
 os.makedirs(TRACES_DIR, exist_ok=True)
 
@@ -191,6 +191,27 @@ test_cases = [
         "category": "ProceduralApply",
         "query": "又发现一段危险代码：`subprocess.call(f'convert {filename} output.pdf', shell=True)`，其中filename来自用户上传。请严格按照前一步总结的 'Command_Injection_Audit' 流程来审查并修复它。",
         "description": "流程经验重用 — 测试从 Procedural Memory 检索并实例化模版",
+    },
+    # Case 26: Relevance Filtering Check (Gate 1 & 2)
+    {
+        "id": 26,
+        "category": "RelevanceFilter",
+        "query": "帮我审查这段前端React组件代码的UI响应式设计是否合理：`<div className='flex md:block'>...</div>`",
+        "description": "相关性过滤 — 确保不会错误匹配、强制应用后端的 Command_Injection_Audit 模板",
+    },
+    # Case 27: Progressive Discovery
+    {
+        "id": 27,
+        "category": "ProgressiveDiscovery",
+        "query": "请帮我查一下杭州现在的天气怎么样？",
+        "description": "渐进式暴露 — agent初始没有天气工具，需要先discover再调用",
+    },
+    # Case 28: Tool Mutation
+    {
+        "id": 28,
+        "category": "ToolMutation",
+        "query": "帮我写一个工具 `get_crypto_price_v2` 来获取加密货币价格，但故意在代码里写错一个拼写（比如 fetch 拼成 fethc）。执行失败后，请利用 mutate_tool 修复它并重新告诉我比特币的价格。",
+        "description": "工具基因突变 — 测试执行失败触发突变机制闭环",
     }
 ]
 

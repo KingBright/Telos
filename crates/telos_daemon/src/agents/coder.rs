@@ -144,7 +144,15 @@ If you cannot complete the task with the available tools, explain what's blockin
         let available_tools = {
             let guard = self.tool_registry.read().await;
             // Get coding-relevant tools
-            let mut tools = guard.discover_tools(&input.task, 10);
+            let mut tools = {
+                let mut extracted = None;
+                if let Some(ref payload) = input.schema_payload {
+                    if let Ok(schemas) = serde_json::from_str::<Vec<telos_tooling::ToolSchema>>(payload) {
+                        extracted = Some(schemas);
+                    }
+                }
+                if let Some(t) = extracted { t } else { guard.discover_tools(&input.task, 10) }
+            };
             // Also explicitly include core coding tools if not already discovered
             let core_names = ["file_edit", "fs_read", "fs_write", "shell_exec", "lsp_tool", "glob", "create_rhai_tool", "list_rhai_tools"];
             for name in &core_names {

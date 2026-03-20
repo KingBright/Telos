@@ -191,6 +191,7 @@ mod tests {
             embedding: Some(vec![1.0, 0.0, 0.0]),
             access_count: 0,
             confidence: 1.0,
+            similarity_score: None,
         };
 
         let existing = vec![
@@ -205,6 +206,7 @@ mod tests {
                 embedding: Some(vec![0.95, 0.05, 0.0]), // very similar vector
                 access_count: 0,
                 confidence: 1.0,
+                similarity_score: None,
             },
             MemoryEntry {
                 id: "old_2".to_string(),
@@ -217,6 +219,7 @@ mod tests {
                 embedding: Some(vec![0.0, 1.0, 0.0]), // different vector
                 access_count: 0,
                 confidence: 1.0,
+                similarity_score: None,
             },
         ];
 

@@ -37,6 +37,9 @@ pub struct MemoryEntry {
     /// Confidence score: 1.0 = fully trusted, lower = contested by conflicting facts
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    /// Cosine similarity score from the most recent vector search (transient, not persisted meaningfully)
+    #[serde(default)]
+    pub similarity_score: Option<f32>,
 }
 
 impl MemoryEntry {
@@ -52,6 +55,7 @@ impl MemoryEntry {
             embedding,
             access_count: 0,
             confidence: 1.0,
+            similarity_score: None,
         }
     }
 

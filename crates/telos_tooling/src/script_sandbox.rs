@@ -45,7 +45,13 @@ impl ScriptSandbox {
                     })?;
                     let status = resp.status();
                     if !status.is_success() {
-                        return Err(format!("HTTP {} error from {}", status.as_u16(), url_str));
+                        let error_body = resp.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
+                        let error_body = if error_body.len() > 1000 {
+                            format!("{}... (truncated)", &error_body[..1000])
+                        } else {
+                            error_body
+                        };
+                        return Err(format!("HTTP {} error from {}: {}", status.as_u16(), url_str, error_body));
                     }
                     resp.text().await.map_err(|e| format!("Failed to read response body: {}", e))
                 })
@@ -91,7 +97,14 @@ impl ScriptSandbox {
                                         }
                                     }
                                 } else {
-                                    last_err = format!("URL[{}] {}: HTTP {}", i, url, resp.status().as_u16());
+                                    let status = resp.status();
+                                    let error_body = resp.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
+                                    let error_body = if error_body.len() > 500 {
+                                        format!("{}... (truncated)", &error_body[..500])
+                                    } else {
+                                        error_body
+                                    };
+                                    last_err = format!("URL[{}] {}: HTTP {} - {}", i, url, status.as_u16(), error_body);
                                 }
                             }
                             Err(e) => {
@@ -203,5 +216,29 @@ impl crate::ToolExecutor for ScriptExecutor {
 
     fn source_code(&self) -> Option<String> {
         Some(self.script.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_http_get_error_propagation() {
+        let sandbox = ScriptSandbox::new();
+        // Since httpbin.org returns an HTML/text error body for 404, we expect it to be in the error string
+        let script = r#"
+            let res = http_get("https://httpbin.org/status/404");
+            res
+        "#;
+        let result = sandbox.execute(script, serde_json::json!({}));
+        assert!(result.is_err(), "Expected an error from 404 response");
+        if let Err(e) = result {
+            let err_str = e.to_string();
+            assert!(err_str.contains("HTTP 404"), "Error string should contain HTTP 404");
+            // While httpbin returns nothing specific in body for 404 compared to other endpoints,
+            // we at least ensure the execution fails gracefully with the body attached (even if empty/HTML).
+            println!("Propagated error: {}", err_str);
+        }
     }
 }

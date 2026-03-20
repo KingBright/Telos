@@ -5,6 +5,9 @@ use tracing::info;
 /// CLI/TUI 端遇到此 token 应忽略，不向用户显示
 pub const SILENT_REPLY_TOKEN: &str = "<<SILENT>>";
 
+/// Core tools that should always be injected by default
+pub const CORE_TOOLS: &[&str] = &["web_search", "fs_read", "fs_write", "shell_exec", "file_edit", "discover_tools", "create_rhai_tool", "list_rhai_tools", "mutate_tool"];
+
 /// 全局缓存的 SOUL 内容（daemon 启动时加载一次）
 static SOUL_CONTENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -92,7 +95,13 @@ impl PromptBuilder {
                 "Available Tools:\nNo specialized tools found. Use general reasoning.\n".into()));
         } else {
             let tools_str = tools.iter()
-                .map(|t| format!("- {}: {} (Params: {})", t.name, t.description, t.parameters_schema.raw_schema))
+                .map(|t| {
+                    let mut s = format!("- {}: {} (Params: {})", t.name, t.description, t.parameters_schema.raw_schema);
+                    if !t.experience_notes.is_empty() {
+                        s.push_str(&format!("\n  ⚠️ Experience Notes: {}", t.experience_notes.join(" | ")));
+                    }
+                    s
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             self.sections.push(("TOOLS".into(), format!("Available Tools:\n{}\n", tools_str)));
@@ -108,12 +117,34 @@ impl PromptBuilder {
                 "Available Tools:\nNo specialized tools found.\n".into()));
         } else {
             let tools_str = tools.iter()
-                .map(|t| format!("- {}: {}", t.name, t.description))
+                .map(|t| {
+                    let mut s = format!("- {}: {}", t.name, t.description);
+                    if !t.experience_notes.is_empty() {
+                        s.push_str(&format!("\n  ⚠️ Experience Notes: {}", t.experience_notes.join(" | ")));
+                    }
+                    s
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             self.sections.push(("TOOLS".into(), format!("Available Tools (summary — full schema provided at execution):\n{}\n", tools_str)));
         }
         self
+    }
+
+    /// 注入工具列表 — 默认仅暴露核心工具 + 额外指定的工具
+    pub fn with_default_core_tools(mut self, all_tools: &[telos_tooling::ToolSchema], additional_tools: &[telos_tooling::ToolSchema]) -> Self {
+        let mut active_tools = Vec::new();
+        for t in all_tools {
+            if CORE_TOOLS.contains(&t.name.as_str()) {
+                active_tools.push(t.clone());
+            }
+        }
+        for t in additional_tools {
+            if !active_tools.iter().any(|existing| existing.name == t.name) {
+                active_tools.push(t.clone());
+            }
+        }
+        self.with_tools_lazy(&active_tools)
     }
 
     /// 注入角色指令（自定义 raw string）

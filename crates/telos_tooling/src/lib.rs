@@ -115,6 +115,9 @@ pub struct ToolSchema {
     /// Creation/update reason
     #[serde(default)]
     pub change_reason: Option<String>,
+    /// Experience notes accumulated from past usage failures or QA feedback
+    #[serde(default)]
+    pub experience_notes: Vec<String>,
 }
 
 fn default_version() -> String {
@@ -133,6 +136,7 @@ impl ToolSchema {
             iteration: 0,
             parent_tool: None,
             change_reason: None,
+            experience_notes: Vec::new(),
         }
     }
 
@@ -147,6 +151,7 @@ impl ToolSchema {
             iteration: self.iteration + 1,
             parent_tool: Some(self.name.clone()),
             change_reason: Some(reason.into()),
+            experience_notes: self.experience_notes.clone(), // Preserve experience notes across iterations or clear them? Usually preserve is safer unless specified otherwise.
         }
     }
 
@@ -161,6 +166,16 @@ pub enum ToolError {
     ExecutionFailed(String),
     SandboxViolation(String),
     Timeout,
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolError::ExecutionFailed(msg) => write!(f, "{}", msg),
+            ToolError::SandboxViolation(msg) => write!(f, "SandboxViolation: {}", msg),
+            ToolError::Timeout => write!(f, "Timeout"),
+        }
+    }
 }
 
 #[async_trait]
@@ -180,6 +195,7 @@ pub trait ToolRegistry: Send + Sync {
     fn get_schema(&self, tool_name: &str) -> Option<ToolSchema>;
     fn list_all_tools(&self) -> Vec<ToolSchema>;
     fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String>;
+    fn attach_tool_note(&self, tool_name: &str, note: String) -> Result<(), String>;
 }
 
 /// A wrapper that allows an Arc<tokio::sync::RwLock<dyn ToolRegistry>> to be used where Arc<dyn ToolRegistry> is expected.
@@ -236,6 +252,14 @@ impl<T: ToolRegistry + ?Sized> ToolRegistry for SharedToolRegistry<T> {
     fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String> {
         if let Ok(guard) = self.inner.try_read() {
             guard.register_dynamic_tool(schema, executor)
+        } else {
+            Err("Registry is locked".into())
+        }
+    }
+
+    fn attach_tool_note(&self, tool_name: &str, note: String) -> Result<(), String> {
+        if let Ok(guard) = self.inner.try_read() {
+            guard.attach_tool_note(tool_name, note)
         } else {
             Err("Registry is locked".into())
         }

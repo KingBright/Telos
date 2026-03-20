@@ -88,3 +88,13 @@ This file tracks the integration points between different modules to ensure the 
   - Decompose the single `main.rs` binary entry point into modular `api/`, `graph/`, `core/`, and `workers/` directories to prevent namespace collisions and routing confusion.
 - [ ] **Tooling Core (Module 5)**:
   - Decompose `native.rs` into `fs_tools.rs`, `web_tools.rs`, `os_tools.rs`, `memory_tools.rs`, and `dev_tools.rs` mapping to standard cohesion principles.
+
+## 18 Workflow Template Evolution (telos_memory / telos_daemon / telos_evolution)
+
+- [ ] **Memory OS (Module 4) → Architect (Module 11)**:
+  - Vector search must expose cosine similarity scores to callers via `MemoryEntry.similarity_score`. Architect uses this to gate template injection (threshold ≥ 0.65).
+- [ ] **Architect (Module 11) → Evolution (Module 6)**:
+  - Architect explicitly declares which templates it adopted via `adopted_templates` output field. Event loop reads this instead of `reused_workflow_count` to produce accurate `ExecutionTrace.reused_workflow_ids`.
+- [ ] **Evolution Worker (Module 6) → Memory OS (Module 4)**:
+  - On reuse failure: attaches failure note + mild strength penalty (-0.2). On cumulative failures (≥2): triggers LLM-driven variant generation (species divergence), storing a new independent template.
+

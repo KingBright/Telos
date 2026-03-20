@@ -3,17 +3,20 @@ use crate::agents::{
 };
 use telos_model_gateway::{Capability, LlmRequest, Message, ModelGateway};
 use telos_memory::MemoryOS;
+use telos_tooling::ToolRegistry;
+use tracing::info;
 
 
 pub struct RouterAgent {
     pub gateway: Arc<GatewayManager>,
     pub persona_name: String,
     pub persona_trait: String,
+    pub tool_registry: Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
 }
 
 impl RouterAgent {
-    pub fn new(gateway: Arc<GatewayManager>, persona_name: String, persona_trait: String) -> Self {
-        Self { gateway, persona_name, persona_trait }
+    pub fn new(gateway: Arc<GatewayManager>, persona_name: String, persona_trait: String, tool_registry: Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>) -> Self {
+        Self { gateway, persona_name, persona_trait, tool_registry }
     }
 
     pub async fn evaluate(&self, original_task: &str, expert_output: &str, _registry: &dyn SystemRegistry) -> AgentOutput {
@@ -250,6 +253,27 @@ impl ExecutableNode for RouterAgent {
         if !mem_context.is_empty() {
             mem_context = format!("[RETRIEVED MEMORY CONTEXT]\n{}\n\n", mem_context);
         }
+
+        // ==========================================
+        // Progressive Exposure: Router Auto-Discovery
+        // ==========================================
+        // Before routing the task, the Router natively discovers which custom tools 
+        // match the user's intent. This saves the Expert Agent from having to blind-search.
+        let registry_guard = self.tool_registry.read().await;
+        let mut discovered_tools = registry_guard.discover_tools(&input.task, 5); // top_k=5 for router hint
+        let all_tools_schema = registry_guard.list_all_tools();
+        drop(registry_guard);
+        
+        let mut custom_tools_context = String::new();
+        if !discovered_tools.is_empty() {
+            let tools_str = discovered_tools.iter()
+                .map(|t| format!("- `{}`: {}", t.name, t.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            
+            custom_tools_context = format!("[AVAILABLE CUSTOM TOOLS]\nThe following custom tools were auto-discovered based on the user's request. If any of these can fulfill the request, YOU MUST ROUTE TO `general_expert` because ONLY `general_expert` can call these custom tools.\n{}\n\n", tools_str);
+            info!("[Router Auto-Discovery] Found {} potential tools for intent", discovered_tools.len());
+        }
         // Build conversation history as a reference block for the system prompt
         // CRITICAL: History goes into the system prompt as context, NOT as actual
         // user/assistant multi-turn messages. This prevents the LLM from treating
@@ -280,6 +304,23 @@ impl ExecutableNode for RouterAgent {
                 if let Ok(strategies) = mem_os.retrieve_procedural_memories(input.task.clone()).await {
                     if !strategies.is_empty() {
                         learned_strategies_context.push_str(&format!("[LEARNED STRATEGIES & WORKFLOW TEMPLATES]\nConsult these past successful strategies to guide your routing and direct reply decisions.\n{}\n\n", strategies.join("\n- ")));
+                        // Auto-expose required tools from templates
+                        for strategy in &strategies {
+                            for line in strategy.lines() {
+                                if let Some(tools_str) = line.strip_prefix("[RequiredTools] ") {
+                                    for t in tools_str.split(',') {
+                                        let t = t.trim();
+                                        if !t.is_empty() {
+                                            if !discovered_tools.iter().any(|existing| existing.name == t) {
+                                                if let Some(schema) = all_tools_schema.iter().find(|s| s.name == t) {
+                                                    discovered_tools.push(schema.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -288,7 +329,7 @@ impl ExecutableNode for RouterAgent {
         // Build persona from SOUL.md (loaded at daemon startup)
         let soul_content = crate::agents::prompt_builder::get_soul();
         let persona_intro = format!("Your name is {}. Your personality traits: {}.\n\n[IDENTITY & VALUES]\n{}\n\nYou are the user's private AI assistant. Behind the scenes, you may delegate tasks to specialized internal modules, but the user should feel they are talking to ONE unified assistant.\n\n", self.persona_name, self.persona_trait, soul_content);
-        let system_prompt = format!("{}{}{}{}{}{}{}", env_context, user_profile_context, mem_context, learned_strategies_context, conversation_history_block, persona_intro, r#"Available Experts:
+        let system_prompt = format!("{}{}{}{}{}{}{}{}", env_context, user_profile_context, mem_context, learned_strategies_context, custom_tools_context, conversation_history_block, persona_intro, r#"Available Experts:
 - "software_expert": For tasks requiring writing, modifying, or executing programming code, or software architecture.
 - "research_expert": For tasks requiring deep, iterative information gathering via search engines (e.g., current events, fact-checking, real-time data).
 - "qa_expert": For tasks heavily focused on writing tests, finding edge cases, or breaking code.
@@ -473,8 +514,13 @@ User: "什么是快速排序算法？"
                     .trim_end_matches("```")
                     .trim();
 
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(clean_reply) {
+                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(clean_reply) {
                     if json.get("route").is_some() || json.get("direct_reply").is_some() || json.get("tool").is_some() {
+                        // Pass along the auto-discovered tools to the returned JSON
+                        // so the execution engine or downstream worker receives them explicitly!
+                        if !discovered_tools.is_empty() {
+                            json["auto_discovered_tools"] = serde_json::to_value(&discovered_tools).unwrap_or(serde_json::json!([]));
+                        }
                         return AgentOutput::success(json).with_trace(trace);
                     }
                 }

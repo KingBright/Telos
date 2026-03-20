@@ -574,6 +574,9 @@ pub async fn workflows_summary(
                 "reuse_success": w.reuse_success,
                 "reuse_failure": w.reuse_failure,
                 "success_rate": if w.reuse_count > 0 { format!("{}%", (w.reuse_success * 100) / w.reuse_count) } else { "—".to_string() },
+                "version": w.version,
+                "type": if w.is_variant { "variant" } else { "original" },
+                "failure_count": w.reuse_failure,
             })
         }).collect();
         

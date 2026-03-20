@@ -253,7 +253,7 @@ async function refreshToolsTab() {
         const tbody = document.getElementById('tl_tool_table');
         if (!tbody) return;
         if (!tools.length) {
-            tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-slate-600">No tool data yet</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="10" class="text-center py-4 text-slate-600">No tool data yet</td></tr>';
             return;
         }
         let html = '';
@@ -264,16 +264,26 @@ async function refreshToolsTab() {
             const version = t.version || '—';
             const iteration = t.iteration || '—';
             const lastUpdated = t.last_updated_ms ? new Date(t.last_updated_ms).toLocaleString() : '—';
+            
+            let notesLabel = '—';
+            let notesTooltip = '';
+            if (t.experience_notes && t.experience_notes.length > 0) {
+                const count = t.experience_notes.length;
+                notesLabel = `<span class="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-500/30">${count} Note${count > 1 ? 's' : ''}</span>`;
+                notesTooltip = escapeHtml(t.experience_notes.join('\\n\\n'));
+            }
+
             html += `<tr class="border-b border-glass-border/30 hover:bg-glass-border/10 transition-colors">
                 <td class="text-left py-2 px-3 text-slate-200">${escapeHtml(t.tool_name)}</td>
                 <td class="text-center py-2 px-3"><span class="text-[9px] font-mono px-2 py-0.5 rounded-full border ${typeColor}">${typeLabel}</span></td>
-                <td class="text-right py-2 px-3 text-slate-400">${version}</td>
+                <td class="text-right py-2 px-3 text-slate-400 font-bold">${version}</td>
                 <td class="text-right py-2 px-3 text-slate-400">${iteration}</td>
                 <td class="text-right py-2 px-3 text-slate-300">${t.total_calls}</td>
                 <td class="text-right py-2 px-3 text-primary">${t.success_count}</td>
                 <td class="text-right py-2 px-3 text-red-400">${t.failure_count}</td>
                 <td class="text-right py-2 px-3 ${rateClass} font-bold">${t.success_rate}</td>
                 <td class="text-right py-2 px-3 text-slate-500 text-[10px]">${lastUpdated}</td>
+                <td class="text-left py-2 px-3 text-[10px]" title="${notesTooltip}">${notesLabel}</td>
             </tr>`;
         });
         tbody.innerHTML = html;
@@ -303,7 +313,7 @@ async function refreshWorkflowsTab() {
         const tbody = document.getElementById('wf_table');
         if (!tbody) return;
         if (!workflows.length) {
-            tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-slate-600">No workflow data yet</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-slate-600">No workflow data yet</td></tr>';
             return;
         }
         let html = '';
@@ -312,14 +322,21 @@ async function refreshWorkflowsTab() {
             const desc = w.description || '';
             const shortDesc = desc.length > 60 ? desc.substring(0, 60) + '...' : desc;
             const rateClass = w.reuse_failure > 0 ? 'text-amber-400' : 'text-primary';
+            const isVariant = w.type === 'variant';
+            const typeColor = isVariant ? 'text-amber-400 bg-amber-400/10 border-amber-400/30' : 'text-blue-400 bg-blue-400/10 border-blue-400/30';
+            const typeLabel = isVariant ? 'VARIANT' : 'ORIGINAL';
+            const version = w.version || 1;
+            const failureColor = w.reuse_failure >= 3 ? 'text-red-500 font-bold' : w.reuse_failure > 0 ? 'text-red-400' : 'text-slate-500';
             html += `<tr class="border-b border-glass-border/30 hover:bg-glass-border/10 transition-colors">
                 <td class="text-left py-2 px-3 text-slate-200" title="${escapeHtml(w.workflow_id)}">${escapeHtml(w.workflow_id.substring(0, 12))}...</td>
                 <td class="text-left py-2 px-3 text-slate-400" title="${escapeHtml(desc)}">${escapeHtml(shortDesc)}</td>
-                <td class="text-right py-2 px-3 text-slate-500 text-[10px]">${storedAt}</td>
+                <td class="text-center py-2 px-3"><span class="text-[9px] font-mono px-2 py-0.5 rounded-full border ${typeColor}">${typeLabel}</span></td>
+                <td class="text-right py-2 px-3 text-slate-300">v${version}</td>
                 <td class="text-right py-2 px-3 text-blue-400">${w.reuse_count}</td>
                 <td class="text-right py-2 px-3 text-primary">${w.reuse_success}</td>
-                <td class="text-right py-2 px-3 text-red-400">${w.reuse_failure}</td>
+                <td class="text-right py-2 px-3 ${failureColor}">${w.reuse_failure}</td>
                 <td class="text-right py-2 px-3 ${rateClass} font-bold">${w.success_rate}</td>
+                <td class="text-right py-2 px-3 text-slate-500 text-[10px]">${storedAt}</td>
             </tr>`;
         });
         tbody.innerHTML = html;

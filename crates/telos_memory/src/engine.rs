@@ -240,7 +240,7 @@ impl MemoryOS for RedbGraphStore {
         let iter = table.iter().map_err(|e| e.to_string())?;
         for result in iter {
             let (_key, value) = result.map_err(|e| e.to_string())?;
-            let entry: MemoryEntry = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+            let mut entry: MemoryEntry = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
 
             let matches = match &effective_query {
                 MemoryQuery::EntityLookup { entity } => {
@@ -253,7 +253,12 @@ impl MemoryOS for RedbGraphStore {
                 MemoryQuery::VectorSearch { query: search_vec, top_k: _ } => {
                     if let Some(ref doc_vec) = entry.embedding {
                          let sim = Self::cosine_similarity(doc_vec, search_vec);
-                         sim > 0.5 // Arbitrary threshold
+                         if sim > 0.5 {
+                             entry.similarity_score = Some(sim);
+                             true
+                         } else {
+                             false
+                         }
                     } else {
                         false
                     }
@@ -269,10 +274,10 @@ impl MemoryOS for RedbGraphStore {
             }
         }
 
-        if let MemoryQuery::VectorSearch { top_k, query: ref search_vec } = effective_query {
+        if let MemoryQuery::VectorSearch { top_k, .. } = effective_query {
              results.sort_by(|a, b| {
-                let sim_a = a.embedding.as_ref().map(|v| Self::cosine_similarity(v, search_vec)).unwrap_or(0.0);
-                let sim_b = b.embedding.as_ref().map(|v| Self::cosine_similarity(v, search_vec)).unwrap_or(0.0);
+                let sim_a = a.similarity_score.unwrap_or(0.0);
+                let sim_b = b.similarity_score.unwrap_or(0.0);
                 sim_b.partial_cmp(&sim_a).unwrap_or(std::cmp::Ordering::Equal)
              });
              results.truncate(top_k);

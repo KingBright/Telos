@@ -455,9 +455,9 @@ impl TelegramBotProvider {
 
                             let sent_msg = bot.send_message(
                                 msg.chat.id,
-                                format!("🚀 Task Dispatched: `{}`", trace_id),
+                                format!("🚀 Task Dispatched: <code>{}</code> (Tap to copy)", trace_id),
                             )
-                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                            .parse_mode(teloxide::types::ParseMode::Html)
                             .reply_markup(keyboard)
                             .await?;
 
@@ -647,9 +647,9 @@ impl TelegramBotProvider {
                                                     let (html_content, images) = crate::markdown_renderer::render_markdown_to_telegram(content);
                                                     let prefix = if *is_final { "✓" } else { "→" };
                                                     
-                                                    // Append Task ID with native copy block for final outputs
+                                                    // Append Task ID with inline copy block for final outputs
                                                     let body = if *is_final {
-                                                        format!("{} {}\n\n📝 Task ID:\n<pre><code>{}</code></pre>", prefix, html_content, task_id)
+                                                        format!("{} {}\n\n📝 Task ID (Tap to copy):\n<code>{}</code>", prefix, html_content, task_id)
                                                     } else {
                                                         format!("{} {}", prefix, html_content)
                                                     };

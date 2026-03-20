@@ -298,6 +298,39 @@ impl ToolRegistry for VectorToolRegistry {
         self.register_tool(schema, Some(executor));
         Ok(())
     }
+
+    fn attach_tool_note(&self, tool_name: &str, note: String) -> Result<(), String> {
+        let mut schema = {
+            let guard = self.tools.read().map_err(|_| "Failed to acquire tools read lock")?;
+            guard.get(tool_name).cloned().ok_or_else(|| format!("Tool not found: {}", tool_name))?
+        };
+
+        schema.experience_notes.push(note);
+
+        if let Ok(mut tools) = self.tools.write() {
+            tools.insert(schema.name.clone(), schema.clone());
+        }
+
+        // Only persist "real" tools to disk
+        let is_ephemeral = schema.name.starts_with("debug_") 
+            || schema.name.starts_with("test_") 
+            || schema.name.starts_with("diag_");
+
+        if !is_ephemeral {
+            let meta_path = self.plugins_dir.join(format!("{}.json", schema.name));
+            if meta_path.exists() {
+                if let Ok(meta_json) = serde_json::to_string_pretty(&schema) {
+                    if let Err(e) = std::fs::write(&meta_path, meta_json) {
+                        tracing::error!("Failed to update tool schema JSON on disk for note attachment: {}", e);
+                        return Err(format!("Failed to save updated schema: {}", e));
+                    }
+                }
+            }
+        }
+        
+        info!("[ToolRegistry] 📝 Attached note to tool '{}'", schema.name);
+        Ok(())
+    }
 }
 
 impl Default for VectorToolRegistry {

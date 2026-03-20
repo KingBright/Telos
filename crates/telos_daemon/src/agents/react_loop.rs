@@ -377,7 +377,7 @@ impl ReactLoop {
                     .map_err(|_| "Tool returned non-UTF8 output".to_string())
             }
             Ok(Err(tool_err)) => {
-                Err(format!("Tool error: {:?}", tool_err))
+                Err(format!("Tool error: {}", tool_err))
             }
             Err(_) => {
                 Err(format!("Tool '{}' timed out after {}s", tool_name, timeout_secs))

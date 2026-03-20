@@ -617,6 +617,7 @@ impl ToolExecutor for CreateRhaiTool {
                     iteration,
                     parent_tool: existing.as_ref().map(|_| name.clone()),
                     change_reason: Some(change_reason.clone()),
+                    experience_notes: existing.as_ref().map(|e| e.experience_notes.clone()).unwrap_or_default(),
                 };
                 
                 let rhai_code_for_response = rhai_code.clone();
@@ -733,4 +734,118 @@ fn validate_tool_name(name: &str) -> Result<(), String> {
     }
     
     Ok(())
+}
+
+// 19. Discover Tools (Progressive Exposure)
+#[derive(Clone)]
+#[cfg(feature = "full")]
+pub struct DiscoverTools {
+    registry: std::sync::Arc<dyn ToolRegistry>,
+}
+
+#[cfg(feature = "full")]
+impl DiscoverTools {
+    pub fn new(registry: std::sync::Arc<dyn ToolRegistry>) -> Self {
+        Self { registry }
+    }
+
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "discover_tools".into(),
+            description: "Discovers available tools in the system based on semantic search of your query. \
+            Use this when you need a capability but don't have the right tool in your context. \
+            It returns the ToolSchema including parameters and any experience_notes on how to use them.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "What you want to achieve, e.g. 'check weather in Hangzhou' or 'search files'" },
+                        "top_k": { "type": "integer", "description": "Number of tools to return. Default is 5. Max is 10." }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(feature = "full")]
+#[async_trait]
+impl ToolExecutor for DiscoverTools {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let query = params.get("query").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'query'".into()))?;
+        
+        let top_k = params.get("top_k").and_then(|v| v.as_u64()).unwrap_or(8).min(20) as usize; // Increased default to 8 as per user request
+        
+        let tools = self.registry.discover_tools(query, top_k);
+        
+        let out = serde_json::json!({
+            "discovered_tools_count": tools.len(),
+            "tools": tools,
+        });
+        
+        Ok(serde_json::to_vec_pretty(&out).unwrap())
+    }
+}
+
+// 20. Attach Tool Note
+#[derive(Clone)]
+#[cfg(feature = "full")]
+pub struct AttachToolNote {
+    registry: std::sync::Arc<dyn ToolRegistry>,
+}
+
+#[cfg(feature = "full")]
+impl AttachToolNote {
+    pub fn new(registry: std::sync::Arc<dyn ToolRegistry>) -> Self {
+        Self { registry }
+    }
+
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "attach_tool_note".into(),
+            description: "Appends a lesson learned or usage warning to a tool's experience notes. \
+            These notes will be read by future agents discovering the tool to avoid repeating mistakes or to use it more effectively.".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tool_name": { "type": "string", "description": "The exact name of the tool to attach the note to" },
+                        "note": { "type": "string", "description": "The experience note, clearly describing a caveat, a constraint, or a proven best practice" }
+                    },
+                    "required": ["tool_name", "note"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(feature = "full")]
+#[async_trait]
+impl ToolExecutor for AttachToolNote {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let tool_name = params.get("tool_name").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'tool_name'".into()))?;
+        
+        let note = params.get("note").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'note'".into()))?;
+        
+        match self.registry.attach_tool_note(tool_name, note.to_string()) {
+            Ok(_) => {
+                let out = serde_json::json!({
+                    "status": "success",
+                    "message": format!("Successfully attached note to '{}'", tool_name)
+                });
+                Ok(serde_json::to_vec_pretty(&out).unwrap())
+            }
+            Err(e) => {
+                Err(ToolError::ExecutionFailed(format!("Failed to attach note to tool: {}", e)))
+            }
+        }
+    }
 }

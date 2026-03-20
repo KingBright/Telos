@@ -98,6 +98,7 @@
                 embedding: None,
                 access_count: 0,
                 confidence: 1.0,
+                similarity_score: None,
             },
             MemoryEntry {
                 id: "recon_2".to_string(),
@@ -110,6 +111,7 @@
                 embedding: None,
                 access_count: 0,
                 confidence: 1.0,
+                similarity_score: None,
             }
         ];
 

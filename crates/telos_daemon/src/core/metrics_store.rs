@@ -158,6 +158,9 @@ pub struct WorkflowMetrics {
     pub reuse_count: usize,
     pub reuse_success: usize,
     pub reuse_failure: usize,
+    pub version: usize,
+    pub is_variant: bool,
+    pub last_failure_note: Option<String>,
 }
 
 /// Per-task metrics aggregation
@@ -435,9 +438,15 @@ impl MetricsStore {
                         stored_at_ms: *timestamp_ms,
                         ..Default::default()
                     });
+                    // Each WorkflowStore event bumps the version
+                    entry.version += 1;
                     if *timestamp_ms > entry.stored_at_ms {
                         entry.description = description.clone();
                         entry.stored_at_ms = *timestamp_ms;
+                    }
+                    // Detect variant templates from description prefix
+                    if description.starts_with("[Variant]") {
+                        entry.is_variant = true;
                     }
                 }
                 MetricEvent::WorkflowReuse { workflow_id, success, .. } => {
