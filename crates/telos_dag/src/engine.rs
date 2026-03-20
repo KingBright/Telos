@@ -177,34 +177,18 @@ impl TokioExecutionEngine {
     /// Serialize and persist real graph state to redb
     fn checkpoint_graph(&self, graph: &TaskGraph) {
         if let Some(ref mgr) = self.checkpoint_manager {
-            let statuses: HashMap<String, String> = graph.node_statuses.iter()
-                .map(|(k, v)| (k.clone(), format!("{:?}", v)))
-                .collect();
-            let results_summary: HashMap<String, serde_json::Value> = graph.node_results.iter()
-                .map(|(k, v)| {
-                    let output_preview = v.output.as_ref()
-                        .map(|o| o.to_string().chars().take(500).collect::<String>())
-                        .unwrap_or_default();
-                    (k.clone(), serde_json::json!({
-                        "success": v.success,
-                        "output_preview": output_preview,
-                        "has_error": v.error.is_some(),
-                    }))
-                })
-                .collect();
-            let snapshot = serde_json::json!({
-                "graph_id": graph.graph_id,
-                "timestamp": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_secs(),
-                "statuses": statuses,
-                "results": results_summary,
-                "is_running": graph.current_state.is_running,
-                "completed": graph.current_state.completed,
-            });
-            if let Ok(json) = serde_json::to_string(&snapshot) {
-                if let Err(e) = mgr.save_checkpoint(&graph.graph_id, &json) {
-                    warn!("[DAG Engine] Checkpoint save failed: {:?}", e);
+            if graph.current_state.completed {
+                // Task is completed, we don't need to resume it anymore. Delete from DB to prevent bloat.
+                if let Err(e) = mgr.delete_checkpoint(&graph.graph_id) {
+                    warn!("[DAG Engine] Failed to delete completed checkpoint: {:?}", e);
+                }
+            } else {
+                if let Ok(json) = serde_json::to_string(graph) {
+                    if let Err(e) = mgr.save_checkpoint(&graph.graph_id, &json) {
+                        warn!("[DAG Engine] Checkpoint save failed: {:?}", e);
+                    }
+                } else {
+                    warn!("[DAG Engine] Failed to serialize TaskGraph for checkpointing");
                 }
             }
         }
@@ -459,6 +443,19 @@ impl ExecutionEngine for TokioExecutionEngine {
             let mut loop_states: HashMap<String, LoopState> = HashMap::new();
 
             while completed_nodes < total_nodes {
+                // 0. Cancellation check
+                {
+                    let still_active = {
+                        let w = active_tasks_ref.read().await;
+                        w.contains_key(&graph_id)
+                    };
+                    if !still_active {
+                        warn!("[DAG Engine] 🛑 Task {} was removed from active tasks! Aborting.", graph_id);
+                        final_state = TaskFinalState::Cancelled;
+                        break;
+                    }
+                }
+
                 // 1. 熔断检查：失败率 > 阈值时停止
                 if Self::should_circuit_break(completed_nodes, failed_nodes, &circuit_config) {
                     error!(
@@ -750,6 +747,7 @@ impl ExecutionEngine for TokioExecutionEngine {
                                                 errors_encountered: vec![],
                                                 success: true,
                                                 sub_graph: None,
+                                                reused_workflow_ids: vec![],
                                             };
                                             match evaluator.detect_drift(&trace).await {
                                                 Err(telos_evolution::DriftWarning::SemanticLoop) => {
@@ -977,6 +975,11 @@ impl ExecutionEngine for TokioExecutionEngine {
 
             graph.current_state.is_running = false;
             graph.current_state.completed = final_state.is_success();
+
+            // Clear checkpoint since execution reached a terminal state (success or abort)
+            if let Some(ref mgr) = self.checkpoint_manager {
+                let _ = mgr.delete_checkpoint(&graph_id);
+            }
 
             // 4. Removed duplicate send_task_completed.
             // The caller (main.rs daemon loop) is responsible for emitting TaskCompleted 

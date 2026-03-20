@@ -248,6 +248,7 @@ REQUIRED JSON STRUCTURE:
             [ABSOLUTE PROHIBITION]: Your final answer MUST be substantive text content, NOT a bare URL or list of URLs. If the tool results contain scraped web page content with actual data (weather, prices, news articles, etc.), EXTRACT and PRESENT that data as readable text. If you can only find URLs but no extracted content, say so explicitly and summarize what the URLs appear to contain. \
             [CRITICAL CONSTRAINT]: Filter the Tool Results STRICTLY against the Original Task constraints (especially time/date/location). \
             If the retrieved data is irrelevant or completely empty, EXPLICITLY state the data deficiency instead of hallucinating. \
+            [CRITICAL FALLBACK]: If ALL tool results are empty, contain errors, or are superficial/incomplete, you MUST compose a comprehensive answer using your built-in training knowledge. Acknowledge that your data comes from your knowledge base (not live search), but DO NOT refuse to answer or say 'search failed'. Your training data contains extensive information on most topics. Only disclaim for truly real-time data that your training cannot possibly know. \
             Output ONLY the final answer text.",
             input.task, results
         );

@@ -18,6 +18,8 @@ pub struct ExecutionTrace {
     pub errors_encountered: Vec<NodeError>,
     pub success: bool,
     pub sub_graph: Option<telos_core::AgentSubGraph>,
+    /// IDs of workflow templates that were reused during Architect planning
+    pub reused_workflow_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

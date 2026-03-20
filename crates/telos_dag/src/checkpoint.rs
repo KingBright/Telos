@@ -1,5 +1,5 @@
 use crate::StorageError;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use std::path::Path;
 
 // Since redb requires keys and values to implement the `Value` trait,
@@ -32,6 +32,18 @@ impl CheckpointManager {
         Ok(())
     }
 
+    pub fn delete_checkpoint(&self, graph_id: &str) -> Result<(), StorageError> {
+        let write_txn = self.db.begin_write().map_err(|_| StorageError::IoError)?;
+        {
+            let mut table = write_txn
+                .open_table(GRAPH_STATE_TABLE)
+                .map_err(|_| StorageError::IoError)?;
+            table.remove(graph_id).map_err(|_| StorageError::IoError)?;
+        }
+        write_txn.commit().map_err(|_| StorageError::IoError)?;
+        Ok(())
+    }
+
     pub fn restore_checkpoint(&self, graph_id: &str) -> Result<Option<String>, StorageError> {
         let read_txn = self.db.begin_read().map_err(|_| StorageError::IoError)?;
         let table = read_txn
@@ -44,5 +56,21 @@ impl CheckpointManager {
         } else {
             Ok(None)
         }
+    }
+
+    /// Retrieves all saved checkpoints from the database.
+    pub fn get_all_checkpoints(&self) -> Result<Vec<(String, String)>, StorageError> {
+        let read_txn = self.db.begin_read().map_err(|_| StorageError::IoError)?;
+        let table = read_txn
+            .open_table(GRAPH_STATE_TABLE)
+            .map_err(|_| StorageError::IoError)?;
+
+        let mut all_checkpoints = Vec::new();
+        let iter = table.iter().map_err(|_| StorageError::IoError)?;
+        for result in iter {
+            let (key, value) = result.map_err(|_| StorageError::IoError)?;
+            all_checkpoints.push((key.value().to_string(), value.value().to_string()));
+        }
+        Ok(all_checkpoints)
     }
 }

@@ -77,7 +77,14 @@ This file tracks the integration points between different modules to ensure the 
 
 - [x] **CLI (Module 11) -> Project Management (Module 13)**:
   - Added CLI subcommands `telos project init/list/switch` to manage contexts.
-- [x] **Daemon (Module 11) -> Project Management (Module 13)**:
+- [x] **Project Management (Module 13)**:
   - Event payloads (`RunRequest`, `AgentEvent::UserInput`) updated to handle optional project IDs allowing nodes to contextualize file execution.
-- [x] **Bot (Module 12) -> Project Management (Module 13)**:
+- [x] **Project Management (Module 13)**:
   - Bots now automatically inject the active project config ID into execution calls.
+
+## 17 Low-Coupling Refactoring (telos_daemon / telos_tooling)
+
+- [ ] **Daemon Core (Module 11)**:
+  - Decompose the single `main.rs` binary entry point into modular `api/`, `graph/`, `core/`, and `workers/` directories to prevent namespace collisions and routing confusion.
+- [ ] **Tooling Core (Module 5)**:
+  - Decompose `native.rs` into `fs_tools.rs`, `web_tools.rs`, `os_tools.rs`, `memory_tools.rs`, and `dev_tools.rs` mapping to standard cohesion principles.

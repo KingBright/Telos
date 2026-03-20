@@ -260,7 +260,7 @@ async fn test_dependency_types() {
     graph.add_edge_with_type("A", "B", DependencyType::Data).unwrap();
 
     // Verify edge type was stored
-    assert_eq!(graph.edge_types.get(&("A".to_string(), "B".to_string())), Some(&DependencyType::Data));
+    assert_eq!(graph.edge_types.get(&"A|B".to_string()), Some(&DependencyType::Data));
 
     // Verify get_dependencies works
     let deps = graph.get_dependencies("B");

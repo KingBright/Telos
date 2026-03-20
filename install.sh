@@ -159,7 +159,16 @@ if [ -f "$CONFIG_FILE" ] || [ -f "$OLD_CONFIG_FILE" ]; then
             if curl -s http://127.0.0.1:8321/api/v1/log-level >/dev/null; then
                 echo ""
                 echo "telos_daemon started successfully and is responding on port 8321."
-                echo "Daemon logs: $LOG_DIR/daemon.log"
+                echo ""
+                echo "═══════════════════════════════════════════════════════"
+                echo "  🚀 Telos Daemon Services"
+                echo "═══════════════════════════════════════════════════════"
+                echo "  📡 Daemon API:           http://127.0.0.1:8321/api/v1/run"
+                echo "  🔌 WebSocket Stream:     ws://127.0.0.1:8321/api/v1/stream"
+                echo "  🔍 Trace Viewer:         http://127.0.0.1:8321/"
+                echo "  📊 Telos Dashboard:      http://127.0.0.1:8321/"
+                echo "  📁 Daemon Logs:          $LOG_DIR/daemon.log"
+                echo "═══════════════════════════════════════════════════════"
                 exit 0
             fi
             echo -n "."

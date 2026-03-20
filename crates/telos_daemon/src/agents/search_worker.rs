@@ -39,6 +39,8 @@ Rules:
 4. For time-sensitive queries, include year/month in the query
 5. Prefer professional terminology over colloquial descriptions
 6. Queries should be diverse — avoid near-duplicates
+7. ENTITY DECOMPOSITION: If the intent asks about "主要厂商/key players/major companies/主要企业", generate SEPARATE targeted queries for known major entities. Example: for "固态电池主要厂商", generate queries like "丰田固态电池进展 2026", "宁德时代固态电池量产计划", "三星SDI全固态电池" instead of a single generic "固态电池主要厂商" query. This dramatically improves coverage of important players.
+8. COVERAGE DIVERSITY: When the topic is global or industry-wide, ensure queries cover different geographies (Chinese companies, Japanese, Korean, US/European) and different sub-aspects (technology route, production timeline, investment, partnerships).
 
 Search Intent: "{}"
 
@@ -440,6 +442,10 @@ impl ExecutableNode for SearchWorkerAgent {
         let mut successful_queries: Vec<String> = Vec::new();
 
         for (i, query) in queries.iter().enumerate() {
+            // Add delay between searches to avoid triggering anti-bot detection
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
             info!("[SearchWorker] Executing query {}/{}: \"{}\"", i + 1, queries.len(), query);
             let results = self.execute_search(query).await;
             

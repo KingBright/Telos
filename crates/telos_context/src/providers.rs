@@ -214,6 +214,11 @@ impl OpenAiProvider {
         }
     }
 
+    /// Get the configured LLM model name
+    pub fn model_name(&self) -> &str {
+        &self.llm_model
+    }
+
     pub async fn chat_completion(&self, prompt: &str) -> Result<String, ProviderError> {
         let messages = vec![
             serde_json::json!({

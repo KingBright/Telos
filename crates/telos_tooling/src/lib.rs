@@ -11,6 +11,72 @@ use telos_core::RiskLevel;
 
 use serde::{Deserialize, Serialize};
 
+// ─── Centralized Tool Metrics Hooks ────────────────────────────────────────
+// Global hooks that fire on tool execution and creation events.
+// The daemon registers callbacks at startup so `telos_tooling` doesn't need
+// to depend on `telos_daemon::metrics_store`.
+
+use std::sync::OnceLock;
+
+/// Callback signature for tool execution: (tool_name, success, duration)
+type ToolMetricsHookFn = Box<dyn Fn(&str, bool, std::time::Duration) + Send + Sync>;
+/// Callback signature for tool creation: (tool_name, success, is_iteration)
+type ToolCreationHookFn = Box<dyn Fn(&str, bool, bool) + Send + Sync>;
+
+static TOOL_METRICS_HOOK: OnceLock<ToolMetricsHookFn> = OnceLock::new();
+static TOOL_CREATION_HOOK: OnceLock<ToolCreationHookFn> = OnceLock::new();
+
+/// Register a global callback that fires after every tool execution.
+/// Should be called once at daemon startup.
+pub fn set_tool_metrics_hook(
+    hook: impl Fn(&str, bool, std::time::Duration) + Send + Sync + 'static,
+) {
+    let _ = TOOL_METRICS_HOOK.set(Box::new(hook));
+}
+
+/// Register a global callback that fires after every tool creation/update.
+/// Should be called once at daemon startup.
+pub fn set_tool_creation_hook(
+    hook: impl Fn(&str, bool, bool) + Send + Sync + 'static,
+) {
+    let _ = TOOL_CREATION_HOOK.set(Box::new(hook));
+}
+
+/// Fire the creation hook (if registered). Called from create_rhai_tool.
+pub fn fire_tool_creation_hook(tool_name: &str, success: bool, is_iteration: bool) {
+    if let Some(hook) = TOOL_CREATION_HOOK.get() {
+        hook(tool_name, success, is_iteration);
+    }
+}
+
+/// Wrapper executor that records metrics around the inner executor's `call()`.
+/// Created automatically by `VectorToolRegistry::get_executor()`.
+pub struct InstrumentedToolExecutor {
+    inner: std::sync::Arc<dyn ToolExecutor>,
+    tool_name: String,
+}
+
+#[async_trait]
+impl ToolExecutor for InstrumentedToolExecutor {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let start = std::time::Instant::now();
+        let result = self.inner.call(params).await;
+        let duration = start.elapsed();
+        let success = result.is_ok();
+
+        // Fire the global hook if registered
+        if let Some(hook) = TOOL_METRICS_HOOK.get() {
+            hook(&self.tool_name, success, duration);
+        }
+
+        result
+    }
+
+    fn source_code(&self) -> Option<String> {
+        self.inner.source_code()
+    }
+}
+
 #[cfg(feature = "full")]
 pub use script_sandbox::{ScriptExecutor, ScriptSandbox};
 #[cfg(feature = "full")]
@@ -37,7 +103,7 @@ pub struct ToolSchema {
     pub parameters_schema: JsonSchema,
     #[serde(default)]
     pub risk_level: RiskLevel,
-    /// Tool version for iteration tracking (defaults to "0.1.0")
+    /// Tool version for lifecycle tracking (semver, defaults to "1.0.0")
     #[serde(default = "default_version")]
     pub version: String,
     /// Iteration count - how many times this tool has been updated
@@ -52,7 +118,7 @@ pub struct ToolSchema {
 }
 
 fn default_version() -> String {
-    "0.1.0".to_string()
+    "1.0.0".to_string()
 }
 
 impl ToolSchema {
@@ -111,6 +177,7 @@ pub trait ToolExecutor: Send + Sync {
 pub trait ToolRegistry: Send + Sync {
     fn discover_tools(&self, intent: &str, limit: usize) -> Vec<ToolSchema>;
     fn get_executor(&self, tool_name: &str) -> Option<std::sync::Arc<dyn ToolExecutor>>;
+    fn get_schema(&self, tool_name: &str) -> Option<ToolSchema>;
     fn list_all_tools(&self) -> Vec<ToolSchema>;
     fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String>;
 }
@@ -155,6 +222,14 @@ impl<T: ToolRegistry + ?Sized> ToolRegistry for SharedToolRegistry<T> {
             guard.list_all_tools()
         } else {
             vec![]
+        }
+    }
+
+    fn get_schema(&self, tool_name: &str) -> Option<ToolSchema> {
+        if let Ok(guard) = self.inner.try_read() {
+            guard.get_schema(tool_name)
+        } else {
+            None
         }
     }
 

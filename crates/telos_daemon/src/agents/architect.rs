@@ -53,11 +53,13 @@ impl ExpertAgent for ArchitectAgent {
         let mem_context = input.memory_context.clone().unwrap_or_default();
 
         let mut template_context = String::new();
+        let mut reused_template_count = 0usize;
         if let Some(mem_any) = _registry.get_memory_os() {
             if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
                 use telos_memory::integration::MemoryIntegration;
                 if let Ok(templates) = mem_os.retrieve_procedural_memories(input.task.clone()).await {
                     if !templates.is_empty() {
+                        reused_template_count = templates.len();
                         template_context = format!("[LEARNED WORKFLOW TEMPLATES & STRATEGIES]\nIf any of the following procedural templates match the user's current goal, you MUST reuse its node topology (agent types, edges). You must instantiate the template by replacing specific placeholder arguments (like filenames or test targets) with the parameters from the current task.\n\n{}\n\n", templates.join("\n---\n"));
                     }
                 }
@@ -169,7 +171,8 @@ Your total response MUST be a single valid JSON object exactly matching the sche
                         }
                         AgentOutput::with_subgraph(
                             serde_json::json!({
-                                "text": format!("SubGraph decomposition complete with {} nodes", sub_graph.nodes.len())
+                                "text": format!("SubGraph decomposition complete with {} nodes", sub_graph.nodes.len()),
+                                "reused_workflow_count": reused_template_count,
                             }),
                             sub_graph,
                         ).with_trace(trace)

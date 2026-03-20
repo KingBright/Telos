@@ -265,6 +265,7 @@ mod tests {
             errors_encountered: vec![],
             success: true,
             sub_graph: None,
+            reused_workflow_ids: vec![],
         };
 
         provider.store_trace(trace.clone());
@@ -293,6 +294,7 @@ mod tests {
             errors_encountered: vec![],
             success: true,
             sub_graph: None,
+            reused_workflow_ids: vec![],
         };
 
         provider.store_trace(trace);

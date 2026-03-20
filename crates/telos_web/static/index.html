@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8"/>
     <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-    <title>AGENT-OS MISSION CONTROL</title>
+    <title>Telos Dashboard</title>
     <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" rel="stylesheet"/>
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
@@ -29,33 +29,48 @@
         }
     </script>
     <style>
-        body {
-            background-color: #050505;
-            color: #f1f5f9;
-        }
+        body { background-color: #050505; color: #f1f5f9; }
         .glass-panel {
             background: rgba(255, 255, 255, 0.02);
             backdrop-filter: blur(12px);
             border: 1px solid rgba(255, 255, 255, 0.05);
         }
-        .neon-glow {
-            text-shadow: 0 0 10px rgba(0, 255, 65, 0.5);
+        .neon-glow { text-shadow: 0 0 10px rgba(0, 255, 65, 0.5); }
+        .tab-btn { transition: all 0.2s ease; }
+        .tab-btn.active { color: #00ff41; border-bottom: 2px solid #00ff41; }
+        .tab-btn:not(.active) { color: #64748b; border-bottom: 2px solid transparent; }
+        .tab-btn:hover:not(.active) { color: #94a3b8; }
+        .metric-card {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            transition: all 0.15s ease;
         }
-        .scanline {
-            width: 100%;
-            height: 2px;
-            background: linear-gradient(to bottom, rgba(0, 255, 65, 0), rgba(0, 255, 65, 0.1), rgba(0, 255, 65, 0));
-            position: absolute;
-            top: 0;
-            left: 0;
-            pointer-events: none;
+        .metric-card:hover {
+            border-color: rgba(0, 255, 65, 0.15);
+            background: rgba(255, 255, 255, 0.04);
         }
-        .circle-progress {
-            transition: stroke-dashoffset 0.5s ease;
+        .circle-progress { transition: stroke-dashoffset 0.5s ease; }
+        /* Trace styles */
+        .trace-card {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            transition: all 0.15s ease;
         }
+        .trace-card:hover { border-color: rgba(0, 255, 65, 0.2); background: rgba(255, 255, 255, 0.03); }
+        .trace-header { cursor: pointer; user-select: none; }
+        .trace-details { display: none; animation: fadeIn 0.15s ease; }
+        .trace-details.open { display: block; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+        .trace-badge-llm { background: rgba(197, 134, 192, 0.15); color: #c586c0; border: 1px solid rgba(197, 134, 192, 0.3); }
+        .trace-badge-tool { background: rgba(206, 145, 120, 0.15); color: #ce9178; border: 1px solid rgba(206, 145, 120, 0.3); }
+        .trace-json {
+            background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(255, 255, 255, 0.05);
+            font-size: 12px; line-height: 1.5; max-height: 500px; overflow-y: auto;
+        }
+        .trace-json::-webkit-scrollbar { width: 6px; }
+        .trace-json::-webkit-scrollbar-track { background: transparent; }
+        .trace-json::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
     </style>
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body class="font-display overflow-x-hidden selection:bg-primary selection:text-black">
 <div class="relative flex min-h-screen flex-col">
@@ -66,7 +81,7 @@
                 <div class="relative flex h-8 w-8 items-center justify-center rounded bg-primary/10 border border-primary/30">
                     <span class="material-symbols-outlined text-primary text-xl">terminal</span>
                 </div>
-                <h1 class="text-sm font-bold tracking-[0.2em] uppercase text-slate-100">AGENT-OS MISSION CONTROL</h1>
+                <h1 class="text-sm font-bold tracking-[0.2em] uppercase text-slate-100">TELOS DASHBOARD</h1>
             </div>
             <div class="h-4 w-[1px] bg-glass-border"></div>
             <div class="flex items-center gap-4 text-[10px] font-mono tracking-widest text-slate-400">
@@ -74,199 +89,635 @@
                     <span class="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"></span>
                     SYSTEM: ONLINE
                 </span>
-                <span class="flex items-center gap-2">
-                    KERNEL: V4.12.0-LTS
-                </span>
             </div>
         </div>
         <div class="flex items-center gap-4">
+            <!-- Tab Navigation -->
+            <div class="flex gap-1 mr-4">
+                <button class="tab-btn active px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="metrics" onclick="switchTab('metrics')">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">monitoring</span>Metrics
+                </button>
+                <button class="tab-btn px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="knowledge" onclick="switchTab('knowledge')">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">psychology</span>Knowledge
+                </button>
+                <button class="tab-btn px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="tokens" onclick="switchTab('tokens')">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">toll</span>Tokens
+                </button>
+                <button class="tab-btn px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="tools" onclick="switchTab('tools')">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">build</span>Tools
+                </button>
+                <button class="tab-btn px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="workflows" onclick="switchTab('workflows')">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">account_tree</span>Workflows
+                </button>
+                <button class="tab-btn px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="traces" onclick="switchTab('traces')">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">timeline</span>Traces
+                </button>
+            </div>
+            <div class="h-4 w-[1px] bg-glass-border"></div>
             <div class="flex gap-2 font-mono text-xs">
                 <div class="flex items-center gap-2 rounded border border-glass-border bg-glass px-3 py-1.5">
                     <span class="text-slate-500">UPTIME</span>
                     <span id="uptime_clock" class="text-primary font-bold">00:00:00</span>
                 </div>
-                <div class="flex items-center gap-2 rounded border border-glass-border bg-glass px-3 py-1.5">
-                    <span class="text-slate-500">SYNC</span>
-                    <span class="text-primary font-bold">NOMINAL</span>
-                </div>
             </div>
-            <button class="flex h-9 w-9 items-center justify-center rounded border border-glass-border bg-glass hover:bg-glass-border transition-colors">
-                <span class="material-symbols-outlined text-slate-400 text-sm">notifications</span>
-            </button>
-            <button class="flex h-9 w-9 items-center justify-center rounded border border-glass-border bg-glass hover:bg-glass-border transition-colors">
-                <span class="material-symbols-outlined text-slate-400 text-sm">settings</span>
-            </button>
         </div>
     </header>
-    <main class="flex-1 p-6 grid grid-cols-12 gap-6 max-w-[1920px] mx-auto w-full">
-        <!-- Left Sidebar: Memory Panel -->
-        <aside class="col-span-12 lg:col-span-3 flex flex-col gap-6">
-            <section class="glass-panel rounded-lg p-5 flex flex-col gap-6">
-                <div class="flex items-center justify-between border-b border-glass-border pb-3">
-                    <h2 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Memory Clusters</h2>
+
+    <!-- ==================== TAB 1: METRICS OVERVIEW ==================== -->
+    <main id="tab-metrics" class="flex-1 p-6 max-w-[1920px] mx-auto w-full">
+        <!-- Time Range Bar -->
+        <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xs font-bold tracking-[0.2em] text-slate-400 uppercase">Metrics Overview</h2>
+            <div class="flex items-center gap-2">
+                <label class="text-[10px] font-mono text-slate-500 uppercase">Time Range:</label>
+                <select id="metricsRangeSelect" onchange="onRangeChange('metrics')" class="text-[10px] font-mono bg-glass border border-glass-border text-slate-300 rounded px-2 py-1 outline-none focus:border-primary/50">
+                    <option value="hour">Last Hour</option>
+                    <option value="day" selected>Last 24h</option>
+                    <option value="week">Last Week</option>
+                    <option value="month">Last Month</option>
+                    <option value="year">Last Year</option>
+                    <option value="all">All Time</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- LLM Gateway -->
+        <div class="mb-6">
+            <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-3 flex items-center gap-2">
+                <span class="material-symbols-outlined text-sm text-slate-600">model_training</span> LLM Gateway
+            </h3>
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Calls</div>
+                    <div id="m_llm_calls" class="text-2xl font-mono font-bold text-slate-100">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Success</div>
+                    <div id="m_llm_success" class="text-2xl font-mono font-bold text-primary">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">HTTP 429</div>
+                    <div id="m_llm_429" class="text-2xl font-mono font-bold text-orange-400">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Other Errors</div>
+                    <div id="m_llm_errors" class="text-2xl font-mono font-bold text-red-400">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Success Rate</div>
+                    <div id="m_llm_rate" class="text-2xl font-mono font-bold text-primary">—</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Avg Token/Call</div>
+                    <div id="m_llm_avg_tok" class="text-2xl font-mono font-bold text-slate-200">—</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Task Flow -->
+        <div class="mb-6">
+            <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-3 flex items-center gap-2">
+                <span class="material-symbols-outlined text-sm text-slate-600">task_alt</span> Task Flow
+            </h3>
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Completed</div>
+                    <div id="m_task_total" class="text-2xl font-mono font-bold text-slate-100">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Success</div>
+                    <div id="m_task_ok" class="text-2xl font-mono font-bold text-primary">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Failures</div>
+                    <div id="m_task_fail" class="text-2xl font-mono font-bold text-red-400">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Active Now</div>
+                    <div id="m_task_active" class="text-2xl font-mono font-bold text-blue-400">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Success Rate</div>
+                    <div id="m_task_rate" class="text-2xl font-mono font-bold text-primary">—</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tool Execution -->
+        <div class="mb-6">
+            <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-3 flex items-center gap-2">
+                <span class="material-symbols-outlined text-sm text-slate-600">build</span> Tool Execution
+            </h3>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Success</div>
+                    <div id="m_tool_ok" class="text-2xl font-mono font-bold text-primary">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Failures</div>
+                    <div id="m_tool_fail" class="text-2xl font-mono font-bold text-red-400">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Success Rate</div>
+                    <div id="m_tool_rate" class="text-2xl font-mono font-bold text-primary">—</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Calls</div>
+                    <div id="m_tool_total" class="text-2xl font-mono font-bold text-slate-100">0</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tool Creation -->
+        <div class="mb-6">
+            <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-3 flex items-center gap-2">
+                <span class="material-symbols-outlined text-sm text-slate-600">extension</span> Tool Creation & Iteration
+            </h3>
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Created ✓</div>
+                    <div id="m_tc_ok" class="text-2xl font-mono font-bold text-primary">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Created ✗</div>
+                    <div id="m_tc_fail" class="text-2xl font-mono font-bold text-red-400">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Iterated ✓</div>
+                    <div id="m_ti_ok" class="text-2xl font-mono font-bold text-primary">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Iterated ✗</div>
+                    <div id="m_ti_fail" class="text-2xl font-mono font-bold text-red-400">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Create Rate</div>
+                    <div id="m_tc_rate" class="text-2xl font-mono font-bold text-primary">—</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Iterate Rate</div>
+                    <div id="m_ti_rate" class="text-2xl font-mono font-bold text-primary">—</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- QA & Agent -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+            <div>
+                <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-3 flex items-center gap-2">
+                    <span class="material-symbols-outlined text-sm text-slate-600">verified</span> QA Validations
+                </h3>
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="metric-card rounded-lg p-4">
+                        <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Pass</div>
+                        <div id="m_qa_pass" class="text-2xl font-mono font-bold text-primary">0</div>
+                    </div>
+                    <div class="metric-card rounded-lg p-4">
+                        <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Fail</div>
+                        <div id="m_qa_fail" class="text-2xl font-mono font-bold text-red-400">0</div>
+                    </div>
+                    <div class="metric-card rounded-lg p-4">
+                        <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Pass Rate</div>
+                        <div id="m_qa_rate" class="text-2xl font-mono font-bold text-primary">—</div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-3 flex items-center gap-2">
+                    <span class="material-symbols-outlined text-sm text-slate-600">smart_toy</span> Agent Activity
+                </h3>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="metric-card rounded-lg p-4">
+                        <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Proactive HCI</div>
+                        <div id="m_proactive" class="text-2xl font-mono font-bold text-orange-400">0</div>
+                    </div>
+                    <div class="metric-card rounded-lg p-4">
+                        <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Semantic Loops</div>
+                        <div id="m_sem_loop" class="text-2xl font-mono font-bold text-amber-400">0</div>
+                    </div>
+                </div>
+            </div>
+            <div>
+                <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-3 flex items-center gap-2">
+                    <span class="material-symbols-outlined text-sm text-slate-600">account_tree</span> Workflow Reuse
+                </h3>
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="metric-card rounded-lg p-4">
+                        <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Stored</div>
+                        <div id="m_wf_stored" class="text-2xl font-mono font-bold text-blue-400">0</div>
+                    </div>
+                    <div class="metric-card rounded-lg p-4">
+                        <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Reused</div>
+                        <div id="m_wf_reused" class="text-2xl font-mono font-bold text-primary">0</div>
+                    </div>
+                    <div class="metric-card rounded-lg p-4">
+                        <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Reuse Rate</div>
+                        <div id="m_wf_rate" class="text-2xl font-mono font-bold text-primary">—</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- ==================== TAB 2: KNOWLEDGE & TOOLS ==================== -->
+    <main id="tab-knowledge" class="flex-1 p-6 max-w-[1920px] mx-auto w-full hidden">
+        <!-- Time Range Bar -->
+        <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xs font-bold tracking-[0.2em] text-slate-400 uppercase">Knowledge & Tool Assets</h2>
+            <div class="flex items-center gap-2">
+                <label class="text-[10px] font-mono text-slate-500 uppercase">Time Range:</label>
+                <select id="knowledgeRangeSelect" onchange="onRangeChange('knowledge')" class="text-[10px] font-mono bg-glass border border-glass-border text-slate-300 rounded px-2 py-1 outline-none focus:border-primary/50">
+                    <option value="hour">Last Hour</option>
+                    <option value="day" selected>Last 24h</option>
+                    <option value="week">Last Week</option>
+                    <option value="month">Last Month</option>
+                    <option value="year">Last Year</option>
+                    <option value="all">All Time</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <!-- Memory Clusters -->
+            <section class="glass-panel rounded-lg p-6">
+                <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-5">
+                    <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Memory Clusters</h3>
                     <span class="material-symbols-outlined text-slate-500 text-sm">database</span>
                 </div>
-                <div class="space-y-6">
+                <div class="space-y-5">
                     <!-- Episodic -->
                     <div class="space-y-2">
                         <div class="flex justify-between text-[11px] font-mono">
-                            <span class="text-slate-300">EPISODIC</span>
-                            <span id="mem_episodic" class="text-primary">0 NODES</span>
+                            <span class="text-slate-300 flex items-center gap-2"><span class="h-2 w-2 rounded-full bg-primary"></span>EPISODIC</span>
+                            <span id="k_episodic" class="text-primary font-bold">0 NODES</span>
                         </div>
                         <div class="h-1.5 w-full bg-glass-border rounded-full overflow-hidden">
-                            <div id="bar_episodic" class="h-full bg-primary" style="width: 0%"></div>
+                            <div id="bar_episodic" class="h-full bg-primary transition-all" style="width: 0%"></div>
                         </div>
-                        <p class="text-[10px] text-slate-500 font-mono">RETENTION: 99.9% | DECAY: 0.02%</p>
+                        <p class="text-[10px] text-slate-500 font-mono">Interactions, events, user profiles</p>
                     </div>
                     <!-- Semantic -->
                     <div class="space-y-2">
                         <div class="flex justify-between text-[11px] font-mono">
-                            <span class="text-slate-300">SEMANTIC</span>
-                            <span id="mem_semantic" class="text-primary">0 NODES</span>
+                            <span class="text-slate-300 flex items-center gap-2"><span class="h-2 w-2 rounded-full bg-blue-400"></span>SEMANTIC</span>
+                            <span id="k_semantic" class="text-blue-400 font-bold">0 NODES</span>
                         </div>
                         <div class="h-1.5 w-full bg-glass-border rounded-full overflow-hidden">
-                            <div id="bar_semantic" class="h-full bg-primary/60" style="width: 0%"></div>
+                            <div id="bar_semantic" class="h-full bg-blue-400 transition-all" style="width: 0%"></div>
                         </div>
-                        <p class="text-[10px] text-slate-500 font-mono">ONTOLOGY: STABLE | LINKAGE: HIGH</p>
+                        <p class="text-[10px] text-slate-500 font-mono">Ontology, facts, knowledge graph</p>
                     </div>
                     <!-- Procedural -->
                     <div class="space-y-2">
                         <div class="flex justify-between text-[11px] font-mono">
-                            <span class="text-slate-300">PROCEDURAL</span>
-                            <span id="mem_procedural" class="text-primary">0 NODES</span>
+                            <span class="text-slate-300 flex items-center gap-2"><span class="h-2 w-2 rounded-full bg-amber-400"></span>PROCEDURAL</span>
+                            <span id="k_procedural" class="text-amber-400 font-bold">0 NODES</span>
                         </div>
                         <div class="h-1.5 w-full bg-glass-border rounded-full overflow-hidden">
-                            <div id="bar_procedural" class="h-full bg-primary/40" style="width: 0%"></div>
+                            <div id="bar_procedural" class="h-full bg-amber-400 transition-all" style="width: 0%"></div>
                         </div>
-                        <p class="text-[10px] text-slate-500 font-mono">SKILL_SET: ACTIVE | OPTIMIZED: YES</p>
+                        <p class="text-[10px] text-slate-500 font-mono">Distilled skills, procedures</p>
+                    </div>
+                </div>
+                <div class="mt-5 pt-4 border-t border-glass-border">
+                    <div class="flex justify-between text-[11px] font-mono">
+                        <span class="text-slate-400">Total Nodes</span>
+                        <span id="k_total_nodes" class="text-slate-200 font-bold">0</span>
+                    </div>
+                    <div class="flex justify-between text-[11px] font-mono mt-2">
+                        <span class="text-slate-400">Skill Distillations</span>
+                        <span id="k_distillations" class="text-amber-400 font-bold">0</span>
                     </div>
                 </div>
             </section>
-            <section class="glass-panel rounded-lg p-5">
-                <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
-                    <h2 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Tool Outcomes</h2>
-                </div>
-                <!-- Search Circle -->
-                <div class="grid grid-cols-1 gap-4">
-                    <div class="flex items-center gap-4 p-3 rounded bg-glass-border/20">
-                        <div class="relative h-12 w-12 flex items-center justify-center">
-                            <svg class="h-full w-full rotate-[-90deg]">
-                                <circle cx="24" cy="24" fill="transparent" r="20" stroke="rgba(255,255,255,0.05)" stroke-width="4"></circle>
-                                <circle id="ring_tool_pass" class="circle-progress" cx="24" cy="24" fill="transparent" r="20" stroke="#00ff41" stroke-dasharray="125.6" stroke-dashoffset="125.6" stroke-width="4"></circle>
-                            </svg>
-                            <span id="val_tool_pass_pct" class="absolute text-[10px] font-mono font-bold">0%</span>
-                        </div>
-                        <div class="flex flex-col">
-                            <span class="text-xs font-bold text-slate-200">Tool Execution</span>
-                            <span class="text-[10px] text-primary/70 font-mono uppercase">Global Average</span>
-                            <span class="text-[10px] text-slate-400 font-mono mt-1">Success: <span id="val_tool_success">0</span></span>
-                            <span class="text-[10px] text-slate-400 font-mono">Failures: <span id="val_tool_fails">0</span></span>
-                        </div>
-                    </div>
-                    
-                    <div class="flex items-center gap-4 p-3 rounded bg-glass-border/20 mt-2">
-                        <div class="relative h-12 w-12 flex items-center justify-center">
-                            <svg class="h-full w-full rotate-[-90deg]">
-                                <circle cx="24" cy="24" fill="transparent" r="20" stroke="rgba(255,255,255,0.05)" stroke-width="4"></circle>
-                                <circle id="ring_task_success" class="circle-progress" cx="24" cy="24" fill="transparent" r="20" stroke="#38bdf8" stroke-dasharray="125.6" stroke-dashoffset="125.6" stroke-width="4"></circle>
-                            </svg>
-                            <span id="val_task_success_pct" class="absolute text-[10px] font-mono font-bold">0%</span>
-                        </div>
-                        <div class="flex flex-col">
-                            <span class="text-xs font-bold text-slate-200">Tasks Completed</span>
-                            <span class="text-[10px] text-blue-400/70 font-mono uppercase">Full Flows</span>
-                            <span class="text-[10px] text-slate-400 font-mono mt-1">Active: <span id="val_active_tasks">0</span></span>
-                            <span class="text-[10px] text-slate-400 font-mono">Success: <span id="val_task_success_count">0</span></span>
-                        </div>
-                    </div>
-                    
-                </div>
-            </section>
-            
-            <section class="glass-panel rounded-lg p-5 flex flex-col items-center justify-center min-h-[140px]">
-                <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-2">Proactive Interactions</h3>
-                <span id="val_interactions" class="text-5xl font-mono font-bold text-orange-400 neon-glow">0</span>
-            </section>
-        </aside>
-        
-        <!-- Center Content -->
-        <div class="col-span-12 lg:col-span-9 flex flex-col gap-6">
-            <!-- Main Chart -->
-            <section class="glass-panel rounded-lg p-6 relative overflow-hidden">
-                <div class="scanline"></div>
-                <div class="flex items-end justify-between mb-8">
-                    <div>
-                        <h2 class="text-xs font-bold tracking-[0.2em] text-slate-400 uppercase mb-2">Global LLM Ingress</h2>
-                        <div class="flex items-baseline gap-4">
-                            <span id="val_llm_reqs" class="text-4xl font-mono font-bold text-slate-100 tabular-nums">0</span>
-                            <span class="text-xs font-mono text-primary bg-primary/10 px-2 py-0.5 rounded">TOTAL CALLS</span>
-                        </div>
-                    </div>
-                    <div class="flex gap-4">
-                        <div class="flex items-center gap-2">
-                            <span class="h-2 w-2 rounded-full bg-[#00ff41]"></span>
-                            <span class="text-[10px] font-mono text-slate-400">THROUGHPUT</span>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <span class="h-2 w-2 rounded-full bg-orange-400"></span>
-                            <span class="text-[10px] font-mono text-slate-400">HTTP 429: <span id="val_llm_429" class="text-white">0</span></span>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <span class="h-2 w-2 rounded-full bg-red-500"></span>
-                            <span class="text-[10px] font-mono text-slate-400">ERRORS: <span id="val_llm_errors" class="text-white">0</span></span>
-                        </div>
-                    </div>
-                </div>
-                <div class="h-64 w-full relative">
-                    <canvas id="activityChart"></canvas>
-                </div>
-            </section>
-            
-            <!-- QA Validation Grid -->
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <!-- QA Pass Rate -->
-                <div class="glass-panel rounded-lg p-5">
-                    <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-4">QA Validations</h3>
-                    <div class="flex items-center justify-between">
-                        <div class="relative h-20 w-20">
-                            <svg class="h-full w-full rotate-[-90deg]">
-                                <circle cx="40" cy="40" fill="transparent" r="34" stroke="rgba(255,255,255,0.05)" stroke-width="8"></circle>
-                                <circle id="ring_qa" class="circle-progress" cx="40" cy="40" fill="transparent" r="34" stroke="#00ff41" stroke-dasharray="213.6" stroke-dashoffset="213.6" stroke-width="8"></circle>
-                            </svg>
-                            <div class="absolute inset-0 flex items-center justify-center flex-col">
-                                <span id="val_qa_pct" class="text-sm font-mono font-bold text-slate-100">0%</span>
-                            </div>
-                        </div>
-                        <div class="text-right">
-                            <div class="text-[10px] font-mono text-primary" id="qa_status_label">SECURE</div>
-                            <div class="text-[9px] font-mono text-slate-500 mt-1">Pass: <span id="qa_pass_count">0</span></div>
-                            <div class="text-[9px] font-mono text-slate-500">Fail: <span id="qa_fail_count">0</span></div>
-                        </div>
-                    </div>
-                </div>
 
-            </div>
-            
-            <!-- Detailed Logs / Terminal -->
-            <section class="glass-panel rounded-lg overflow-hidden flex flex-col flex-1 min-h-[300px]">
-                <div class="bg-glass-border/20 border-b border-glass-border px-4 py-2 flex items-center justify-between">
-                    <div class="flex items-center gap-3">
-                        <div class="flex gap-1.5">
-                            <div class="h-2 w-2 rounded-full bg-red-500/50"></div>
-                            <div class="h-2 w-2 rounded-full bg-orange-500/50"></div>
-                            <div class="h-2 w-2 rounded-full bg-green-500/50"></div>
-                        </div>
-                        <span class="text-[10px] font-mono text-slate-400 uppercase tracking-widest">System Logs // Trace 0x82A</span>
-                    </div>
-                    <span class="material-symbols-outlined text-slate-500 text-sm">filter_list</span>
+            <!-- Tool Asset Summary -->
+            <section class="glass-panel rounded-lg p-6">
+                <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-5">
+                    <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Tool Assets</h3>
+                    <span class="material-symbols-outlined text-slate-500 text-sm">extension</span>
                 </div>
-                <div id="live_logs" class="p-4 font-mono text-[11px] space-y-2 overflow-y-auto max-h-[400px]">
+                <div class="space-y-4">
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="metric-card rounded-lg p-4 text-center">
+                            <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Tools Created</div>
+                            <div id="k_tools_created" class="text-3xl font-mono font-bold text-primary">0</div>
+                        </div>
+                        <div class="metric-card rounded-lg p-4 text-center">
+                            <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Iterations</div>
+                            <div id="k_tools_iterated" class="text-3xl font-mono font-bold text-blue-400">0</div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="metric-card rounded-lg p-4 text-center">
+                            <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Executions</div>
+                            <div id="k_tools_exec" class="text-3xl font-mono font-bold text-slate-200">0</div>
+                        </div>
+                        <div class="metric-card rounded-lg p-4 text-center">
+                            <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Exec Success Rate</div>
+                            <div id="k_tools_exec_rate" class="text-3xl font-mono font-bold text-primary">—</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-5 pt-4 border-t border-glass-border space-y-2">
+                    <div class="flex justify-between text-[11px] font-mono">
+                        <span class="text-slate-400">Creation Success Rate</span>
+                        <span id="k_create_rate" class="text-primary font-bold">—</span>
+                    </div>
+                    <div class="flex justify-between text-[11px] font-mono">
+                        <span class="text-slate-400">Iteration Success Rate</span>
+                        <span id="k_iterate_rate" class="text-primary font-bold">—</span>
+                    </div>
                 </div>
             </section>
         </div>
+
+        <!-- System Logs -->
+        <section class="glass-panel rounded-lg overflow-hidden flex flex-col mt-6 min-h-[250px]">
+            <div class="bg-glass-border/20 border-b border-glass-border px-4 py-2 flex items-center justify-between">
+                <div class="flex items-center gap-3">
+                    <div class="flex gap-1.5">
+                        <div class="h-2 w-2 rounded-full bg-red-500/50"></div>
+                        <div class="h-2 w-2 rounded-full bg-orange-500/50"></div>
+                        <div class="h-2 w-2 rounded-full bg-green-500/50"></div>
+                    </div>
+                    <span class="text-[10px] font-mono text-slate-400 uppercase tracking-widest">System Logs // Live Stream</span>
+                </div>
+            </div>
+            <div id="live_logs" class="p-4 font-mono text-[11px] space-y-2 overflow-y-auto max-h-[300px]">
+            </div>
+        </section>
+    </main>
+
+    <!-- ==================== TAB 3: TOKEN ANALYTICS ==================== -->
+    <main id="tab-tokens" class="flex-1 p-6 max-w-[1920px] mx-auto w-full hidden">
+        <!-- Time Range Bar -->
+        <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xs font-bold tracking-[0.2em] text-slate-400 uppercase">Token & Cost Analytics</h2>
+            <div class="flex items-center gap-2">
+                <label class="text-[10px] font-mono text-slate-500 uppercase">Time Range:</label>
+                <select id="tokensRangeSelect" onchange="onRangeChange('tokens')" class="text-[10px] font-mono bg-glass border border-glass-border text-slate-300 rounded px-2 py-1 outline-none focus:border-primary/50">
+                    <option value="hour">Last Hour</option>
+                    <option value="day" selected>Last 24h</option>
+                    <option value="week">Last Week</option>
+                    <option value="month">Last Month</option>
+                    <option value="year">Last Year</option>
+                    <option value="all">All Time</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Tokens</div>
+                <div id="t_total_tokens" class="text-3xl font-mono font-bold text-slate-100">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Estimated Cost</div>
+                <div id="t_total_cost" class="text-3xl font-mono font-bold text-amber-400">$0.00</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">LLM Calls</div>
+                <div id="t_total_calls" class="text-3xl font-mono font-bold text-primary">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Avg Token/Call</div>
+                <div id="t_avg_tokens" class="text-3xl font-mono font-bold text-slate-200">—</div>
+            </div>
+        </div>
+
+        <!-- Agent Token Breakdown -->
+        <section class="glass-panel rounded-lg p-6 mb-6">
+            <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
+                <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Token Consumption by Agent</h3>
+                <span class="material-symbols-outlined text-slate-500 text-sm">smart_toy</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-[11px] font-mono">
+                    <thead>
+                        <tr class="text-slate-500 uppercase tracking-wider border-b border-glass-border">
+                            <th class="text-left py-2 px-3">Agent</th>
+                            <th class="text-right py-2 px-3">Calls</th>
+                            <th class="text-right py-2 px-3">Tokens</th>
+                            <th class="text-right py-2 px-3">Cost (USD)</th>
+                            <th class="text-right py-2 px-3">Avg Tok/Call</th>
+                        </tr>
+                    </thead>
+                    <tbody id="t_agent_table">
+                        <tr><td colspan="5" class="text-center py-4 text-slate-600">No agent data yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+
+        <!-- Task Token Breakdown -->
+        <section class="glass-panel rounded-lg p-6">
+            <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
+                <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Token Consumption by Task</h3>
+                <div class="flex items-center gap-3">
+                    <span id="t_task_page_info" class="text-[10px] font-mono text-slate-500"></span>
+                    <div class="flex gap-1">
+                        <button onclick="taskPagePrev()" class="text-[10px] font-mono px-2 py-1 rounded border border-glass-border bg-glass hover:bg-glass-border transition-colors text-slate-400">
+                            <span class="material-symbols-outlined text-xs align-middle">chevron_left</span>
+                        </button>
+                        <button onclick="taskPageNext()" class="text-[10px] font-mono px-2 py-1 rounded border border-glass-border bg-glass hover:bg-glass-border transition-colors text-slate-400">
+                            <span class="material-symbols-outlined text-xs align-middle">chevron_right</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-[11px] font-mono">
+                    <thead>
+                        <tr class="text-slate-500 uppercase tracking-wider border-b border-glass-border">
+                            <th class="text-left py-2 px-3">Task ID</th>
+                            <th class="text-right py-2 px-3">LLM Calls</th>
+                            <th class="text-right py-2 px-3">Tokens</th>
+                            <th class="text-right py-2 px-3">Cost</th>
+                            <th class="text-right py-2 px-3">Tools</th>
+                            <th class="text-right py-2 px-3">Time</th>
+                            <th class="text-center py-2 px-3">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="t_task_table">
+                        <tr><td colspan="7" class="text-center py-4 text-slate-600">No task data yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <!-- ==================== TAB 4: TOOLS ==================== -->
+    <main id="tab-tools" class="flex-1 p-6 max-w-[1920px] mx-auto w-full hidden">
+        <!-- Time Range Bar -->
+        <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xs font-bold tracking-[0.2em] text-slate-400 uppercase">Tool Inventory & Usage</h2>
+            <div class="flex items-center gap-2">
+                <label class="text-[10px] font-mono text-slate-500 uppercase">Time Range:</label>
+                <select id="toolsRangeSelect" onchange="onRangeChange('tools')" class="text-[10px] font-mono bg-glass border border-glass-border text-slate-300 rounded px-2 py-1 outline-none focus:border-primary/50">
+                    <option value="hour">Last Hour</option>
+                    <option value="day" selected>Last 24h</option>
+                    <option value="week">Last Week</option>
+                    <option value="month">Last Month</option>
+                    <option value="year">Last Year</option>
+                    <option value="all">All Time</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Tools</div>
+                <div id="tl_total" class="text-3xl font-mono font-bold text-slate-100">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Built-in</div>
+                <div id="tl_native" class="text-3xl font-mono font-bold text-blue-400">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Custom</div>
+                <div id="tl_custom" class="text-3xl font-mono font-bold text-amber-400">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Calls</div>
+                <div id="tl_calls" class="text-3xl font-mono font-bold text-slate-100">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Failures</div>
+                <div id="tl_failures" class="text-3xl font-mono font-bold text-red-400">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Success Rate</div>
+                <div id="tl_rate" class="text-3xl font-mono font-bold text-primary">—</div>
+            </div>
+        </div>
+
+        <!-- Per-Tool Breakdown -->
+        <section class="glass-panel rounded-lg p-6">
+            <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
+                <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Per-Tool Breakdown</h3>
+                <span class="material-symbols-outlined text-slate-500 text-sm">build</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-[11px] font-mono">
+                    <thead>
+                        <tr class="text-slate-500 uppercase tracking-wider border-b border-glass-border">
+                            <th class="text-left py-2 px-3">Tool</th>
+                            <th class="text-center py-2 px-3">Type</th>
+                            <th class="text-right py-2 px-3">Version</th>
+                            <th class="text-right py-2 px-3">Iterations</th>
+                            <th class="text-right py-2 px-3">Total Calls</th>
+                            <th class="text-right py-2 px-3">Success</th>
+                            <th class="text-right py-2 px-3">Failures</th>
+                            <th class="text-right py-2 px-3">Success Rate</th>
+                            <th class="text-right py-2 px-3">Last Updated</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tl_tool_table">
+                        <tr><td colspan="9" class="text-center py-4 text-slate-600">No tool data yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <!-- ==================== TAB 5: WORKFLOWS ==================== -->
+    <main id="tab-workflows" class="flex-1 p-6 max-w-[1920px] mx-auto w-full hidden">
+        <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xs font-bold tracking-[0.2em] text-slate-400 uppercase">Workflow Templates & Reuse</h2>
+            <div class="flex items-center gap-2">
+                <label class="text-[10px] font-mono text-slate-500 uppercase">Time Range:</label>
+                <select id="workflowsRangeSelect" onchange="onRangeChange('workflows')" class="text-[10px] font-mono bg-glass border border-glass-border text-slate-300 rounded px-2 py-1 outline-none focus:border-primary/50">
+                    <option value="hour">Last Hour</option>
+                    <option value="day" selected>Last 24h</option>
+                    <option value="week">Last Week</option>
+                    <option value="month">Last Month</option>
+                    <option value="year">Last Year</option>
+                    <option value="all">All Time</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-6">
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Stored</div>
+                <div id="wf_total" class="text-3xl font-mono font-bold text-slate-100">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Reused</div>
+                <div id="wf_reused" class="text-3xl font-mono font-bold text-blue-400">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Reuse Success</div>
+                <div id="wf_success" class="text-3xl font-mono font-bold text-primary">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Reuse Fail</div>
+                <div id="wf_failure" class="text-3xl font-mono font-bold text-red-400">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Success Rate</div>
+                <div id="wf_rate" class="text-3xl font-mono font-bold text-primary">—</div>
+            </div>
+        </div>
+
+        <!-- Per-Workflow Breakdown -->
+        <section class="glass-panel rounded-lg p-6">
+            <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
+                <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Per-Workflow Breakdown</h3>
+                <span class="material-symbols-outlined text-slate-500 text-sm">account_tree</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-[11px] font-mono">
+                    <thead>
+                        <tr class="text-slate-500 uppercase tracking-wider border-b border-glass-border">
+                            <th class="text-left py-2 px-3">Workflow</th>
+                            <th class="text-left py-2 px-3">Description</th>
+                            <th class="text-right py-2 px-3">Stored At</th>
+                            <th class="text-right py-2 px-3">Reuses</th>
+                            <th class="text-right py-2 px-3">Success</th>
+                            <th class="text-right py-2 px-3">Failures</th>
+                            <th class="text-right py-2 px-3">Success Rate</th>
+                        </tr>
+                    </thead>
+                    <tbody id="wf_table">
+                        <tr><td colspan="7" class="text-center py-4 text-slate-600">No workflow data yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <!-- ==================== TAB 6: TRACES ==================== -->
+    <main id="tab-traces" class="flex-1 p-6 max-w-[1920px] mx-auto w-full hidden">
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <h2 class="text-xs font-bold tracking-[0.2em] text-slate-400 uppercase mb-1">Execution Traces</h2>
+                <p class="text-[10px] font-mono text-slate-500">LLM calls, tool executions, and agent interactions</p>
+            </div>
+            <div class="flex items-center gap-3">
+                <div class="flex items-center gap-2 text-[10px] font-mono text-slate-500">
+                    <span class="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"></span>
+                    AUTO-REFRESH: <span id="trace-auto-status">ON</span>
+                </div>
+                <button onclick="toggleTraceAutoRefresh()" class="text-[10px] font-mono font-bold tracking-widest uppercase px-3 py-1.5 rounded border border-glass-border bg-glass hover:bg-glass-border transition-colors text-slate-300">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">sync</span>Toggle
+                </button>
+                <button onclick="fetchTraces()" class="text-[10px] font-mono font-bold tracking-widest uppercase px-3 py-1.5 rounded border border-primary/30 bg-primary/10 hover:bg-primary/20 transition-colors text-primary">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">refresh</span>Refresh
+                </button>
+            </div>
+        </div>
+        <div id="traces-container" class="space-y-2">
+            <div class="text-center py-12 text-slate-500 font-mono text-sm">Loading traces...</div>
+        </div>
     </main>
     
-    <!-- Footer / Status Bar -->
+    <!-- Footer -->
     <footer class="h-8 border-t border-glass-border bg-background-dark/80 backdrop-blur-md px-6 flex items-center justify-between text-[10px] font-mono text-slate-500 uppercase tracking-widest">
         <div class="flex items-center gap-6">
             <span class="flex items-center gap-2">

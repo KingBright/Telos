@@ -32,6 +32,10 @@ pub trait MemoryIntegration: Send + Sync {
 
     /// Stores the topology of a successful DAG execution as a JSON Workflow Template.
     async fn store_workflow_template(&self, description: String, template_json: String) -> Result<(), String>;
+
+    /// Upgrades an existing workflow template if a similar one exists (cosine similarity > 0.8).
+    /// If no similar template is found, stores as new. Returns true if upgraded, false if new.
+    async fn upgrade_workflow_template(&self, description: String, template_json: String) -> Result<bool, String>;
 }
 
 // Implement this trait for any system that implements `MemoryOS` (like RedbGraphStore).
@@ -102,17 +106,33 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
     }
 
     async fn retrieve_procedural_memories(&self, query_string: String) -> Result<Vec<String>, String> {
-        // Query the memory OS specifically for Procedural memories (skills or workflow templates).
-        let query = MemoryQuery::EntityLookup { entity: query_string };
-
-        let results = self.retrieve(query).await?;
-
-        // Extract the content from the procedural memories.
-        Ok(results
-            .into_iter()
-            .filter(|e| e.memory_type == MemoryType::Procedural)
-            .map(|e| e.content)
-            .collect())
+        // Dual-strategy retrieval for maximum recall:
+        // Strategy 1: SemanticSearch (embedding-based similarity) for fuzzy matching
+        // Strategy 2: EntityLookup (keyword) as fallback
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut procedural_results = Vec::new();
+        
+        // Strategy 1: Vector similarity search (primary)
+        let semantic_query = MemoryQuery::SemanticSearch { query: query_string.clone(), top_k: 10 };
+        if let Ok(results) = self.retrieve(semantic_query).await {
+            for e in results {
+                if e.memory_type == MemoryType::Procedural && seen_ids.insert(e.id.clone()) {
+                    procedural_results.push(e.content);
+                }
+            }
+        }
+        
+        // Strategy 2: Keyword fallback (catches exact term matches that vector might miss)
+        let keyword_query = MemoryQuery::EntityLookup { entity: query_string };
+        if let Ok(results) = self.retrieve(keyword_query).await {
+            for e in results {
+                if e.memory_type == MemoryType::Procedural && seen_ids.insert(e.id.clone()) {
+                    procedural_results.push(e.content);
+                }
+            }
+        }
+        
+        Ok(procedural_results)
     }
 
     async fn store_procedural_skill(&self, trigger: String, procedure: String) -> Result<(), String> {
@@ -137,7 +157,7 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
     async fn store_workflow_template(&self, description: String, template_json: String) -> Result<(), String> {
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let entry_id = format!("workflow_template_{}", timestamp);
-        let content = format!("[Description] {}\n[TemplateJSON]\n{}", description, template_json);
+        let content = format!("[Description] {}\n[Version] 1\n[TemplateJSON]\n{}", description, template_json);
 
         let mut entry = MemoryEntry::new(
             entry_id,
@@ -150,5 +170,57 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
         entry.current_strength = 5.0;
 
         self.store(entry).await
+    }
+
+    async fn upgrade_workflow_template(&self, description: String, template_json: String) -> Result<bool, String> {
+        // Search for existing similar templates via vector similarity
+        let query = MemoryQuery::SemanticSearch { query: description.clone(), top_k: 5 };
+        let results = self.retrieve(query).await.unwrap_or_default();
+        
+        // Find the best matching existing workflow template
+        let existing_template = results.into_iter()
+            .find(|e| e.memory_type == MemoryType::Procedural && e.content.contains("[TemplateJSON]"));
+        
+        if let Some(existing) = existing_template {
+            // Extract current version number
+            let current_version: u32 = existing.content
+                .lines()
+                .find(|l| l.starts_with("[Version] "))
+                .and_then(|l| l.trim_start_matches("[Version] ").parse().ok())
+                .unwrap_or(1);
+            
+            let new_version = current_version + 1;
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            
+            // Build upgraded content with new version
+            let upgraded_content = format!(
+                "[Description] {}\n[Version] {}\n[TemplateJSON]\n{}",
+                description, new_version, template_json
+            );
+            
+            // Create a replacement entry with the same ID (overwrites in redb)
+            let mut upgraded_entry = MemoryEntry::new(
+                existing.id.clone(),
+                MemoryType::Procedural,
+                upgraded_content,
+                timestamp,
+                None, // Embedding will be auto-generated
+            );
+            // Boost strength on successful upgrade (successful reuse = proven value)
+            upgraded_entry.base_strength = (existing.base_strength + 0.5).min(10.0);
+            upgraded_entry.current_strength = upgraded_entry.base_strength;
+            
+            self.store(upgraded_entry).await?;
+            tracing::info!(
+                "[MemoryOS] 🔄 Upgraded workflow template '{}' to version {} (strength: {:.1})",
+                &description[..description.len().min(60)], new_version, existing.base_strength + 0.5
+            );
+            Ok(true) // Upgraded existing
+        } else {
+            // No similar template found — store as new
+            self.store_workflow_template(description, template_json).await?;
+            Ok(false) // Stored as new
+        }
     }
 }

@@ -33,12 +33,105 @@ impl ScriptSandbox {
                         }
                     }
 
-                    let client = builder.build().map_err(|e| e.to_string())?;
-                    let resp = client.get(&url_str).send().await.map_err(|e| e.to_string())?;
-                    resp.text().await.map_err(|e| e.to_string())
+                    let client = builder.build().map_err(|e| format!("Client build error: {}", e))?;
+                    let resp = client.get(&url_str).send().await.map_err(|e| {
+                        if e.is_timeout() {
+                            format!("HTTP timeout after 10s for URL: {}", url_str)
+                        } else if e.is_connect() {
+                            format!("Connection refused for URL: {}", url_str)
+                        } else {
+                            format!("HTTP request failed for {}: {}", url_str, e)
+                        }
+                    })?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        return Err(format!("HTTP {} error from {}", status.as_u16(), url_str));
+                    }
+                    resp.text().await.map_err(|e| format!("Failed to read response body: {}", e))
                 })
             });
             result.map_err(|e| e.into())
+        });
+
+        // Register HTTP GET with Fallback: tries multiple URLs sequentially, returns first success
+        // Usage in Rhai: http_get_with_fallback("[\"url1\", \"url2\", \"url3\"]")
+        engine.register_fn("http_get_with_fallback", |urls_json: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            let urls_str = urls_json.to_string();
+            let result = tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let urls: Vec<String> = serde_json::from_str(&urls_str)
+                        .map_err(|e| format!("Invalid URL array JSON: {}. Expected format: [\"url1\", \"url2\"]", e))?;
+                    
+                    if urls.is_empty() {
+                        return Err("Empty URL list provided to http_get_with_fallback".to_string());
+                    }
+
+                    let mut builder = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10));
+
+                    if let Some(proxy_url) = std::env::var("TELOS_PROXY")
+                        .or_else(|_| std::env::var("HTTPS_PROXY"))
+                        .or_else(|_| std::env::var("HTTP_PROXY")).ok() {
+                        if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                            builder = builder.proxy(proxy);
+                        }
+                    }
+
+                    let client = builder.build().map_err(|e| format!("Client build error: {}", e))?;
+                    let mut last_err = String::new();
+
+                    for (i, url) in urls.iter().enumerate() {
+                        match client.get(url).send().await {
+                            Ok(resp) => {
+                                if resp.status().is_success() {
+                                    match resp.text().await {
+                                        Ok(body) => return Ok(body),
+                                        Err(e) => {
+                                            last_err = format!("URL[{}] {}: body read failed: {}", i, url, e);
+                                        }
+                                    }
+                                } else {
+                                    last_err = format!("URL[{}] {}: HTTP {}", i, url, resp.status().as_u16());
+                                }
+                            }
+                            Err(e) => {
+                                last_err = format!("URL[{}] {}: {}", i, url, e);
+                            }
+                        }
+                    }
+
+                    Err(format!("All {} URLs failed. Last error: {}", urls.len(), last_err))
+                })
+            });
+            result.map_err(|e| e.into())
+        });
+
+        // Register parse_json: converts a JSON string to a Rhai object map
+        // Usage in Rhai: let obj = parse_json(json_string); obj["key"]
+        engine.register_fn("parse_json", |json_str: &str| -> Result<Dynamic, Box<rhai::EvalAltResult>> {
+            let value: Value = serde_json::from_str(json_str)
+                .map_err(|e| format!("parse_json failed: {}", e))?;
+            to_dynamic(value)
+                .map_err(|e| -> Box<rhai::EvalAltResult> { format!("parse_json conversion failed: {}", e).into() })
+        });
+
+        // Register to_json: converts a Rhai value back to a JSON string
+        engine.register_fn("to_json", |val: Dynamic| -> Result<String, Box<rhai::EvalAltResult>> {
+            let json_val: Value = rhai::serde::from_dynamic(&val)
+                .map_err(|e| -> Box<rhai::EvalAltResult> { format!("to_json failed: {}", e).into() })?;
+            serde_json::to_string(&json_val)
+                .map_err(|e| -> Box<rhai::EvalAltResult> { format!("to_json serialization failed: {}", e).into() })
+        });
+
+        // Register try_parse_json: safe JSON parsing that returns the raw string on failure
+        // Usage in Rhai: let data = try_parse_json(body);
+        // If body is valid JSON → returns parsed object map
+        // If body is not JSON (e.g. ASCII art, HTML) → returns the original string as-is
+        engine.register_fn("try_parse_json", |json_str: &str| -> Dynamic {
+            match serde_json::from_str::<Value>(json_str) {
+                Ok(value) => to_dynamic(value).unwrap_or_else(|_| Dynamic::from(json_str.to_string())),
+                Err(_) => Dynamic::from(json_str.to_string()),
+            }
         });
 
         Self { engine }

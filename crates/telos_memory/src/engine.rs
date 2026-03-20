@@ -143,8 +143,8 @@ impl RedbGraphStore {
 #[async_trait]
 impl MemoryOS for RedbGraphStore {
     async fn store(&self, mut entry: MemoryEntry) -> Result<(), String> {
-        // Automatically inject embedding if this is a Semantic, UserProfile, or InteractionEvent memory without one
-        if (entry.memory_type == MemoryType::Semantic || entry.memory_type == MemoryType::UserProfile || entry.memory_type == MemoryType::InteractionEvent) && entry.embedding.is_none() {
+        // Automatically inject embedding if this is a Semantic, UserProfile, InteractionEvent, or Procedural memory without one
+        if (entry.memory_type == MemoryType::Semantic || entry.memory_type == MemoryType::UserProfile || entry.memory_type == MemoryType::InteractionEvent || entry.memory_type == MemoryType::Procedural) && entry.embedding.is_none() {
             if let Some(ref model_arc) = self.model {
                 let mut m = model_arc.write().await;
                 if let Ok(embeddings) = m.embed(vec![entry.content.clone()], None) {
@@ -245,7 +245,7 @@ impl MemoryOS for RedbGraphStore {
             let matches = match &effective_query {
                 MemoryQuery::EntityLookup { entity } => {
                     // Search content or semantic type
-                    (entry.memory_type == MemoryType::Semantic || entry.memory_type == MemoryType::UserProfile || entry.memory_type == MemoryType::InteractionEvent) && entry.content.contains(entity)
+                    (entry.memory_type == MemoryType::Semantic || entry.memory_type == MemoryType::UserProfile || entry.memory_type == MemoryType::InteractionEvent || entry.memory_type == MemoryType::Procedural) && entry.content.contains(entity)
                 },
                 MemoryQuery::TimeRange { start, end } => {
                     entry.created_at >= *start && entry.created_at <= *end

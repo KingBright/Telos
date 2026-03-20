@@ -1,5 +1,5 @@
 use telos_core::SystemRegistry;
-use tracing::{info, warn};
+use tracing::info;
 
 /// SILENT_REPLY_TOKEN: 当 Agent 无需向用户展示中间结果时返回此标记
 /// CLI/TUI 端遇到此 token 应忽略，不向用户显示

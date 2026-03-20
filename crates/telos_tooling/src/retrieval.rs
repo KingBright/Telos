@@ -241,6 +241,19 @@ impl ToolRegistry for VectorToolRegistry {
 
     fn get_executor(&self, tool_name: &str) -> Option<std::sync::Arc<dyn ToolExecutor>> {
         if let Ok(guard) = self.executors.read() {
+            guard.get(tool_name).map(|inner| {
+                std::sync::Arc::new(crate::InstrumentedToolExecutor {
+                    inner: inner.clone(),
+                    tool_name: tool_name.to_string(),
+                }) as std::sync::Arc<dyn ToolExecutor>
+            })
+        } else {
+            None
+        }
+    }
+
+    fn get_schema(&self, tool_name: &str) -> Option<ToolSchema> {
+        if let Ok(guard) = self.tools.read() {
             guard.get(tool_name).cloned()
         } else {
             None
@@ -254,24 +267,34 @@ impl ToolRegistry for VectorToolRegistry {
     fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String> {
         info!("[ToolRegistry] 🔌 Dynamic Tool Registered: {}", schema.name);
         
-        // Save the tool physically if it has dynamic source code
-        if let Some(source) = executor.source_code() {
-            let plugin_path = self.plugins_dir.join(format!("{}.rhai", schema.name));
-            let meta_path = self.plugins_dir.join(format!("{}.json", schema.name));
-            
-            // Write script content
-            if let Err(e) = std::fs::write(&plugin_path, &source) {
-                tracing::error!("Failed to save dynamic tool script to disk: {}", e);
+        // Only persist "real" tools to disk — skip debug/test intermediaries
+        // These are created by the CoderAgent during ReactLoop iterations and should be ephemeral
+        let is_ephemeral = schema.name.starts_with("debug_") 
+            || schema.name.starts_with("test_") 
+            || schema.name.starts_with("diag_");
+        
+        if !is_ephemeral {
+            // Save the tool physically if it has dynamic source code
+            if let Some(source) = executor.source_code() {
+                let plugin_path = self.plugins_dir.join(format!("{}.rhai", schema.name));
+                let meta_path = self.plugins_dir.join(format!("{}.json", schema.name));
+                
+                // Write script content
+                if let Err(e) = std::fs::write(&plugin_path, &source) {
+                    tracing::error!("Failed to save dynamic tool script to disk: {}", e);
+                }
+                
+                // Write schema metadata
+                if let Ok(meta_json) = serde_json::to_string_pretty(&schema) {
+                    let _ = std::fs::write(&meta_path, meta_json);
+                }
+                info!("Plugin safely installed to: {:?}", plugin_path);
             }
-            
-            // Write schema metadata
-            if let Ok(meta_json) = serde_json::to_string_pretty(&schema) {
-                let _ = std::fs::write(&meta_path, meta_json);
-            }
-            info!("Plugin safely installed to: {:?}", plugin_path);
+        } else {
+            debug!("[ToolRegistry] Ephemeral tool '{}' registered in-memory only (not persisted to disk)", schema.name);
         }
 
-        // Register it natively using the RwLock
+        // Register it natively using the RwLock (always in-memory for current session)
         self.register_tool(schema, Some(executor));
         Ok(())
     }

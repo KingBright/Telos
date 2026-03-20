@@ -8,12 +8,14 @@ telos_project = { path = "../telos_project" }
 telos_web = { path = "../telos_web" }
 tokio = { workspace = true, features = ["full"] }
 axum = { version = "0.7", features = ["ws", "macros"] }
+tower-http = { version = "0.5", features = ["fs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 uuid = { version = "1.21.0", features = ["v4", "serde"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
 dirs = "5"
+redb = { workspace = true }
 tracing = "0.1"
 chrono = "0.4"
 reqwest = { version = "0.11", features = ["json"] }

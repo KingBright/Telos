@@ -17,11 +17,11 @@ use tokio::sync::RwLock;
 use tracing::{info, warn, error, debug};
 
 use telos_model_gateway::{
-    ModelGateway, LlmRequest, LlmResponse, Message, Capability,
-    ToolDefinition, ToolCallRequest, GatewayError,
+    ModelGateway, LlmRequest, Message, Capability,
+    ToolDefinition,
 };
 use telos_model_gateway::gateway::GatewayManager;
-use telos_tooling::{ToolExecutor, ToolRegistry, ToolSchema, ToolError};
+use telos_tooling::{ToolExecutor, ToolRegistry, ToolSchema};
 use telos_tooling::retrieval::VectorToolRegistry;
 use telos_core::{AgentOutput, TraceLog};
 
@@ -254,7 +254,7 @@ impl ReactLoop {
                 total_tool_calls += 1;
 
                 // Duplicate detection
-                let call_sig = format!("{}:{}", tool_call.name, tool_call.arguments);
+                let _call_sig = format!("{}:{}", tool_call.name, tool_call.arguments);
                 let dup_count = call_history.iter().filter(|(n, a)| *n == tool_call.name && *a == tool_call.arguments).count();
                 call_history.push((tool_call.name.clone(), tool_call.arguments.clone()));
 
@@ -373,16 +373,13 @@ impl ReactLoop {
 
         match result {
             Ok(Ok(bytes)) => {
-                crate::METRICS.tool_execution_success.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 String::from_utf8(bytes)
                     .map_err(|_| "Tool returned non-UTF8 output".to_string())
             }
             Ok(Err(tool_err)) => {
-                crate::METRICS.tool_execution_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err(format!("Tool error: {:?}", tool_err))
             }
             Err(_) => {
-                crate::METRICS.tool_execution_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err(format!("Tool '{}' timed out after {}s", tool_name, timeout_secs))
             }
         }

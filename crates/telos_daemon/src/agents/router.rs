@@ -74,6 +74,11 @@ CRITICAL RULES:
 - is_acceptable can NEVER be true if contains_answer is false AND is_clarification is false.
 - is_clarification should be true ONLY when the user's input is genuinely ambiguous — NOT when the Expert lazily asks follow-up questions to a clear request.
 - DO NOT penalize the Expert for referencing user memory/preferences — this system has persistent memory capabilities.
+- SHORT INPUT LENIENCY: When the user's original request is ≤5 characters (e.g., "怎么", "帮我", "继续"), SIGNIFICANTLY relax your evaluation standards:
+  • ANY reasonable attempt to engage, clarify, or guide the user is acceptable
+  • The Expert MAY show personality, humor, warmth, or playfulness — this is ENCOURAGED, not penalized
+  • You may optionally note positive personality traits (e.g., "Agent showed creative engagement") but this is NOT required for acceptance
+  • is_acceptable should almost always be true for short-input responses unless the output is truly nonsensical or harmful
 
 --- EXAMPLES ---
 
@@ -190,6 +195,11 @@ Expert: "抱歉，我无法获取相关信息。"
                     } else {
                         crate::METRICS.qa_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
+                    crate::core::metrics_store::record(crate::core::metrics_store::MetricEvent::QaResult {
+                        timestamp_ms: crate::core::metrics_store::now_ms(),
+                        task_id: "router_eval".to_string(),
+                        passed: final_is_acceptable,
+                    });
 
                     if json.get("is_acceptable").is_some() || json.get("route").is_some() {
                         return AgentOutput::success(json).with_trace(trace);
@@ -236,8 +246,10 @@ impl ExecutableNode for RouterAgent {
             }
         }
         
-        let mem_context = input.memory_context.clone().unwrap_or_default();
-
+        let mut mem_context = input.memory_context.clone().unwrap_or_default();
+        if !mem_context.is_empty() {
+            mem_context = format!("[RETRIEVED MEMORY CONTEXT]\n{}\n\n", mem_context);
+        }
         // Build conversation history as a reference block for the system prompt
         // CRITICAL: History goes into the system prompt as context, NOT as actual
         // user/assistant multi-turn messages. This prevents the LLM from treating
@@ -280,7 +292,13 @@ impl ExecutableNode for RouterAgent {
 - "software_expert": For tasks requiring writing, modifying, or executing programming code, or software architecture.
 - "research_expert": For tasks requiring deep, iterative information gathering via search engines (e.g., current events, fact-checking, real-time data).
 - "qa_expert": For tasks heavily focused on writing tests, finding edge cases, or breaking code.
-- "general_expert": For all other tasks requiring step-by-step reasoning or general tool use.
+- "general_expert": For all other tasks requiring step-by-step reasoning or general tool use. Also the preferred expert when CUSTOM TOOLS are available that match the user's request.
+
+CUSTOM TOOL PRIORITY:
+If the [AVAILABLE CUSTOM TOOLS] section appears in the context above, it means the system has previously-created tools that match this query. When a custom tool is relevant:
+- Route to "general_expert" — it can directly invoke the custom tool
+- Do NOT route to "research_expert" for web search if a custom tool can fulfill the request
+- Example: If a "weather_tool" custom tool exists and the user asks about weather, route to "general_expert" (NOT "research_expert")
 
 CRITICAL RULES:
 1. You MUST output a strictly valid JSON object.
@@ -307,7 +325,25 @@ ROUTING DISTINCTION FOR CODING TASKS:
 - "Modify an existing file in a project" → software_expert (needs file I/O tools)
 - "Build a complete multi-file application" → software_expert (needs file system)
 - "Debug a specific file or codebase" → software_expert (needs file access + shell)
+
+CRITICAL — TOOL CREATION ROUTING:
+- When the user asks to "制作工具/创建工具/make a tool/create a tool/build a tool" or describes functionality they want as a PERSISTENT TOOL, you MUST route to "general_expert". Do NOT use "direct_reply" to just give code — the general_expert has a special `create_rhai_tool` capability that can register real, reusable tools inside the system that persist across sessions.
+- Examples that MUST route to general_expert:
+  - "帮我做一个查天气的工具" → general_expert
+  - "create a calculator tool" → general_expert
+  - "可以做一个翻译工具吗" → general_expert
+  - "制作一个汇率转换的工具" → general_expert
+- If in doubt whether the user wants "code to read" vs "a persistent tool", prefer routing to general_expert.
+
 8. If you have attempted to use memory_read but could not find sufficient information, you SHOULD still provide your best direct_reply based on whatever you DID find (even if partial or uncertain), or route to an appropriate expert agent if you believe only a deeper search pipeline can answer the question. NEVER return an empty response or give up silently.
+9. SHORT/AMBIGUOUS INPUT HANDLING: When the user sends a very short message (≤5 chars):
+   - FIRST, check the [CONVERSATION HISTORY]. If there is recent context (e.g., a failed task, a previous request), resolve the short message as a CONTEXTUAL REFERENCE:
+     * "再试一次/重来/再来" → re-execute the most recent task from conversation history
+     * "继续/接着" → continue the last incomplete task
+     * "好的/可以/行" → confirm the last proposed action
+   - ONLY if conversation history is EMPTY or provides no useful context, show personality and ask for clarification.
+   - NEVER ask "what do you want to retry?" if the conversation history clearly shows what failed.
+10. MEMORY WRITE DETECTION: If the user explicitly asks you to "记住/记录/保存/remember/save" information about themselves (preferences, facts, notes), you MUST include a memory_write action. Output EXACTLY TWO keys: "tool": "memory_write" and "content": "<the fact to store>". After the tool returns, confirm to the user with a personalized response. Examples of triggers: "帮我记住我对花生过敏", "请记录一下我的地址是...", "记住我喜欢蓝色".
 
 FOCUS RULE: Your JSON output must address ONLY the user's CURRENT request (the message below). The [CONVERSATION HISTORY] above is reference material — do NOT repeat or re-answer any of it.
 
@@ -348,6 +384,13 @@ User: "Help me plan a generic schedule."
   "route": "general_expert",
   "reason": "General reasoning query.",
   "enriched_task": "Help me plan a generic schedule."
+}
+
+User: "帮我制作一个查天气的工具"
+{
+  "route": "general_expert",
+  "reason": "User wants to create a persistent tool within the system. The general_expert has create_rhai_tool capability.",
+  "enriched_task": "帮我制作一个查天气的工具，使用 create_rhai_tool 创建一个可以持久使用的天气查询工具"
 }
 
 User: "计算 25 的平方根加上 150 的 15%"

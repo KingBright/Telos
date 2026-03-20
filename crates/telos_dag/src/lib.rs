@@ -32,8 +32,14 @@ pub struct GraphState {
     pub completed: bool,
 }
 
+fn default_schema_version() -> u32 {
+    1 // Current schema version
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct TaskGraph {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub graph_id: String,
     // Original mapping of node ID to ExecutableNode logic
     #[serde(skip)]
@@ -46,8 +52,8 @@ pub struct TaskGraph {
     pub node_statuses: HashMap<String, NodeStatus>,
     // Results from execution (new: structured output)
     pub node_results: HashMap<String, AgentOutput>,
-    // Edge types: (from, to) -> dependency type
-    pub edge_types: HashMap<(String, String), DependencyType>,
+    // Edge types: "from|to" -> dependency type
+    pub edge_types: HashMap<String, DependencyType>,
     // Metadata for each node (task_type, prompt_preview, etc.)
     pub node_metadata: HashMap<String, NodeMetadata>,
     pub current_state: GraphState,
@@ -57,6 +63,7 @@ pub struct TaskGraph {
 impl TaskGraph {
     pub fn new(graph_id: String) -> Self {
         Self {
+            schema_version: default_schema_version(),
             graph_id,
             nodes: HashMap::new(),
             edges: DiGraph::new(),
@@ -135,7 +142,7 @@ impl TaskGraph {
             .ok_or("To node not found")?;
         self.edges.add_edge(from_idx, to_idx, ());
         self.edge_types
-            .insert((from.to_string(), to.to_string()), dep_type);
+            .insert(format!("{}|{}", from, to), dep_type);
         Ok(())
     }
 
@@ -152,7 +159,7 @@ impl TaskGraph {
                 if let Some(from_id) = self.edges.node_weight(neighbor_idx) {
                     let dep_type = self
                         .edge_types
-                        .get(&(from_id.clone(), node_id.to_string()))
+                        .get(&format!("{}|{}", from_id, node_id))
                         .copied()
                         .unwrap_or(DependencyType::Data);
                     deps.push((from_id.clone(), dep_type));
@@ -177,14 +184,29 @@ impl TaskGraph {
             });
         }
         let mut edges = Vec::new();
-        for ((from, to), dep_type) in &self.edge_types {
-            edges.push(telos_core::SubGraphEdge {
-                from: from.clone(),
-                to: to.clone(),
-                dep_type: *dep_type,
-            });
+        for (key_str, dep_type) in &self.edge_types {
+            if let Some((from, to)) = key_str.split_once('|') {
+                edges.push(telos_core::SubGraphEdge {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    dep_type: *dep_type,
+                });
+            }
         }
         telos_core::AgentSubGraph { nodes, edges }
+    }
+
+    /// Rebuilds the runtime node logic (`Box<dyn ExecutableNode>`) from metadata.
+    /// Used when restoring a checkpoint from disk.
+    pub fn rebuild_nodes(&mut self, factory: &dyn engine::NodeFactory) -> Result<(), String> {
+        for (id, meta) in &self.node_metadata {
+            if let Some(executable) = factory.create_node(&meta.task_type, &meta.full_task) {
+                self.nodes.insert(id.clone(), executable);
+            } else {
+                return Err(format!("Failed to rebuild node logic for node: {} (type: {})", id, meta.task_type));
+            }
+        }
+        Ok(())
     }
 }
 

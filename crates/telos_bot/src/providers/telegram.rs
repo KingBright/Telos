@@ -222,8 +222,9 @@ impl TelegramFeedbackFormatter {
                 new_level,
             } => Some(format!("📝 Log level: {:?} → {:?}", old_level, new_level)),
             AgentFeedback::Trace { .. } => None,
-            AgentFeedback::ClarificationNeeded { prompt, .. } => {
-                Some(format!("❓ <b>需要您的确认</b>\n\n{}", Self::truncate_for_telegram(prompt, 3500)))
+            AgentFeedback::ClarificationNeeded { .. } => {
+                // Handled directly in listen_to_daemon with proper markdown rendering
+                None
             }
         }
     }
@@ -625,10 +626,12 @@ impl TelegramBotProvider {
                                                     })
                                                     .collect();
                                                 let keyboard = InlineKeyboardMarkup::new(buttons);
-                                                let escaped_prompt = teloxide::utils::html::escape(&prompt);
+                                                // Use proper markdown→HTML rendering (same as Output handler)
+                                                let (html_prompt, _images) = crate::markdown_renderer::render_markdown_to_telegram(&prompt);
+                                                let formatted_prompt = TelegramFeedbackFormatter::truncate_for_telegram(&format!("❓ <b>需要您的确认</b>\n\n{}", html_prompt), 4000);
                                                 let _ = bot.send_message(
                                                     chat_id,
-                                                    format!("❓ <b>需要您的确认</b>\n\n{}", escaped_prompt),
+                                                    &formatted_prompt,
                                                 )
                                                 .parse_mode(teloxide::types::ParseMode::Html)
                                                 .reply_markup(keyboard)
@@ -639,11 +642,18 @@ impl TelegramBotProvider {
                                                     (task_id.clone(), "clarification".to_string()),
                                                 );
                                             }
-                                            AgentFeedback::Output { content, is_final, silent, .. } => {
+                                            AgentFeedback::Output { task_id, content, is_final, silent, .. } => {
                                                 if !*silent && (*is_final || current_level.should_show(LogLevel::Verbose)) {
                                                     let (html_content, images) = crate::markdown_renderer::render_markdown_to_telegram(content);
                                                     let prefix = if *is_final { "✓" } else { "→" };
-                                                    let formatted = TelegramFeedbackFormatter::truncate_for_telegram(&format!("{} {}", prefix, html_content), 4000);
+                                                    
+                                                    // Append Task ID with native copy block for final outputs
+                                                    let body = if *is_final {
+                                                        format!("{} {}\n\n📝 Task ID:\n<pre><code>{}</code></pre>", prefix, html_content, task_id)
+                                                    } else {
+                                                        format!("{} {}", prefix, html_content)
+                                                    };
+                                                    let formatted = TelegramFeedbackFormatter::truncate_for_telegram(&body, 4000);
                                                     
                                                     // Send text
                                                     let _ = bot.send_message(chat_id, &formatted).parse_mode(teloxide::types::ParseMode::Html).await;
@@ -696,6 +706,14 @@ impl TelegramBotProvider {
                                                                 .parse_mode(teloxide::types::ParseMode::Html)
                                                                 .reply_markup(keyboard)
                                                                 .await;
+
+                                                            if let AgentFeedback::TaskCompleted { .. } = &feedback {
+                                                                let bot_clone = bot.clone();
+                                                                tokio::spawn(async move {
+                                                                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                                                                    let _ = bot_clone.delete_message(chat_id, teloxide::types::MessageId(msg_id)).await;
+                                                                });
+                                                            }
                                                         } else {
                                                             let _ = bot.send_message(chat_id, &formatted)
                                                                 .parse_mode(teloxide::types::ParseMode::Html)
@@ -830,14 +848,51 @@ impl TelegramBotProvider {
                     if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(regular_msg)) = q.message.clone() {
                          let _ = bot.edit_message_text(regular_msg.chat.id, regular_msg.id, format!("✅ *Task Completed or Inactive*: `{}`", task_id.replace('-', "\\-")))
                                 .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                                .reply_markup(InlineKeyboardMarkup::new(vec![vec![] as Vec<InlineKeyboardButton>])) // Remove keyboard
                                 .await;
+
+                         // Auto-delete the fallback message after 5 seconds
+                         let bot_clone = bot.clone();
+                         let chat_id_clone = regular_msg.chat.id;
+                         let msg_id_clone = regular_msg.id;
+                         tokio::spawn(async move {
+                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                             let _ = bot_clone.delete_message(chat_id_clone, msg_id_clone).await;
+                         });
                     }
                     return Ok(());
                 } else if action == "cancel" {
+                    let res = client.post(format!("{}/api/v1/tasks/{}/cancel", daemon_url, task_id)).send().await;
+                    if let Ok(r) = res {
+                        if r.status().is_success() {
+                            bot.answer_callback_query(q.id.clone())
+                                .text("Task Cancelled Successfully.")
+                                .show_alert(true)
+                                .await?;
+                            
+                            if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(regular_msg)) = q.message.clone() {
+                                let _ = bot.edit_message_text(regular_msg.chat.id, regular_msg.id, format!("🛑 *Task Cancelled*: `{}`", task_id.replace('-', "\\-")))
+                                    .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                                    .reply_markup(InlineKeyboardMarkup::new(vec![vec![] as Vec<InlineKeyboardButton>])) // Remove keyboard
+                                    .await;
+                                
+                                let bot_clone = bot.clone();
+                                let chat_id_clone = regular_msg.chat.id;
+                                let msg_id_clone = regular_msg.id;
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    let _ = bot_clone.delete_message(chat_id_clone, msg_id_clone).await;
+                                });
+                            }
+                            return Ok(());
+                        }
+                    }
+                    
                     bot.answer_callback_query(q.id.clone())
-                        .text("Cancel command is not implemented yet in the Daemon.")
+                        .text("Failed to cancel task. Either it's already finished or daemon error.")
                         .show_alert(true)
                         .await?;
+                        
                     return Ok(());
                 }
 

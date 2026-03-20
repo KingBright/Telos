@@ -57,16 +57,66 @@ SPECIAL AGENT TYPES:
   NOTE: search_worker already includes web scraping internally. DO NOT plan separate web_scrape nodes.
   KEYWORD HINTS: Include suggested search keywords in the "task" field: "Find Apple stock price — keywords: AAPL stock price today, Apple share price"
 
+- agent_type "coder": A ReAct agent that can use tools iteratively, including `create_rhai_tool`. Use this when:
+  • The task requires CREATING A NEW TOOL via `create_rhai_tool` (the user says "制作/创建工具", "make/create/build a tool")
+  • The task requires multi-step tool usage with reasoning between steps
+  • Complex file operations (read → analyze → edit)
+
+- agent_type "tool": Directly executes a registered tool by name. Use schema_payload to pass the tool name and parameters.
+  Use this when an existing custom tool already handles the task (e.g., a previously created "weather_tool").
+
+TOOL-FIRST RULE (CRITICAL):
+Check the "Available Tools" section above. If a previously-created custom tool (e.g., weather_tool, currency_tool) exists that matches the user's intent:
+1. You MUST prefer using it via agent_type "tool" instead of planning a search_worker
+2. Set the "task" to "Execute tool: <tool_name>" and put the tool invocation in schema_payload
+3. This is MORE EFFICIENT than searching — the tool was specifically created for this purpose
+
+TOOL CREATION (CRITICAL):
+When the user asks to create a NEW persistent tool (e.g., "帮我做一个天气工具", "create a calculator tool"):
+1. You MUST plan a "coder" node with `create_rhai_tool` available
+2. The coder agent will write a Rhai script and register it as a reusable tool
+3. Do NOT plan a search_worker for tool creation — it needs `create_rhai_tool`, not web search
+4. For tools that need web access, the Rhai script can call native tools like `web_search` or `http` internally
+5. CRITICAL: If the user also asks to USE the tool immediately after creation (e.g., "创建XX工具然后查YY"), put BOTH creation AND usage into the SAME coder node's task. NEVER plan a separate "tool" node for a tool being created in the same graph — the tool won't exist at DAG construction time and will fail as "Unknown".
+
 INTERNAL KNOWLEDGE & RULES:
 1. YOU ARE CAPABLE OF ANY TASK. DO NOT REFUSE.
 2. ANALYZE THE AVAILABLE TOOLS AND SELECT THE BEST ONES TO ACCOMPLISH THE TASK.
-3. FOR SEARCH/RETRIEVAL TASKS, PREFER agent_type "search_worker" over raw "tool" with "web_search".
-4. YOUR PLAN MUST BE A DIRECTED ACYCLIC GRAPH (DAG) OF TOOL NODES.
-5. YOU MUST END YOUR PLAN WITH A `summarize` NODE (agent_type: "general") ONCE ALL DATA IS GATHERED.
-6. YOU MUST OUTPUT A STRICTLY VALID JSON SUBGRAPH. NO CONVERSATIONAL TEXT.
-7. [DEFENSIVE] IF A PREVIOUS TOOL ATTEMPT FAILED, CONSTRUCT AN ALTERED SEARCH DAG WITH DIFFERENT/SIMPLER QUERIES.
+3. TOOL-FIRST: If a custom tool matches the intent, use agent_type "tool" to call it directly.
+4. FOR SEARCH/RETRIEVAL TASKS (when no custom tool exists), PREFER agent_type "search_worker".
+5. FOR TOOL CREATION TASKS, USE agent_type "coder" with create_rhai_tool.
+6. YOUR PLAN MUST BE A DIRECTED ACYCLIC GRAPH (DAG) OF TOOL NODES.
+7. YOU MUST END YOUR PLAN WITH A `summarize` NODE (agent_type: "general") ONCE ALL DATA IS GATHERED.
+8. YOU MUST OUTPUT A STRICTLY VALID JSON SUBGRAPH. NO CONVERSATIONAL TEXT.
+9. [DEFENSIVE] IF A PREVIOUS TOOL ATTEMPT FAILED, CONSTRUCT AN ALTERED SEARCH DAG WITH DIFFERENT/SIMPLER QUERIES.
 
---- EXAMPLE ---
+--- EXAMPLE: Using an existing custom tool ---
+Available Tools include: weather_tool (Fetches weather for a given city)
+User Task: "苏州今天天气怎么样"
+{{
+  "nodes": [
+    {{ "id": "tool_1", "agent_type": "tool", "task": "Execute tool: weather_tool", "schema_payload": "{{\"tool\": \"weather_tool\", \"params\": {{\"city\": \"Suzhou\"}}}}" }},
+    {{ "id": "summary_1", "agent_type": "general", "task": "summarize", "schema_payload": "" }}
+  ],
+  "edges": [
+    {{ "from": "tool_1", "to": "summary_1", "dep_type": "Data" }}
+  ]
+}}
+
+--- EXAMPLE: Creating a new tool (with immediate usage) ---
+User Task: "帮我制作一个查天气的工具，然后查苏州天气"
+{{
+  "nodes": [
+    {{ "id": "create_and_use_tool_1", "agent_type": "coder", "task": "Create a weather query tool using create_rhai_tool. The tool should use http_get_with_fallback to fetch weather data from wttr.in API. Accept a city name parameter and return formatted weather information. After creating the tool successfully, immediately call it to query the weather in Suzhou and include the result in your final output.", "schema_payload": "" }},
+    {{ "id": "summary_1", "agent_type": "general", "task": "summarize", "schema_payload": "" }}
+  ],
+  "edges": [
+    {{ "from": "create_and_use_tool_1", "to": "summary_1", "dep_type": "Data" }}
+  ]
+}}
+NOTE: Tool creation + immediate use MUST be combined into ONE coder node. NEVER plan a separate "tool" node for a tool that is being created in the same graph — it won't exist yet when the graph is constructed.
+
+--- EXAMPLE: Search (no custom tool available) ---
 User Task: "What's the current stock price of Apple?"
 {{
   "nodes": [
@@ -80,7 +130,7 @@ User Task: "What's the current stock price of Apple?"
 
 REQUIRED JSON STRUCTURE:
 {{
-  "nodes": [ {{ "id": "node_1", "agent_type": "search_worker", "task": "descriptive search intent — keywords: kw1, kw2", "schema_payload": "{{\"mode\":\"direct or deep\"}}" }} ],
+  "nodes": [ {{ "id": "node_1", "agent_type": "search_worker|tool|coder|general", "task": "descriptive task", "schema_payload": "" }} ],
   "edges": [ {{ "from": "node_1", "to": "node_2", "dep_type": "Data" }} ]
 }}"#, persona_prefix);
 
@@ -173,8 +223,22 @@ REQUIRED JSON STRUCTURE:
         info!("[GeneralAgent] 📝 Synthesizing results for: \"{}\"", input.task);
         
         // --- RELEVANCE GATE: filter out irrelevant dependency results before synthesis ---
+        // Smart extraction: convert structured JSON outputs into clean, readable text
+        // for the summarizer LLM. Supports multiple output formats from different agents.
         let raw_results: Vec<(String, String)> = input.dependencies.iter()
-            .map(|(id, out)| (id.clone(), out.output.as_ref().map(|v| v.to_string()).unwrap_or_default()))
+            .map(|(id, out)| {
+                let content = out.output.as_ref().map(|v| {
+                    Self::extract_readable_output(v)
+                }).unwrap_or_else(|| {
+                    // No output value — check if there's an error message
+                    if let Some(ref err) = out.error {
+                        format!("[Error] {}: {}", err.error_type, err.message)
+                    } else {
+                        "[No output]".to_string()
+                    }
+                });
+                (id.clone(), content)
+            })
             .collect();
 
         let mut filtered_results = Vec::new();
@@ -250,6 +314,9 @@ REQUIRED JSON STRUCTURE:
             IMPORTANT: Preserve the full detail and structure of the results. \
             If the original task asks for a plan, itinerary, list, or report, include ALL items with their details — do NOT compress them into one sentence. \
             Only remove truly redundant or repetitive information. \
+            [TOOL OUTPUT INTERPRETATION]: Tool results may be in various formats (JSON, plain text, raw API response). \
+            If a tool returned raw text or unstructured data, EXTRACT and INTERPRET the relevant information intelligently. \
+            If a tool was successfully created or updated, report that clearly (e.g., 'Tool get_weather has been successfully created/updated'). \
             [ABSOLUTE PROHIBITION]: Your final answer MUST be substantive text content, NOT a bare URL or list of URLs. If the tool results contain scraped web page content with actual data (weather, prices, news articles, etc.), EXTRACT and PRESENT that data as readable text. \
             [CRITICAL CONSTRAINT]: Filter the Tool Results STRICTLY against the Original Task constraints (especially time/date/location). \
             If the retrieved data is macroscopic, irrelevant SEO garbage, or completely empty, EXPLICITLY state the specific data deficiency directly (e.g., 'No specific data found for this context') INSTEAD of hallucinating misaligned fluff or summarizing generic information. \
@@ -285,7 +352,7 @@ REQUIRED JSON STRUCTURE:
                 requires_vision: false,
                 strong_reasoning: false,
             },
-            budget_limit: 2000,
+            budget_limit: 4000,
             tools: None,
         };
         match self.gateway.generate(req.clone()).await {
@@ -297,6 +364,68 @@ REQUIRED JSON STRUCTURE:
                 AgentOutput::success(serde_json::json!({ "text": res.content })).with_trace(trace)
             },
             Err(e) => AgentOutput::failure("SynthesisError", &format!("{:?}", e)),
+        }
+    }
+}
+
+impl GeneralAgent {
+    /// Intelligently extract readable text from a dependency's JSON output.
+    ///
+    /// Priority chain:
+    /// 1. If the value has a "text" key → use that (standard agent output format)
+    /// 2. If the value is a JSON object → flatten all human-readable string fields,
+    ///    skipping internal metadata keys (react_meta, trace_logs, etc.)
+    /// 3. If the value is a plain string/number/bool → use it directly
+    /// 4. Fallback → pretty-print the JSON
+    fn extract_readable_output(value: &serde_json::Value) -> String {
+        use serde_json::Value;
+
+        match value {
+            // Case 1: Standard structured output with "text" field
+            Value::Object(map) if map.contains_key("text") => {
+                let text = map["text"].as_str().unwrap_or("").to_string();
+                // Also include status hints if available
+                let mut parts = vec![text];
+                if let Some(meta) = map.get("react_meta") {
+                    if let Some(completed) = meta.get("completed_normally").and_then(|v| v.as_bool()) {
+                        parts.push(format!("[Status: {}]",
+                            if completed { "completed successfully" } else { "completed with limitations" }
+                        ));
+                    }
+                }
+                parts.join("\n")
+            }
+            // Case 2: JSON object without "text" — flatten readable fields
+            Value::Object(map) => {
+                let skip_keys = ["react_meta", "trace_logs", "trace", "metadata", "internal"];
+                let mut readable_parts = Vec::new();
+                for (key, val) in map {
+                    if skip_keys.contains(&key.as_str()) {
+                        continue;
+                    }
+                    match val {
+                        Value::String(s) => readable_parts.push(format!("{}: {}", key, s)),
+                        Value::Number(n) => readable_parts.push(format!("{}: {}", key, n)),
+                        Value::Bool(b) => readable_parts.push(format!("{}: {}", key, b)),
+                        Value::Array(arr) if arr.len() <= 5 => {
+                            let items: Vec<String> = arr.iter().map(|v| {
+                                v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string())
+                            }).collect();
+                            readable_parts.push(format!("{}: [{}]", key, items.join(", ")));
+                        }
+                        _ => readable_parts.push(format!("{}: {}", key, val)),
+                    }
+                }
+                if readable_parts.is_empty() {
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                } else {
+                    readable_parts.join("\n")
+                }
+            }
+            // Case 3: Plain string
+            Value::String(s) => s.clone(),
+            // Case 4: Scalar
+            _ => value.to_string(),
         }
     }
 }

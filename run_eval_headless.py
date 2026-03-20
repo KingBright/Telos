@@ -11,115 +11,115 @@ import requests, json, time, os, uuid, sys, re
 
 API = "http://127.0.0.1:8321/api/v1/run_sync"
 BASE_URL = "http://127.0.0.1:8321"
-ITER = 25
+ITER = 27
 TRACES_DIR = "test_traces"
 os.makedirs(TRACES_DIR, exist_ok=True)
 
 # ─── Test Cases ───────────────────────────────────────────────────────
 test_cases = [
-    # Category: Identity & Persona
+    # Category: Identity & Self-Awareness
     {
         "id": 1,
         "category": "Identity",
-        "query": "你是基于什么底层架构运行的？你的创造使命是什么？",
-        "description": "身份识别 + 开发者信息",
+        "query": "你和 ChatGPT 有什么本质区别？你有哪些独特的能力是它没有的？",
+        "description": "自我认知差异化 — 测试 SOUL persona 边界意识",
     },
-    # Category: Math & Logic
+    # Category: Math & Logic (应用题)
     {
         "id": 2,
         "category": "Math",
-        "query": "假设我在银行存了20000元，年利率是3.5%，复利计算，3年后我总共有多少钱？保留两位小数。",
-        "description": "多步数学运算",
+        "query": "某工厂有A、B两条生产线。A线每小时生产120件产品，B线每小时生产80件。客户订单需要4800件产品，但B线在运行3小时后发生故障停机维修2小时后恢复。请问从开工到完成全部订单，最少需要几小时？",
+        "description": "生产线应用题 — 需要分段计算",
     },
-    # Category: Common Knowledge
+    # Category: Knowledge (物理原理)
     {
         "id": 3,
         "category": "Knowledge",
-        "query": "木星的体积大约是地球的多少倍？它们的主要大气成分分别是什么？",
-        "description": "常识比较题",
+        "query": "为什么飞机在万米高空飞行时，机舱外温度可以达到零下50度，而机舱内却很温暖？请从工程和物理两个角度解释。",
+        "description": "物理常识+原理解释",
     },
-    # Category: Real-time Search
+    # Category: Real-time Search (金融)
     {
         "id": 4,
         "category": "Search",
-        "query": "请帮我查一下昨天谷歌母公司Alphabet的股票收盘价是多少？",
-        "description": "实时财经查询 — 需联网搜索",
+        "query": "比特币现在多少钱？以太坊呢？最近24小时涨了还是跌了？",
+        "description": "实时加密货币查询 — 双币种对比",
     },
-    # Category: Deep Research
+    # Category: Deep Research (新话题)
     {
         "id": 5,
         "category": "DeepResearch",
-        "query": "帮我深度调研一下目前固态电池技术的商业化落地现状以及主要厂商",
-        "description": "深度研究 — 多源汇总",
+        "query": "帮我深度调研一下2026年全球AI芯片市场的竞争格局，包括主要玩家（英伟达、AMD、Intel、华为、Google TPU等）和各自的技术路线",
+        "description": "AI芯片深度调研 — 新话题、多厂商",
     },
-    # Category: Time Awareness
+    # Category: Time Awareness (复合计算)
     {
         "id": 6,
         "category": "TimeAware",
-        "query": "距离今年的圣诞节还有多少天？",
-        "description": "时间感知 — 需系统时间上下文",
+        "query": "今天是星期几？本月还剩多少个工作日（不算周末）？",
+        "description": "复合时间计算 — 需要星期+日历推理",
     },
-    # Category: Coding (Simple)
+    # Category: Coding (Rust并发)
     {
         "id": 7,
         "category": "Coding",
-        "query": "用JavaScript写一个能够实现防抖(debounce)功能的函数，并给出一个简单用法示例",
-        "description": "简单编码任务",
+        "query": "用Rust写一个泛型的线程安全LRU Cache结构体，支持get、put和len方法，容量在初始化时指定，并写单元测试",
+        "description": "Rust泛型+并发+LRU算法",
     },
-    # Category: Knowledge Reasoning
+    # Category: Reasoning (技术+商业)
     {
         "id": 8,
         "category": "Reasoning",
-        "query": "请对比分析一下微服务架构中 Choreography（协同）和 Orchestration（编排）这两种模式的优缺点及适用场景",
-        "description": "概念对比推理",
+        "query": "请从技术生态和商业竞争两个角度分析，为什么 Rust 目前还没有完全取代 C++ 在系统编程领域的地位？未来5年你认为会改变吗？",
+        "description": "技术+商业混合推理 — 需要多维度分析",
     },
-    # Category: Ambiguous / Edge Case
+    # Category: Edge Case (符号输入)
     {
         "id": 9,
         "category": "EdgeCase",
-        "query": "怎么",
-        "description": "极短模糊指令 — 测试容错",
+        "query": "🤔",
+        "description": "极端表情输入 — 仅一个emoji",
     },
-    # Category: Multi-step Planning
+    # Category: Planning (旅行规划)
     {
         "id": 10,
         "category": "Planning",
-        "query": "我计划周末给朋友办一场大约10人的户外烧烤派对。预算2000元以内，请帮我列一个详尽的采购清单，包括食材、工具和娱乐项目。",
-        "description": "多步规划任务 — 需搜索+结构化输出",
+        "query": "我和3个朋友下周末想去成都吃火锅+看大熊猫，两天一夜，人均预算800元（不含交通），帮我规划行程，要考虑我的花生过敏。",
+        "description": "短途旅行规划 — 需结合用户偏好",
     },
-    # Category: Code + Explanation
+    # Category: Coding (Go设计模式)
     {
         "id": 11,
         "category": "Coding",
-        "query": "用Python实现一个简单的LRU Cache类，要求包含get和put方法，且时间复杂度均为O(1)，并加上关键注释",
-        "description": "带解释的编码任务 — 测试代码质量",
+        "query": "用Go语言实现一个并发安全的发布-订阅(pub/sub)模式，支持按topic过滤消息，并写一个使用示例",
+        "description": "Go语言设计模式 — 区别于JS/Python/Rust",
     },
-    # Category: Translation + Reasoning
+    # Category: Reasoning (跨学科假设推理)
     {
         "id": 12,
         "category": "Reasoning",
-        "query": "将 '纸上得来终觉浅，绝知此事要躬行' 翻译为英文，并结合现代职场环境阐述它的哲学指导意义",
-        "description": "翻译 + 文化推理",
+        "query": "如果地球突然停止自转（但公转不变），会发生什么？请从物理学、气象学和生物学三个角度分析。",
+        "description": "跨学科假设推理 — 需要多领域知识整合",
     },
     # Category: Memory - User Preference Storage & Recall
     {
         "id": 13,
         "category": "Memory",
-        "query": "请帮我记录一下：我对海鲜严重过敏，而且我不吃香菜",
-        "description": "用户偏好记忆存储 — 测试 memory_write 工具",
+        "query": "帮我记一下：我有乳糖不耐受，喝牛奶会拉肚子。还有我特别怕辣，微辣都受不了",
+        "description": "用户偏好记忆存储 — 新的健康信息",
     },
     # Category: Memory - Cross-session Recall
     {
         "id": 14,
         "category": "Memory",
-        "query": "考虑到我的饮食禁忌，今晚去吃日料合适吗？",
-        "description": "跨会话记忆回忆 — 测试 memory_read 工具",
+        "query": "考虑到我的饮食禁忌，下午想去喝杯奶茶合适吗？",
+        "description": "跨会话记忆回忆 — 测试乳糖不耐受的应用",
     },
     # Category: Memory - Conflict/Update
     {
         "id": 15,
         "category": "MemoryConflict",
-        "query": "不好意思我昨天记错了，其实我是对花生过敏，海鲜我是可以吃的！",
+        "query": "不好意思我之前说错了，我不是乳糖不耐受，我其实是对牛奶蛋白过敏，豆奶、燕麦奶这些植物奶我是可以喝的！",
         "description": "记忆冲突更新 — 测试 conflict detection",
     },
     # Category: Persona
@@ -133,22 +133,22 @@ test_cases = [
     {
         "id": 17,
         "category": "HistoryRecall",
-        "query": "我刚才是不是又修改了我的过敏原信息？最后确认的是什么过敏？",
+        "query": "我刚才是不是修改了我的饮食禁忌信息？最后确认的是什么情况？",
         "description": "近期历史回忆 — 窗口内，应直接从对话历史回答",
     },
     # Case 18: In-window contextual back-reference
     {
         "id": 18,
         "category": "HistoryRecall",
-        "query": "我们前面写的那个LRU Cache类，如果容量设为完全一样，它和普通的内置字典在删除元素倾向上有什么区别？",
-        "description": "上下文指代回忆 — 窗口内，测试'之前'代词消歧",
+        "query": "回头看看，我们前面写的那段Rust代码用了什么同步原语？如果改成无锁设计会有什么权衡？",
+        "description": "上下文指代回忆 + 延伸推理",
     },
     # Case 19: Out-of-window recall
     {
         "id": 19,
         "category": "DeepMemoryRecall",
-        "query": "回到我们刚开始算的那个存款利息的数学题，如果是单利计算，结果会差多少钱？",
-        "description": "深度记忆回忆 — 窗口外，应触发 memory_read 工具检索",
+        "query": "回到最开始的生产线问题，如果B线故障停机时间从2小时变成4小时，最少需要几小时完成订单？",
+        "description": "深度记忆回忆 — 窗口外，测试对生产线问题参数的回忆",
     },
     # Case 20: Multi-fact cross-turn recall
     {
@@ -175,21 +175,21 @@ test_cases = [
     {
         "id": 23,
         "category": "ToolCreation",
-        "query": "帮我创建一个名为 `get_crypto_price` 的工具，用于获取比特币(BTC)当前的美元价格，你可以用任何无需API Key的公共API。创建成功后请立刻调用一次并告诉我当前价格。",
-        "description": "动态工具自造与立即调用 — 测试 ScriptSandbox 和注册流",
+        "query": "帮我创建一个名为 `get_weather` 的工具，用于获取指定城市的当前天气信息。请使用 open-meteo.com 的免费API（不需要 API Key，示例：api.open-meteo.com/v1/forecast?latitude=31.30&longitude=120.62&current=temperature_2m,weather_code,wind_speed_10m,relative_humidity_2m&timezone=Asia/Shanghai）。创建成功后请立刻用这个工具查询苏州的天气并告诉我。",
+        "description": "动态工具自造 — 使用 open-meteo.com API（中国可访问，稳定可靠）",
     },
     # Case 24: Procedural Memory Setup (Learning a Workflow)
     {
         "id": 24,
         "category": "ProceduralSetup",
-        "query": "我这有一段存在安全隐患的SQL查询语句：`SELECT * FROM users WHERE username = '\" + userInput + \"' AND password = '\" + passInput + \"'`。请帮我指出它的漏洞并给出修复建议。在这之后，请把你的安全审查步骤提炼成一个名为 'SQL_Injection_Audit' 的经验模板存入你的程序记忆中。",
-        "description": "流程经验蒸馏 — 测试工作流模版提取",
+        "query": "帮我审查这段代码的安全隐患：`os.system(f'ping -c 4 {user_input}')`。请详细分析漏洞类型并给出修复方案。之后请把你的命令注入审查流程提炼成一个名为 'Command_Injection_Audit' 的经验模板存入你的程序记忆中。",
+        "description": "命令注入审查 — 测试新漏洞类型的流程蒸馏",
     },
     # Case 25: Procedural Memory Application (Reusing Workflow)
     {
         "id": 25,
         "category": "ProceduralApply",
-        "query": "我又发现了一段糟糕的代码：`cursor.execute(f\"UPDATE accounts SET balance = balance - {withdraw_amount} WHERE id = {user_id}\")`。请严格按照我们前一步总结的 'SQL_Injection_Audit' 流程来审查并修复它。",
+        "query": "又发现一段危险代码：`subprocess.call(f'convert {filename} output.pdf', shell=True)`，其中filename来自用户上传。请严格按照前一步总结的 'Command_Injection_Audit' 流程来审查并修复它。",
         "description": "流程经验重用 — 测试从 Procedural Memory 检索并实例化模版",
     }
 ]

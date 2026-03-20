@@ -209,6 +209,7 @@ mod tests {
             errors_encountered: vec![],
             success: false,
             sub_graph: None,
+            reused_workflow_ids: vec![],
         };
 
         let result = evaluator.detect_drift(&trace).await;
@@ -241,6 +242,7 @@ mod tests {
             errors_encountered: vec![],
             success: true,
             sub_graph: None,
+            reused_workflow_ids: vec![],
         };
 
         let skill = evaluator.distill_experience(&trace).await.expect("Should distill successfully");

@@ -11,20 +11,18 @@ pub mod search_worker;
 pub mod tester;
 
 // Re-export common dependencies that agents might need
-use async_trait::async_trait;
-use std::sync::Arc;
-use telos_core::{AgentInput, AgentOutput, AgentErrorDetail, ErrorSeverity, ErrorLayer, SystemRegistry};
-use telos_dag::ExecutableNode;
-use telos_model_gateway::gateway::GatewayManager;
+pub use async_trait::async_trait;
+pub use std::sync::Arc;
+pub use telos_core::{AgentInput, AgentOutput, AgentErrorDetail, ErrorSeverity, ErrorLayer, SystemRegistry};
+pub use telos_dag::ExecutableNode;
+pub use telos_model_gateway::gateway::GatewayManager;
 use telos_model_gateway::GatewayError;
 
 pub use architect::ArchitectAgent;
 pub use coder::CoderAgent;
-pub use evolutor::EvolutionAgent;
 pub use general::GeneralAgent;
 pub use researcher::DeepResearchAgent;
 pub use reviewer::ReviewAgent;
-pub use router::RouterAgent;
 pub use search_worker::SearchWorkerAgent;
 pub use tester::TestingAgent;
 
