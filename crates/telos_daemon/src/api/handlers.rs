@@ -48,7 +48,7 @@ use crate::core::metrics::*;
     if let Ok(entries) = telos_memory::engine::MemoryOS::retrieve_all(&*state.memory_os).await {
         for entry in &entries {
             match entry.memory_type {
-                telos_memory::MemoryType::Episodic | telos_memory::MemoryType::InteractionEvent | telos_memory::MemoryType::UserProfile => { episodic += 1; }
+                telos_memory::MemoryType::Episodic | telos_memory::MemoryType::InteractionEvent | telos_memory::MemoryType::UserProfileStatic | telos_memory::MemoryType::UserProfileDynamic => { episodic += 1; }
                 telos_memory::MemoryType::Semantic => { semantic += 1; }
                 telos_memory::MemoryType::Procedural => { procedural += 1; }
             }
@@ -142,28 +142,71 @@ use crate::core::metrics::*;
             serde_json::json!({"trace_id": trace_id_str}).to_string()
         ));
 
-        while let Ok(feedback) = rx.recv().await {
-            match feedback {
-                AgentFeedback::TaskCompleted { task_id, summary } if task_id == trace_id_str => {
-                    let summary_json = serde_json::to_string(&summary).unwrap_or_default();
-                    yield Ok(Event::default().event("completed").data(summary_json));
-                    break;
-                }
-                AgentFeedback::Output { task_id, content, is_final, .. } if task_id == trace_id_str => {
-                    if is_final {
-                        yield Ok(Event::default().event("output").data(content));
-                    } else {
-                        yield Ok(Event::default().event("heartbeat").data(content));
+        // Idle timeout: if no event arrives for 300s, the task is likely stalled.
+        // Complex tasks that keep producing heartbeats will never trigger this.
+        let idle_timeout = tokio::time::Duration::from_secs(300);
+
+        loop {
+            match tokio::time::timeout(idle_timeout, rx.recv()).await {
+                Ok(Ok(feedback)) => {
+                    match feedback {
+                        AgentFeedback::TaskCompleted { task_id, summary } if task_id == trace_id_str => {
+                            let summary_json = serde_json::to_string(&summary).unwrap_or_default();
+                            yield Ok(Event::default().event("completed").data(summary_json));
+                            break;
+                        }
+                        AgentFeedback::Output { task_id, content, is_final, .. } if task_id == trace_id_str => {
+                            if is_final {
+                                yield Ok(Event::default().event("output").data(content));
+                            } else {
+                                yield Ok(Event::default().event("heartbeat").data(content));
+                            }
+                        }
+                        AgentFeedback::ClarificationNeeded { task_id, prompt, options, .. } if task_id == trace_id_str => {
+                            let data = serde_json::json!({
+                                "prompt": prompt,
+                                "options": options,
+                            });
+                            yield Ok(Event::default().event("clarification").data(data.to_string()));
+                        }
+                        AgentFeedback::ProgressUpdate { task_id, progress } if task_id == trace_id_str => {
+                            let data = serde_json::json!({
+                                "type": "progress",
+                                "completed": progress.completed,
+                                "total": progress.total,
+                            });
+                            yield Ok(Event::default().event("heartbeat").data(data.to_string()));
+                        }
+                        AgentFeedback::NodeStarted { task_id, node_id, detail } if task_id == trace_id_str => {
+                            let data = serde_json::json!({
+                                "type": "node_started",
+                                "node_id": node_id,
+                                "task_type": detail.task_type,
+                            });
+                            yield Ok(Event::default().event("heartbeat").data(data.to_string()));
+                        }
+                        AgentFeedback::StateChanged { task_id, current_node, status } if task_id == trace_id_str => {
+                            let data = serde_json::json!({
+                                "type": "state_changed",
+                                "node": current_node,
+                                "status": format!("{:?}", status),
+                            });
+                            yield Ok(Event::default().event("heartbeat").data(data.to_string()));
+                        }
+                        _ => {}
                     }
                 }
-                AgentFeedback::ClarificationNeeded { task_id, prompt, options, .. } if task_id == trace_id_str => {
-                    let data = serde_json::json!({
-                        "prompt": prompt,
-                        "options": options,
-                    });
-                    yield Ok(Event::default().event("clarification").data(data.to_string()));
+                Ok(Err(_)) => {
+                    // Channel closed
+                    break;
                 }
-                _ => {}
+                Err(_) => {
+                    // Idle timeout: no event for 300s — task is likely stalled
+                    yield Ok(Event::default().event("error").data(
+                        "Task stalled: no activity for 300s"
+                    ));
+                    break;
+                }
             }
         }
     };
@@ -596,3 +639,135 @@ pub async fn workflows_summary(
     }
 }
 
+use telos_core::schedule::MissionStatus;
+use telos_memory::engine::MissionStore;
+
+/// GET /api/v1/schedules
+pub async fn get_schedules(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut missions = state.memory_os.retrieve_missions().await.unwrap_or_default();
+    // sort by next_run_at ascending
+    missions.sort_by_key(|m| m.next_run_at);
+    Json(serde_json::json!({
+        "schedules": missions
+    }))
+}
+
+/// DELETE /api/v1/schedules/:id
+pub async fn cancel_schedule(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    match state.memory_os.delete_mission(&id).await {
+        Ok(_) => Json(serde_json::json!({ "status": "success" })),
+        Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
+    }
+}
+
+/// GET /api/v1/schedules/metrics
+pub async fn schedules_metrics(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HistoryQuery>,
+) -> Json<serde_json::Value> {
+    let mut total_active = 0;
+    let mut total_completed = 0;
+    let mut total_failed = 0;
+    let mut total_executions = 0;
+
+    if let Ok(missions) = state.memory_os.retrieve_missions().await {
+         for m in missions {
+             match m.status {
+                MissionStatus::Active => total_active += 1,
+                MissionStatus::Completed => total_completed += 1,
+                MissionStatus::Failed => total_failed += 1,
+                _ => {}
+             }
+             total_executions += m.execute_count;
+         }
+    }
+    Json(serde_json::json!({
+        "range": params.range,
+        "metrics": {
+            "total_active": total_active,
+            "total_completed": total_completed,
+            "total_failed": total_failed,
+            "total_executions": total_executions,
+        }
+    }))
+}
+
+/// GET /api/v1/metrics/performance?range=day
+/// Returns performance summary (avg/max latency) + time-bucketed trends
+pub async fn metrics_performance(
+    axum::extract::Query(params): axum::extract::Query<HistoryQuery>,
+) -> Json<serde_json::Value> {
+    let (from, to) = range_to_bounds(&params.range);
+
+    if let Some(store) = crate::core::metrics_store::METRICS_STORE.get() {
+        let perf = store.by_performance(from, to);
+
+        let llm_avg = if perf.llm_count > 0 { perf.llm_total_ms / perf.llm_count as u64 } else { 0 };
+        let node_avg = if perf.node_count > 0 { perf.node_total_ms / perf.node_count as u64 } else { 0 };
+        let mem_avg = if perf.memory_count > 0 { perf.memory_total_ms / perf.memory_count as u64 } else { 0 };
+        let ctx_avg = if perf.ctx_count > 0 { perf.ctx_total_ms / perf.ctx_count as u64 } else { 0 };
+
+        // Node breakdown by type
+        let node_by_type: Vec<serde_json::Value> = perf.node_by_type.iter().map(|(t, (c, ms))| {
+            serde_json::json!({
+                "type": t,
+                "count": c,
+                "avg_ms": if *c > 0 { *ms / *c as u64 } else { 0 },
+                "total_ms": ms,
+            })
+        }).collect();
+
+        // Memory breakdown by query type
+        let mem_by_type: Vec<serde_json::Value> = perf.memory_by_type.iter().map(|(t, (c, ms))| {
+            serde_json::json!({
+                "type": t,
+                "count": c,
+                "avg_ms": if *c > 0 { *ms / *c as u64 } else { 0 },
+                "total_ms": ms,
+            })
+        }).collect();
+
+        // Time-bucketed trends
+        let bucket_ms: u64 = match params.range.as_str() {
+            "hour" => 5 * 60_000,
+            "day" => 3_600_000,
+            "week" => 24 * 3_600_000,
+            "month" => 24 * 3_600_000,
+            "year" => 7 * 24 * 3_600_000,
+            "all" => 30 * 24 * 3_600_000,
+            _ => 3_600_000,
+        };
+        let buckets = store.aggregate_buckets(from, to, bucket_ms);
+        let trend: Vec<serde_json::Value> = buckets.iter().map(|b| {
+            let m = &b.metrics;
+            serde_json::json!({
+                "bucket_start_ms": b.bucket_start_ms,
+                "llm_count": m.llm_total_requests,
+                "llm_avg_ms": if m.llm_total_requests > 0 { m.llm_call_total_elapsed_ms / m.llm_total_requests as u64 } else { 0 },
+                "node_count": m.node_exec_count,
+                "node_avg_ms": if m.node_exec_count > 0 { m.node_exec_total_ms / m.node_exec_count as u64 } else { 0 },
+                "memory_count": m.memory_retrieval_count,
+                "memory_avg_ms": if m.memory_retrieval_count > 0 { m.memory_retrieval_total_ms / m.memory_retrieval_count as u64 } else { 0 },
+                "ctx_count": m.context_compression_count,
+                "ctx_avg_ms": if m.context_compression_count > 0 { m.context_compression_total_ms / m.context_compression_count as u64 } else { 0 },
+            })
+        }).collect();
+
+        Json(serde_json::json!({
+            "range": params.range,
+            "summary": {
+                "llm": { "count": perf.llm_count, "avg_ms": llm_avg, "max_ms": perf.llm_max_ms },
+                "node": { "count": perf.node_count, "avg_ms": node_avg, "max_ms": perf.node_max_ms, "by_type": node_by_type },
+                "memory": { "count": perf.memory_count, "avg_ms": mem_avg, "max_ms": perf.memory_max_ms, "total_results": perf.memory_total_results, "by_type": mem_by_type },
+                "context": { "count": perf.ctx_count, "avg_ms": ctx_avg, "max_ms": perf.ctx_max_ms },
+                "routes": { "direct_reply": perf.route_direct, "expert": perf.route_expert },
+            },
+            "trend_buckets": trend,
+        }))
+    } else {
+        Json(serde_json::json!({"error": "metrics store not initialized"}))
+    }
+}

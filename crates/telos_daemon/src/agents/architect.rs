@@ -55,7 +55,7 @@ impl ExpertAgent for ArchitectAgent {
         let mut template_context = String::new();
         let mut template_descriptions: Vec<String> = Vec::new();
         if let Some(mem_any) = _registry.get_memory_os() {
-            if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+            if let Ok(mem_os) = mem_any.clone().downcast::<telos_memory::engine::RedbGraphStore>() {
                 use telos_memory::integration::MemoryIntegration;
                 if let Ok(templates) = mem_os.retrieve_procedural_memories(input.task.clone()).await {
                     if !templates.is_empty() {

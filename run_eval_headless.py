@@ -1,218 +1,377 @@
 #!/usr/bin/env python3
 """
-Telos Agent Evaluation Suite — Iteration 16 (Post Memory OS Upgrade)
+Telos Agent Evaluation Suite — Iteration 32 (Memory System Refinement)
 Tests all agent categories via /api/v1/run_sync SSE endpoint.
+
+UPDATED TEST CASES — personalized scenarios based on actual user profile.
+Test cases now cover personal info grounding (Rust developer in Suzhou,
+game/anime/history enthusiast, Tesla → BYD vehicle update), memory CRUD
+with conflict resolution, and all agent categories.
 
 Categories: Identity, Math, Common Knowledge, Real-time Search,
             Deep Research, Time Awareness, Coding, Knowledge Reasoning,
-            Ambiguous/Edge, Multi-step Planning, Memory, Persona
+            Ambiguous/Edge, Multi-step Planning, Memory, Persona,
+            Tool Creation, Procedural Memory, Scheduled Missions
 """
 import requests, json, time, os, uuid, sys, re
 
 API = "http://127.0.0.1:8321/api/v1/run_sync"
 BASE_URL = "http://127.0.0.1:8321"
-ITER = 29
+ITER = 32
 TRACES_DIR = "test_traces"
 os.makedirs(TRACES_DIR, exist_ok=True)
 
 # ─── Test Cases ───────────────────────────────────────────────────────
 test_cases = [
-    # Category: Identity & Self-Awareness
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Identity & Self-Awareness ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 1,
         "category": "Identity",
-        "query": "你和 ChatGPT 有什么本质区别？你有哪些独特的能力是它没有的？",
-        "description": "自我认知差异化 — 测试 SOUL persona 边界意识",
+        "query": "如果有人说你只是一个'API套壳'的产品，你会怎么反驳？请从你的架构独特性出发，说明你和市面上其他AI助手的根本差异。",
+        "description": "自我架构认知 — 测试 Telos 对自身 DAG/Memory/Tool 架构的理解",
     },
-    # Category: Math & Logic (应用题)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Math & Logic ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 2,
         "category": "Math",
-        "query": "某工厂有A、B两条生产线。A线每小时生产120件产品，B线每小时生产80件。客户订单需要4800件产品，但B线在运行3小时后发生故障停机维修2小时后恢复。请问从开工到完成全部订单，最少需要几小时？",
-        "description": "生产线应用题 — 需要分段计算",
+        "query": "小明有一个8升桶和一个5升桶，水龙头无限量供水。他需要精确量出6升水。请给出最少步骤的方案，并说明每步后两个桶里分别有多少水。",
+        "description": "经典量水问题 — 需要搜索/回溯推理",
     },
-    # Category: Knowledge (物理原理)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Knowledge (生物学) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 3,
         "category": "Knowledge",
-        "query": "为什么飞机在万米高空飞行时，机舱外温度可以达到零下50度，而机舱内却很温暖？请从工程和物理两个角度解释。",
-        "description": "物理常识+原理解释",
+        "query": "章鱼有三颗心脏，它们分别负责什么功能？如果切断其中一颗会怎样？另外，章鱼的血液为什么是蓝色的？",
+        "description": "生物学冷知识 — 章鱼循环系统",
     },
-    # Category: Real-time Search (金融)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Real-time Search (体育) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 4,
         "category": "Search",
-        "query": "比特币现在多少钱？以太坊呢？最近24小时涨了还是跌了？",
-        "description": "实时加密货币查询 — 双币种对比",
+        "query": "2026年F1赛季目前车手积分榜前三名是谁？最近一站比赛是在哪里举行的，冠军是谁？",
+        "description": "实时体育赛事 — 2026 F1赛季最新数据",
     },
-    # Category: Deep Research (新话题)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Deep Research (贴近用户 Rust 兴趣) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 5,
         "category": "DeepResearch",
-        "query": "帮我深度调研一下2026年全球AI芯片市场的竞争格局，包括主要玩家（英伟达、AMD、Intel、华为、Google TPU等）和各自的技术路线",
-        "description": "AI芯片深度调研 — 新话题、多厂商",
+        "query": "帮我深度调研一下 2026 年 Rust 异步运行时的最新生态格局。重点对比 tokio、async-std、smol、glommio 这四个运行时在以下维度的差异：性能基准测试数据、io_uring 支持情况、生态库兼容性、以及各自适用的场景。最后给出一份选型建议矩阵。",
+        "description": "Rust异步运行时深度调研 — 贴合用户技术栈",
     },
-    # Category: Time Awareness (复合计算)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Time Awareness (贴近苏州) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 6,
         "category": "TimeAware",
-        "query": "今天是星期几？本月还剩多少个工作日（不算周末）？",
-        "description": "复合时间计算 — 需要星期+日历推理",
+        "query": "距离2026年国庆节还有多少天？如果我从今天开始每天存100元，到国庆能存多少钱？",
+        "description": "时间推理+简单计算 — 需要知道今天日期",
     },
-    # Category: Coding (Rust并发)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Coding (Rust — 贴合用户主力语言) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 7,
         "category": "Coding",
-        "query": "用Rust写一个泛型的线程安全LRU Cache结构体，支持get、put和len方法，容量在初始化时指定，并写单元测试",
-        "description": "Rust泛型+并发+LRU算法",
+        "query": "用 Rust 实现一个无锁的 MPSC 环形缓冲区（ring buffer），要求：1) 使用 AtomicUsize 做 head/tail 索引 2) 支持泛型 T: Send 3) 提供 try_push 和 try_pop 方法，满时/空时返回 None 4) 附带完整的 #[cfg(test)] 模块，至少包含并发读写正确性测试",
+        "description": "Rust无锁数据结构 — 贴合用户专业领域",
     },
-    # Category: Reasoning (技术+商业)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Reasoning (科学哲学) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 8,
         "category": "Reasoning",
-        "query": "请从技术生态和商业竞争两个角度分析，为什么 Rust 目前还没有完全取代 C++ 在系统编程领域的地位？未来5年你认为会改变吗？",
-        "description": "技术+商业混合推理 — 需要多维度分析",
+        "query": "费米悖论问的是：宇宙这么大这么老，为什么我们没有找到外星文明？请列出至少三种主流的解释假说，并说说你认为哪个最有说服力，为什么。",
+        "description": "科学哲学推理 — 费米悖论开放性分析",
     },
-    # Category: Edge Case (符号输入)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Edge Case ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 9,
         "category": "EdgeCase",
-        "query": "🤔",
-        "description": "极端表情输入 — 仅一个emoji",
+        "query": "请把这段话反过来念：'苏州园林甲天下'，然后用每个字造一个四字成语。",
+        "description": "字符串反转+创意造句 — 中文字符级操作+输出足够长",
     },
-    # Category: Planning (旅行规划)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Planning (贴近个人兴趣 — 游戏/历史) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 10,
         "category": "Planning",
-        "query": "我和3个朋友下周末想去成都吃火锅+看大熊猫，两天一夜，人均预算800元（不含交通），帮我规划行程，要考虑我的花生过敏。",
-        "description": "短途旅行规划 — 需结合用户偏好",
+        "query": "我打算利用周末两天时间在苏州做一次'三国文化'主题的自驾游。请帮我规划路线，包括常熟的虞山（与虞仲传说相关）、苏州的盘门（伍子胥故事）等三国前后的历史遗迹，还要穿插推荐当地特色美食（但注意我对芒果严重过敏），住宿最好在平江路附近的精品民宿。预算控制在2000元以内。",
+        "description": "个性化旅行计划 — 结合苏州本地+历史爱好+过敏信息",
     },
-    # Category: Coding (Go设计模式)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Coding (Python) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 11,
         "category": "Coding",
-        "query": "用Go语言实现一个并发安全的发布-订阅(pub/sub)模式，支持按topic过滤消息，并写一个使用示例",
-        "description": "Go语言设计模式 — 区别于JS/Python/Rust",
+        "query": "用Python写一个命令行工具，能够读取CSV文件并自动生成数据分析摘要。要求：1) 自动检测每列的数据类型（数值、日期、文本） 2) 对数值列输出均值/中位数/标准差 3) 对文本列输出唯一值数量和最常见的前3个值 4) 结果打印为格式化的表格。请使用标准库+csv模块，不要依赖pandas。",
+        "description": "Python CLI工具 — 纯标准库数据分析",
     },
-    # Category: Reasoning (跨学科假设推理)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Reasoning (历史 — 贴合用户兴趣) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 12,
         "category": "Reasoning",
-        "query": "如果地球突然停止自转（但公转不变），会发生什么？请从物理学、气象学和生物学三个角度分析。",
-        "description": "跨学科假设推理 — 需要多领域知识整合",
+        "query": "三国时期诸葛亮的'隆中对'战略提出了'跨有荆益，联吴抗曹'的大计。请从现代地缘政治和博弈论的角度分析：这个战略在执行中有哪些结构性矛盾？为什么最终'联吴'走向破裂？如果你是诸葛亮的战略顾问，你会如何修正这个方案？",
+        "description": "历史+博弈论推理 — 贴合用户的三国/历史爱好",
     },
-    # Category: Memory - User Preference Storage & Recall
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Memory — Store New Facts (个人真实信息) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 13,
         "category": "Memory",
-        "query": "帮我记一下：我有乳糖不耐受，喝牛奶会拉肚子。还有我特别怕辣，微辣都受不了",
-        "description": "用户偏好记忆存储 — 新的健康信息",
+        "query": "帮我记住以下信息：我叫金亮，是一个 Rust 开发者，现在住在苏州。我的车是一辆白色特斯拉 Model Y，车牌号苏E·88888。我对芒果严重过敏，另外我是三国历史和《原神》的忠实粉丝。",
+        "description": "记忆存储 — 真实个人信息（姓名+职业+城市+车辆+过敏+兴趣）",
     },
-    # Category: Memory - Cross-session Recall
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Memory — Contextual Recall (过敏应用) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 14,
         "category": "Memory",
-        "query": "考虑到我的饮食禁忌，下午想去喝杯奶茶合适吗？",
-        "description": "跨会话记忆回忆 — 测试乳糖不耐受的应用",
+        "query": "同事从泰国出差回来送了我一箱热带水果，里面有芒果、山竹、榴莲和火龙果。哪些我可以放心吃？",
+        "description": "记忆应用 — 需要回忆芒果过敏并自动警告",
     },
-    # Category: Memory - Conflict/Update
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Memory — Update/Conflict Resolution ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 15,
         "category": "MemoryConflict",
-        "query": "不好意思我之前说错了，我不是乳糖不耐受，我其实是对牛奶蛋白过敏，豆奶、燕麦奶这些植物奶我是可以喝的！",
-        "description": "记忆冲突更新 — 测试 conflict detection",
+        "query": "更正一下，我最近换车了。旧的白色特斯拉 Model Y 已经卖掉了，现在开的是一辆黑色比亚迪汉EV，新车牌是苏E·66666。请帮我更新记忆。",
+        "description": "记忆更新 — 测试旧信息覆盖/冲突处理（Tesla→BYD）",
     },
-    # Category: Persona
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Persona ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 16,
         "category": "Persona",
-        "query": "如果遇到你无法解决或者是系统错误的情况，你通常会表现出什么样的态度？",
-        "description": "人格独立性 — 测试 SOUL persona",
+        "query": "用一段话描述你的性格特点和处事风格。你觉得自己更像哪个知名人物或虚构角色？为什么？",
+        "description": "人格自我描述 — 测试 SOUL persona 一致性",
     },
-    # Case 17: In-window recall
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: History Recall — Vehicle Update Confirmation ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 17,
         "category": "HistoryRecall",
-        "query": "我刚才是不是修改了我的饮食禁忌信息？最后确认的是什么情况？",
-        "description": "近期历史回忆 — 窗口内，应直接从对话历史回答",
+        "query": "对了，我更新完的车辆信息是什么来着？牌号和颜色帮我确认一下。",
+        "description": "近期历史回忆 — 确认车辆更新（应回答比亚迪汉EV/苏E·66666）",
     },
-    # Case 18: In-window contextual back-reference
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Cross-turn Context — Code Reference ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 18,
         "category": "HistoryRecall",
-        "query": "回头看看，我们前面写的那段Rust代码用了什么同步原语？如果改成无锁设计会有什么权衡？",
-        "description": "上下文指代回忆 + 延伸推理",
+        "query": "回头看一下我们前面写的那个Rust环形缓冲区代码，它用了哪些Rust高级特性？如果要让它支持动态扩容应该怎么改？",
+        "description": "上下文指代 + 技术延伸（引用Case 7的Rust代码）",
     },
-    # Case 19: Out-of-window recall
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Deep Memory Recall — Problem Mutation ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 19,
         "category": "DeepMemoryRecall",
-        "query": "回到最开始的生产线问题，如果B线故障停机时间从2小时变成4小时，最少需要几小时完成订单？",
-        "description": "深度记忆回忆 — 窗口外，测试对生产线问题参数的回忆",
+        "query": "我们之前讨论的量水问题，如果把条件改成需要量出7升水（桶还是8升和5升），最少需要几步？",
+        "description": "深度记忆回忆 — 回到早期问题并修改条件",
     },
-    # Case 20: Multi-fact cross-turn recall
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Multi-fact Summary ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 20,
         "category": "HistoryRecall",
-        "query": "回顾一下我们聊到现在，你都掌握了关于我个人的哪些健康和偏好信息？",
-        "description": "跨轮次摘要 — 需整合多轮对话",
+        "query": "总结一下到目前为止你了解的关于我的所有个人信息（姓名、职业、城市、车辆、过敏、兴趣爱好等）。",
+        "description": "跨轮次信息汇总 — 需要整合多轮记忆（应包含金亮/Rust/苏州/比亚迪/芒果过敏/三国/原神）",
     },
-    # Case 21: Implicit preference application from memory
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Implicit Preference Application (过敏+兴趣) ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 21,
         "category": "PreferenceApplication",
-        "query": "帮我推荐三道适合做今晚晚餐的简单家常菜",
-        "description": "隐式偏好应用 — 测试agent是否主动避开花生/香菜等忌口",
+        "query": "下周末想请朋友们来家里聚餐，帮我设计一个6人份的菜单。甜品也要有，最好能和我喜欢的游戏《原神》来个主题联动。",
+        "description": "隐式偏好应用 — 测试是否自动避开芒果+融合原神兴趣",
     },
-    # Case 22: False memory test
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: False Memory Guard ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 22,
         "category": "FalseMemoryGuard",
-        "query": "我们之前是不是讨论过怎么修理漏水的马桶？",
-        "description": "虚假记忆防护 — 测试agent不会捏造不存在的对话",
+        "query": "我记得我们之前好像一起调试过一个Go语言的gRPC服务端的问题，你还记得当时报的是什么错吗？",
+        "description": "虚假记忆防护 — 从未讨论过Go/gRPC",
     },
-    # Case 23: Tool Creation & Dynamic Registration
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Tool Creation ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 23,
         "category": "ToolCreation",
-        "query": "帮我创建一个名为 `get_weather` 的工具，用于获取指定城市的当前天气信息。请使用 open-meteo.com 的免费API（不需要 API Key，示例：api.open-meteo.com/v1/forecast?latitude=31.30&longitude=120.62&current=temperature_2m,weather_code,wind_speed_10m,relative_humidity_2m&timezone=Asia/Shanghai）。创建成功后请立刻用这个工具查询苏州的天气并告诉我。",
-        "description": "动态工具自造 — 使用 open-meteo.com API（中国可访问，稳定可靠）",
+        "query": "帮我创建一个名为 `convert_units` 的工具，用于单位换算。支持：长度（米↔英尺）、重量（千克↔磅）、温度（摄氏↔华氏）。创建成功后，请用这个工具帮我把 180cm 换算成英尺，以及 72°F 换算成摄氏度。",
+        "description": "动态工具自造 — 纯逻辑计算型（不依赖外部API）",
     },
-    # Case 24: Procedural Memory Setup (Learning a Workflow)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Procedural Memory — Store ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 24,
         "category": "ProceduralSetup",
-        "query": "帮我审查这段代码的安全隐患：`os.system(f'ping -c 4 {user_input}')`。请详细分析漏洞类型并给出修复方案。之后请把你的命令注入审查流程提炼成一个名为 'Command_Injection_Audit' 的经验模板存入你的程序记忆中。",
-        "description": "命令注入审查 — 测试新漏洞类型的流程蒸馏",
+        "query": "帮我审查这段Rust代码的安全隐患：`let query = format!(\"SELECT * FROM users WHERE name = '{}'\", user_input); conn.execute(&query, [])?;` 请详细分析漏洞类型并给出修复方案（使用参数化查询）。之后请把你的SQL注入审查流程提炼成一个名为 'SQL_Injection_Audit' 的经验模板存入程序记忆。",
+        "description": "SQL注入审查（Rust版本）— 贴合用户主力语言 + 流程蒸馏",
     },
-    # Case 25: Procedural Memory Application (Reusing Workflow)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Procedural Memory — Apply ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 25,
         "category": "ProceduralApply",
-        "query": "又发现一段危险代码：`subprocess.call(f'convert {filename} output.pdf', shell=True)`，其中filename来自用户上传。请严格按照前一步总结的 'Command_Injection_Audit' 流程来审查并修复它。",
-        "description": "流程经验重用 — 测试从 Procedural Memory 检索并实例化模版",
+        "query": "又发现一段可疑的Rust代码：`conn.execute(&format!(\"DELETE FROM orders WHERE id = {}\", order_id), [])?;` 请严格按照前一步总结的 'SQL_Injection_Audit' 流程来审查并修复它。",
+        "description": "流程经验重用 — 测试 SQL_Injection_Audit 模板检索和应用",
     },
-    # Case 26: Relevance Filtering Check (Gate 1 & 2)
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Relevance Filter ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 26,
         "category": "RelevanceFilter",
-        "query": "帮我审查这段前端React组件代码的UI响应式设计是否合理：`<div className='flex md:block'>...</div>`",
-        "description": "相关性过滤 — 确保不会错误匹配、强制应用后端的 Command_Injection_Audit 模板",
+        "query": "帮我看看这段CSS动画代码的性能问题：`@keyframes slide { from { left: 0; } to { left: 100%; } }` 用了 `left` 属性做动画。",
+        "description": "相关性过滤 — 前端CSS不应触发 SQL_Injection_Audit 模板",
     },
-    # Case 27: Progressive Discovery
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Progressive Discovery ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 27,
         "category": "ProgressiveDiscovery",
-        "query": "请帮我查一下杭州现在的天气怎么样？",
-        "description": "渐进式暴露 — agent初始没有天气工具，需要先discover再调用",
+        "query": "帮我查一下现在苏州的空气质量指数(AQI)怎么样？PM2.5是多少？",
+        "description": "渐进式暴露 — 需要发现并使用工具获取实时数据",
     },
-    # Case 28: Tool Mutation
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Tool Mutation ──
+    # ══════════════════════════════════════════════════════════════════
     {
         "id": 28,
         "category": "ToolMutation",
-        "query": "帮我写一个工具 `get_crypto_price_v2` 来获取加密货币价格，但故意在代码里写错一个拼写（比如 fetch 拼成 fethc）。执行失败后，请利用 mutate_tool 修复它并重新告诉我比特币的价格。",
-        "description": "工具基因突变 — 测试执行失败触发突变机制闭环",
-    }
+        "query": "帮我创建一个工具 `get_exchange_rate_v2` 来获取汇率信息，使用 open.er-api.com/v6/latest/USD 这个免费API。但请故意在代码里写一个小错误（比如把URL路径拼错）。执行失败后，请利用 mutate_tool 修复它，然后告诉我1美元等于多少人民币。",
+        "description": "工具基因突变 — 故意出错→修复→验证闭环",
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Scheduled Mission ──
+    # ══════════════════════════════════════════════════════════════════
+    {
+        "id": 29,
+        "category": "ScheduledMission",
+        "query": "帮我设置一个定时任务：每周一早上9点检查苏州的天气预报并推送给我，如果有雨就提醒我带伞。请用 schedule_mission 工具创建，cron表达式要正确。",
+        "description": "定时任务创建 — 结合用户所在城市苏州",
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Mission Management ──
+    # ══════════════════════════════════════════════════════════════════
+    {
+        "id": 30,
+        "category": "ScheduledMission",
+        "query": "列出所有正在运行的定时任务，然后把刚才创建的天气提醒任务取消掉。取消后再确认一下是否成功删除了。",
+        "description": "定时任务管理 — list + cancel + verify",
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Multi-language ──
+    # ══════════════════════════════════════════════════════════════════
+    {
+        "id": 31,
+        "category": "MultiLang",
+        "query": "请用英文写一首关于'人工智能'的五行俳句(Haiku: 5-7-5音节结构)，然后翻译成中文，并解释你是如何控制音节数的。",
+        "description": "多语言创作 — 英文俳句创作+翻译+过程解释",
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── NEW: Memory — Question Guard (P1 fix verification) ──
+    # ══════════════════════════════════════════════════════════════════
+    {
+        "id": 32,
+        "category": "MemoryQuestionGuard",
+        "query": "你还记得我喜欢什么颜色吗？我之前有没有跟你说过？",
+        "description": "提问防护 — 测试P1修复：不应从疑问句中提取虚假事实",
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── NEW: Memory — Hobby Contextual Application ──
+    # ══════════════════════════════════════════════════════════════════
+    {
+        "id": 33,
+        "category": "PreferenceApplication",
+        "query": "推荐5款和《原神》风格类似的开放世界游戏，考虑到我是用 Rust 做后端开发的，如果其中有使用 Rust 编写的游戏引擎也请特别标注。",
+        "description": "兴趣关联推荐 — 测试是否能结合用户的原神+Rust双重兴趣",
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── NEW: Knowledge — Suzhou-specific local knowledge ──
+    # ══════════════════════════════════════════════════════════════════
+    {
+        "id": 34,
+        "category": "Knowledge",
+        "query": "苏州的拙政园、留园、网师园和沧浪亭并称'苏州四大名园'，请分别用一句话概括它们各自最突出的造园特色。另外哪个最适合雨天去逛？",
+        "description": "苏州本地知识 — 园林文化常识题",
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── NEW: Real-time Search — Tech News (Rust-specific) ──
+    # ══════════════════════════════════════════════════════════════════
+    {
+        "id": 35,
+        "category": "Search",
+        "query": "Rust 语言最新的 stable 版本号是多少？这个版本有什么重要的新特性？另外 Rust 2024 edition 的关键变化有哪些？",
+        "description": "实时技术搜索 — Rust最新版本+edition信息",
+    },
 ]
 
 # ─── SSE Request Helper ───────────────────────────────────────────────
@@ -221,19 +380,40 @@ def run_query(query: str, timeout: int = 300) -> dict:
     start = time.time()
     final_output, heartbeats, summary = "", [], {}
     error = None
+    last_activity = [time.time()]  # mutable ref for watchdog thread
+    stall_timeout = 300  # idle timeout in seconds (matches server-side)
 
     try:
+        trace_id = str(uuid.uuid4())
         r = requests.post(
             API,
-            json={"payload": query, "trace_id": str(uuid.uuid4())},
+            json={"payload": query, "trace_id": trace_id},
             headers={"Accept": "text/event-stream"},
             stream=True,
             timeout=timeout,
             proxies={"http": None, "https": None},
         )
+
+        # Idle watchdog: closes connection if no activity for stall_timeout seconds
+        import threading
+        watchdog_stop = threading.Event()
+        def watchdog():
+            while not watchdog_stop.is_set():
+                time.sleep(10)
+                if time.time() - last_activity[0] > stall_timeout:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    return
+        watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+        watchdog_thread.start()
+
         event_type, data_lines = "", []
         for raw_line in r.iter_lines():
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            if line.startswith("event:") or line.startswith("data:"):
+                last_activity[0] = time.time()  # reset idle timer on valid SSE content
             if line.startswith("event:"):
                 event_type = line[6:].strip()
             elif line.startswith("data:"):
@@ -265,8 +445,12 @@ def run_query(query: str, timeout: int = 300) -> dict:
                         summary = json.loads(data)
                     except:
                         summary = {"raw": data}
+                elif event_type == "error":
+                    error = data
                 event_type, data_lines = "", []
         
+        watchdog_stop.set()  # stop watchdog after stream ends
+
         if r.status_code != 200:
             error = f"HTTP {r.status_code}: {r.text}"
             final_output = f"ERROR: HTTP {r.status_code}"
@@ -298,10 +482,18 @@ if __name__ == "__main__":
     results = []
     total_start = time.time()
 
+    target_cases = None
+    if "--cases" in sys.argv:
+        idx = sys.argv.index("--cases")
+        if idx + 1 < len(sys.argv):
+            target_cases = [int(x) for x in sys.argv[idx + 1].split(",")]
+
     for tc in test_cases:
         n = tc["id"]
+        if target_cases is not None and n not in target_cases:
+            continue
         print(f"━━━ Case {n:02d} [{tc['category']}] {tc['description']} ━━━")
-        print(f"    Query: \"{tc['query'][:60]}{'...' if len(tc['query'])>60 else ''}\"")
+        print(f"    Query: \"{tc['query'][:80]}{'...' if len(tc['query'])>80 else ''}\"")
 
         result = run_query(tc["query"])
         result["case_id"] = n

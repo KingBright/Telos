@@ -11,10 +11,15 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
+// Re-export from telos_core for local convenience
+pub use telos_core::metrics::{MetricEvent, now_ms};
+
 /// Global metrics store — set once at startup, accessible from any module
 pub static METRICS_STORE: std::sync::OnceLock<Arc<MetricsStore>> = std::sync::OnceLock::new();
 
-/// Helper to record a metric event (no-op if store not initialized)
+/// Helper to record a metric event (no-op if store not initialized).
+/// Prefer `telos_core::metrics::record()` from other crates;
+/// this function is kept for backward compatibility within telos_daemon.
 pub fn record(event: MetricEvent) {
     if let Some(store) = METRICS_STORE.get() {
         store.record_event(&event);
@@ -23,86 +28,6 @@ pub fn record(event: MetricEvent) {
 
 /// redb table: key = "{timestamp_ms}:{seq}" (string for lexicographic ordering), value = JSON
 const METRICS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("metric_events");
-
-/// All metric event types that get persisted
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum MetricEvent {
-    LlmCall {
-        timestamp_ms: u64,
-        agent_name: String,
-        task_id: String,
-        model: String,
-        tokens: usize,
-        estimated_cost: f64,
-    },
-    LlmError {
-        timestamp_ms: u64,
-        error_type: String, // "429", "network", "other"
-        model: String,
-    },
-    ToolExec {
-        timestamp_ms: u64,
-        tool_name: String,
-        success: bool,
-        task_id: String,
-        agent_name: String,
-    },
-    ToolCreation {
-        timestamp_ms: u64,
-        tool_name: String,
-        success: bool,
-        is_iteration: bool,
-    },
-    TaskResult {
-        timestamp_ms: u64,
-        task_id: String,
-        fulfilled: bool,
-        total_time_ms: u64,
-    },
-    QaResult {
-        timestamp_ms: u64,
-        task_id: String,
-        passed: bool,
-    },
-    SemanticLoop {
-        timestamp_ms: u64,
-        task_id: String,
-        loop_count: usize,
-    },
-    ProactiveHCI {
-        timestamp_ms: u64,
-        task_id: String,
-    },
-    WorkflowStore {
-        timestamp_ms: u64,
-        workflow_id: String,
-        description: String,
-    },
-    WorkflowReuse {
-        timestamp_ms: u64,
-        workflow_id: String,
-        task_id: String,
-        success: bool,
-    },
-}
-
-impl MetricEvent {
-    pub fn timestamp_ms(&self) -> u64 {
-        match self {
-            MetricEvent::LlmCall { timestamp_ms, .. } => *timestamp_ms,
-            MetricEvent::LlmError { timestamp_ms, .. } => *timestamp_ms,
-            MetricEvent::ToolExec { timestamp_ms, .. } => *timestamp_ms,
-            MetricEvent::ToolCreation { timestamp_ms, .. } => *timestamp_ms,
-            MetricEvent::TaskResult { timestamp_ms, .. } => *timestamp_ms,
-            MetricEvent::QaResult { timestamp_ms, .. } => *timestamp_ms,
-            MetricEvent::SemanticLoop { timestamp_ms, .. } => *timestamp_ms,
-            MetricEvent::ProactiveHCI { timestamp_ms, .. } => *timestamp_ms,
-            MetricEvent::WorkflowStore { timestamp_ms, .. } => *timestamp_ms,
-            MetricEvent::WorkflowReuse { timestamp_ms, .. } => *timestamp_ms,
-        }
-    }
-}
 
 /// Aggregated metrics for a time range, returned by the API
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -129,6 +54,17 @@ pub struct AggregatedMetrics {
     pub workflow_stored: usize,
     pub workflow_reused: usize,
     pub workflow_reuse_success: usize,
+
+    // ── Performance latency summaries (usable per-bucket for trend analysis) ──
+    pub node_exec_count: usize,
+    pub node_exec_total_ms: u64,
+    pub memory_retrieval_count: usize,
+    pub memory_retrieval_total_ms: u64,
+    pub llm_call_total_elapsed_ms: u64,
+    pub context_compression_count: usize,
+    pub context_compression_total_ms: u64,
+    pub route_direct_reply: usize,
+    pub route_expert: usize,
 }
 
 /// Per-agent metrics aggregation
@@ -187,6 +123,68 @@ pub struct TimeBucket {
 pub struct MetricsStore {
     db: Database,
     seq: std::sync::atomic::AtomicU32,
+}
+
+impl telos_core::metrics::MetricsSink for MetricsStore {
+    fn record_event(&self, event: &MetricEvent) {
+        self.record_event(event);
+    }
+}
+
+/// Shared aggregation logic — accumulate one event into an AggregatedMetrics.
+fn accumulate_event(agg: &mut AggregatedMetrics, event: &MetricEvent) {
+    match event {
+        MetricEvent::LlmCall { tokens, estimated_cost, elapsed_ms, .. } => {
+            agg.llm_total_requests += 1;
+            agg.llm_total_tokens += tokens;
+            agg.llm_total_cost += estimated_cost;
+            agg.llm_call_total_elapsed_ms += elapsed_ms;
+        }
+        MetricEvent::LlmError { error_type, .. } => {
+            if error_type == "429" { agg.llm_429_errors += 1; }
+            else { agg.llm_other_errors += 1; }
+        }
+        MetricEvent::ToolExec { success, .. } => {
+            if *success { agg.tool_exec_success += 1; } else { agg.tool_exec_failure += 1; }
+        }
+        MetricEvent::ToolCreation { success, is_iteration, .. } => {
+            if *is_iteration {
+                if *success { agg.tool_iteration_success += 1; } else { agg.tool_iteration_failure += 1; }
+            } else {
+                if *success { agg.tool_creation_success += 1; } else { agg.tool_creation_failure += 1; }
+            }
+        }
+        MetricEvent::TaskResult { fulfilled, .. } => {
+            if *fulfilled { agg.task_success += 1; } else { agg.task_failure += 1; }
+        }
+        MetricEvent::QaResult { passed, .. } => {
+            if *passed { agg.qa_passes += 1; } else { agg.qa_failures += 1; }
+        }
+        MetricEvent::SemanticLoop { .. } => { agg.semantic_loops += 1; }
+        MetricEvent::ProactiveHCI { .. } => { agg.proactive_hci += 1; }
+        MetricEvent::WorkflowStore { .. } => { agg.workflow_stored += 1; }
+        MetricEvent::WorkflowReuse { success, .. } => {
+            agg.workflow_reused += 1;
+            if *success { agg.workflow_reuse_success += 1; }
+        }
+        // ── New performance events ──
+        MetricEvent::NodeExecution { elapsed_ms, .. } => {
+            agg.node_exec_count += 1;
+            agg.node_exec_total_ms += elapsed_ms;
+        }
+        MetricEvent::MemoryRetrieval { elapsed_ms, .. } => {
+            agg.memory_retrieval_count += 1;
+            agg.memory_retrieval_total_ms += elapsed_ms;
+        }
+        MetricEvent::RouteDecision { route, .. } => {
+            if route == "direct_reply" { agg.route_direct_reply += 1; }
+            else { agg.route_expert += 1; }
+        }
+        MetricEvent::ContextCompression { elapsed_ms, .. } => {
+            agg.context_compression_count += 1;
+            agg.context_compression_total_ms += elapsed_ms;
+        }
+    }
 }
 
 impl MetricsStore {
@@ -274,40 +272,7 @@ impl MetricsStore {
         let mut agg = AggregatedMetrics { from_ms, to_ms, ..Default::default() };
         
         for event in &events {
-            match event {
-                MetricEvent::LlmCall { tokens, estimated_cost, .. } => {
-                    agg.llm_total_requests += 1;
-                    agg.llm_total_tokens += tokens;
-                    agg.llm_total_cost += estimated_cost;
-                }
-                MetricEvent::LlmError { error_type, .. } => {
-                    if error_type == "429" { agg.llm_429_errors += 1; }
-                    else { agg.llm_other_errors += 1; }
-                }
-                MetricEvent::ToolExec { success, .. } => {
-                    if *success { agg.tool_exec_success += 1; } else { agg.tool_exec_failure += 1; }
-                }
-                MetricEvent::ToolCreation { success, is_iteration, .. } => {
-                    if *is_iteration {
-                        if *success { agg.tool_iteration_success += 1; } else { agg.tool_iteration_failure += 1; }
-                    } else {
-                        if *success { agg.tool_creation_success += 1; } else { agg.tool_creation_failure += 1; }
-                    }
-                }
-                MetricEvent::TaskResult { fulfilled, .. } => {
-                    if *fulfilled { agg.task_success += 1; } else { agg.task_failure += 1; }
-                }
-                MetricEvent::QaResult { passed, .. } => {
-                    if *passed { agg.qa_passes += 1; } else { agg.qa_failures += 1; }
-                }
-                MetricEvent::SemanticLoop { .. } => { agg.semantic_loops += 1; }
-                MetricEvent::ProactiveHCI { .. } => { agg.proactive_hci += 1; }
-                MetricEvent::WorkflowStore { .. } => { agg.workflow_stored += 1; }
-                MetricEvent::WorkflowReuse { success, .. } => {
-                    agg.workflow_reused += 1;
-                    if *success { agg.workflow_reuse_success += 1; }
-                }
-            }
+            accumulate_event(&mut agg, event);
         }
         agg
     }
@@ -338,39 +303,7 @@ impl MetricsStore {
             if ts < effective_from { continue; }
             let bucket_start = effective_from + ((ts - effective_from) / bucket_size_ms) * bucket_size_ms;
             if let Some(agg) = buckets.get_mut(&bucket_start) {
-                match event {
-                    MetricEvent::LlmCall { tokens, estimated_cost, .. } => {
-                        agg.llm_total_requests += 1;
-                        agg.llm_total_tokens += tokens;
-                        agg.llm_total_cost += estimated_cost;
-                    }
-                    MetricEvent::LlmError { error_type, .. } => {
-                        if error_type == "429" { agg.llm_429_errors += 1; } else { agg.llm_other_errors += 1; }
-                    }
-                    MetricEvent::ToolExec { success, .. } => {
-                        if *success { agg.tool_exec_success += 1; } else { agg.tool_exec_failure += 1; }
-                    }
-                    MetricEvent::ToolCreation { success, is_iteration, .. } => {
-                        if *is_iteration {
-                            if *success { agg.tool_iteration_success += 1; } else { agg.tool_iteration_failure += 1; }
-                        } else {
-                            if *success { agg.tool_creation_success += 1; } else { agg.tool_creation_failure += 1; }
-                        }
-                    }
-                    MetricEvent::TaskResult { fulfilled, .. } => {
-                        if *fulfilled { agg.task_success += 1; } else { agg.task_failure += 1; }
-                    }
-                    MetricEvent::QaResult { passed, .. } => {
-                        if *passed { agg.qa_passes += 1; } else { agg.qa_failures += 1; }
-                    }
-                    MetricEvent::SemanticLoop { .. } => { agg.semantic_loops += 1; }
-                    MetricEvent::ProactiveHCI { .. } => { agg.proactive_hci += 1; }
-                    MetricEvent::WorkflowStore { .. } => { agg.workflow_stored += 1; }
-                    MetricEvent::WorkflowReuse { success, .. } => {
-                        agg.workflow_reused += 1;
-                        if *success { agg.workflow_reuse_success += 1; }
-                    }
-                }
+                accumulate_event(agg, event);
             }
         }
         
@@ -510,6 +443,50 @@ impl MetricsStore {
         result
     }
 
+    /// Get performance metrics breakdown (for the Performance dashboard tab)
+    pub fn by_performance(&self, from_ms: u64, to_ms: u64) -> PerformanceSummary {
+        let events = self.query_events(from_ms, to_ms);
+        let mut summary = PerformanceSummary::default();
+        
+        for event in &events {
+            match event {
+                MetricEvent::LlmCall { elapsed_ms, .. } if *elapsed_ms > 0 => {
+                    summary.llm_count += 1;
+                    summary.llm_total_ms += elapsed_ms;
+                    if *elapsed_ms > summary.llm_max_ms { summary.llm_max_ms = *elapsed_ms; }
+                }
+                MetricEvent::NodeExecution { elapsed_ms, node_type, .. } => {
+                    summary.node_count += 1;
+                    summary.node_total_ms += elapsed_ms;
+                    if *elapsed_ms > summary.node_max_ms { summary.node_max_ms = *elapsed_ms; }
+                    let entry = summary.node_by_type.entry(node_type.clone()).or_insert((0usize, 0u64));
+                    entry.0 += 1;
+                    entry.1 += elapsed_ms;
+                }
+                MetricEvent::MemoryRetrieval { elapsed_ms, query_type, result_count, .. } => {
+                    summary.memory_count += 1;
+                    summary.memory_total_ms += elapsed_ms;
+                    summary.memory_total_results += result_count;
+                    if *elapsed_ms > summary.memory_max_ms { summary.memory_max_ms = *elapsed_ms; }
+                    let entry = summary.memory_by_type.entry(query_type.clone()).or_insert((0usize, 0u64));
+                    entry.0 += 1;
+                    entry.1 += elapsed_ms;
+                }
+                MetricEvent::ContextCompression { elapsed_ms, .. } => {
+                    summary.ctx_count += 1;
+                    summary.ctx_total_ms += elapsed_ms;
+                    if *elapsed_ms > summary.ctx_max_ms { summary.ctx_max_ms = *elapsed_ms; }
+                }
+                MetricEvent::RouteDecision { route, .. } => {
+                    if route == "direct_reply" { summary.route_direct += 1; }
+                    else { summary.route_expert += 1; }
+                }
+                _ => {}
+            }
+        }
+        summary
+    }
+
     /// Restore cumulative counters from persisted data (called at startup)
     pub fn restore_counters(&self) {
         let m = &super::metrics::METRICS;
@@ -539,10 +516,24 @@ impl MetricsStore {
     }
 }
 
-/// Current time in milliseconds
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+/// Performance summary for the dashboard Performance tab
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceSummary {
+    pub llm_count: usize,
+    pub llm_total_ms: u64,
+    pub llm_max_ms: u64,
+    pub node_count: usize,
+    pub node_total_ms: u64,
+    pub node_max_ms: u64,
+    pub node_by_type: std::collections::HashMap<String, (usize, u64)>, // (count, total_ms)
+    pub memory_count: usize,
+    pub memory_total_ms: u64,
+    pub memory_max_ms: u64,
+    pub memory_total_results: usize,
+    pub memory_by_type: std::collections::HashMap<String, (usize, u64)>, // (count, total_ms)
+    pub ctx_count: usize,
+    pub ctx_total_ms: u64,
+    pub ctx_max_ms: u64,
+    pub route_direct: usize,
+    pub route_expert: usize,
 }

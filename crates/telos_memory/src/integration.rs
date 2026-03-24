@@ -73,10 +73,18 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
     }
 
     async fn retrieve_semantic_facts(&self, query_string: String) -> Result<Vec<String>, String> {
+        let start = std::time::Instant::now();
         // Query the memory OS specifically for Semantic memories relating to the query.
         let query = MemoryQuery::EntityLookup { entity: query_string };
 
         let results = self.retrieve(query).await?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        telos_core::metrics::record(telos_core::metrics::MetricEvent::MemoryRetrieval {
+            timestamp_ms: telos_core::metrics::now_ms(),
+            query_type: "semantic_entity".to_string(),
+            result_count: results.len(),
+            elapsed_ms,
+        });
 
         // Extract the content from the semantic memories.
         Ok(results.into_iter().map(|e| e.content).collect())
@@ -117,6 +125,7 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
     }
 
     async fn retrieve_procedural_memories(&self, query_string: String) -> Result<Vec<String>, String> {
+        let overall_start = std::time::Instant::now();
         // Dual-strategy retrieval for maximum recall:
         // Strategy 1: SemanticSearch (embedding-based similarity) for fuzzy matching
         // Strategy 2: EntityLookup (keyword) as fallback
@@ -128,8 +137,11 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
         const SIMILARITY_THRESHOLD: f32 = 0.65;
         
         // Strategy 1: Vector similarity search (primary)
+        let sem_start = std::time::Instant::now();
         let semantic_query = MemoryQuery::SemanticSearch { query: query_string.clone(), top_k: 10 };
         if let Ok(results) = self.retrieve(semantic_query).await {
+            let sem_elapsed = sem_start.elapsed().as_millis() as u64;
+            let sem_count = results.len();
             for e in results {
                 if e.memory_type == MemoryType::Procedural && seen_ids.insert(e.id.clone()) {
                     // Gate: only include if similarity is above threshold
@@ -151,18 +163,34 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
                     }
                 }
             }
+            telos_core::metrics::record(telos_core::metrics::MetricEvent::MemoryRetrieval {
+                timestamp_ms: telos_core::metrics::now_ms(),
+                query_type: "procedural_semantic".to_string(),
+                result_count: sem_count,
+                elapsed_ms: sem_elapsed,
+            });
         }
         
         // Strategy 2: Keyword fallback (catches exact term matches that vector might miss)
         // Keyword matches don't have similarity scores — they matched on exact terms, so they're relevant
+        let kw_start = std::time::Instant::now();
         let keyword_query = MemoryQuery::EntityLookup { entity: query_string };
         if let Ok(results) = self.retrieve(keyword_query).await {
+            let kw_elapsed = kw_start.elapsed().as_millis() as u64;
+            let kw_count = results.len();
             for e in results {
                 if e.memory_type == MemoryType::Procedural && seen_ids.insert(e.id.clone()) {
                     procedural_results.push(e.content);
                 }
             }
+            telos_core::metrics::record(telos_core::metrics::MetricEvent::MemoryRetrieval {
+                timestamp_ms: telos_core::metrics::now_ms(),
+                query_type: "procedural_keyword".to_string(),
+                result_count: kw_count,
+                elapsed_ms: kw_elapsed,
+            });
         }
+        let _total_elapsed = overall_start.elapsed().as_millis() as u64;
         
         Ok(procedural_results)
     }

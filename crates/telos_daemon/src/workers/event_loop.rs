@@ -7,6 +7,7 @@ use tracing::{debug, error};
 use telos_hci::{AgentEvent, AgentFeedback, EventBroker, TaskSummary, global_log_level};
 use telos_core::{config::TelosConfig, SystemRegistry};
 use telos_memory::engine::{MemoryOS, RedbGraphStore};
+use telos_model_gateway::ModelGateway;
 
 use telos_dag::{TaskGraph, GraphState, ExecutableNode, NodeMetadata, ExecutionEngine};
 use telos_context::ContextManager;
@@ -125,12 +126,12 @@ pub async fn run_event_loop(
                     });
                     debug!("[Daemon] Log level changed: {:?} -> {:?}", old_level, level);
                 }
-                AgentEvent::UserInput {
-                    session_id,
-                    payload,
-                    trace_id,
-                    project_id,
-                } => {
+                event @ AgentEvent::UserInput { .. } | event @ AgentEvent::SystemMission { .. } => {
+                    let (session_id, payload, trace_id, project_id, system_mission_channel) = match event {
+                        AgentEvent::UserInput { session_id, payload, trace_id, project_id } => (session_id, payload, trace_id, project_id, None),
+                        AgentEvent::SystemMission { mission_id, context, origin_channel, trace_id } => (mission_id, context, trace_id, None, Some(origin_channel)),
+                        _ => unreachable!(),
+                    };
                     let broker_bg = broker_bg.clone();
                     let gateway_clone = gateway_clone.clone();
                     let registry_clone = registry_clone.clone();
@@ -273,52 +274,34 @@ pub async fn run_event_loop(
                         }
                         // ----------------------------------------
 
-                        // --- USER PROFILE INJECTION (Long-Term User Knowledge) ---
+                        // --- USER PROFILE INJECTION (Dual-Layer: Static + Dynamic) ---
                         {
-                            if let Some(mem_any) = registry_clone.get_memory_os() {
-                                if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<RedbGraphStore>>() {
-                                    // Load ALL UserProfile memories (these are permanent user facts)
-                                    if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange {
-                                        start: 0,
-                                        end: u64::MAX,
-                                    }).await {
-                                        let profile_entries: Vec<&telos_memory::MemoryEntry> = results.iter()
-                                            .filter(|e| e.memory_type == telos_memory::MemoryType::UserProfile)
-                                            .collect();
-                                        if !profile_entries.is_empty() {
-                                            memory_context_text.push_str("[USER PROFILE — PERSISTENT KNOWLEDGE ABOUT YOUR OWNER]\nThe following are facts, preferences, and personal information you have learned about the user (your 主人) through past interactions. Use this to personalize your responses:\n");
-                                            for entry in &profile_entries {
-                                                memory_context_text.push_str(&format!("• {}\n", entry.content));
-                                            }
-                                            memory_context_text.push('\n');
-                                            debug!("[Daemon] Injected {} UserProfile facts into memory context", profile_entries.len());
-                                        }
-                                    }
-                                }
+                            let mem_os = registry_clone.memory_os.clone();
+                            let profile_text = telos_memory::build_and_format_profile(&*mem_os).await;
+                            if !profile_text.is_empty() {
+                                memory_context_text.push_str(&profile_text);
+                                debug!("[Daemon] Injected dual-layer user profile into memory context");
                             }
                         }
                         // ----------------------------------------
 
                         // --- PROCEDURAL MEMORY INJECTION (Learned Strategies) ---
                         {
-                            if let Some(mem_any) = registry_clone.get_memory_os() {
-                                if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<RedbGraphStore>>() {
-                                    if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange {
-                                        start: 0,
-                                        end: u64::MAX,
-                                    }).await {
-                                        let procedural_entries: Vec<&telos_memory::MemoryEntry> = results.iter()
-                                            .filter(|e| e.memory_type == telos_memory::MemoryType::Procedural)
-                                            .collect();
-                                        if !procedural_entries.is_empty() {
-                                            memory_context_text.push_str("[LEARNED STRATEGIES — distilled from past successful task executions]\n");
-                                            for entry in procedural_entries.iter().take(10) { // Cap at 10 most recent
-                                                memory_context_text.push_str(&format!("• {}\n", entry.content));
-                                            }
-                                            memory_context_text.push('\n');
-                                            debug!("[Daemon] Injected {} Procedural skills into memory context", procedural_entries.len());
-                                        }
+                            let mem_os = registry_clone.memory_os.clone();
+                            if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange {
+                                start: 0,
+                                end: u64::MAX,
+                            }).await {
+                                let procedural_entries: Vec<&telos_memory::MemoryEntry> = results.iter()
+                                    .filter(|e| e.memory_type == telos_memory::MemoryType::Procedural)
+                                    .collect();
+                                if !procedural_entries.is_empty() {
+                                    memory_context_text.push_str("[LEARNED STRATEGIES — distilled from past successful task executions]\n");
+                                    for entry in procedural_entries.iter().take(10) { // Cap at 10 most recent
+                                        memory_context_text.push_str(&format!("• {}\n", entry.content));
                                     }
+                                    memory_context_text.push('\n');
+                                    debug!("[Daemon] Injected {} Procedural skills into memory context", procedural_entries.len());
                                 }
                             }
                         }
@@ -443,6 +426,10 @@ pub async fn run_event_loop(
                             // --- NORMAL PLANNING & EXECUTION ---
                             let mut enriched_payload = payload.clone();
 
+                            if let Some(channel) = &system_mission_channel {
+                                enriched_payload = format!("[SYSTEM MISSION]\nYou are executing an autonomous scheduled mission. Fulfill it and dispatch the final result back to `origin_channel` ({}). Keep logs of any failures for standard evolution.\n\nMission Context/Instruction:\n{}", channel, enriched_payload);
+                            }
+
                             if let Some(pid) = &project_id {
                                 debug!("[Daemon] Active Project ID: {}", pid);
                                 if let Ok(Some(project)) =
@@ -502,7 +489,8 @@ pub async fn run_event_loop(
                                 let matching_tools = guard.discover_tools(&payload, 5);
                                 // Filter out core/native tools — only show user-created custom tools
                                 let core_names = ["file_edit", "fs_read", "fs_write", "shell_exec", "lsp_tool", "glob",
-                                    "create_rhai_tool", "list_rhai_tools", "web_search", "web_scrape", "http"];
+                                    "create_rhai_tool", "list_rhai_tools", "web_search", "web_scrape", "http",
+                                    "schedule_mission", "list_scheduled_missions", "cancel_mission"];
                                 let custom: Vec<_> = matching_tools.iter()
                                     .filter(|t| !core_names.contains(&t.name.as_str()))
                                     .collect();
@@ -604,42 +592,41 @@ pub async fn run_event_loop(
                                             });
 
                                             let mut memory_findings = String::new();
-                                            if let Some(mem_any) = registry_clone.get_memory_os() {
-                                                if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<RedbGraphStore>>() {
-                                                    // Dual-strategy query: EntityLookup (keyword) + TimeRange (recency)
-                                                    let mut all_entries: Vec<(u64, String)> = Vec::new(); // (created_at, content)
-                                                    
-                                                    // Strategy 1: Keyword-based EntityLookup
-                                                    if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::EntityLookup { entity: query_val.to_string() }).await {
-                                                        for e in results.iter().filter(|e| e.memory_type == telos_memory::MemoryType::Semantic || e.memory_type == telos_memory::MemoryType::InteractionEvent) {
+                                            {
+                                                let mem_os = registry_clone.memory_os.clone();
+                                                // Dual-strategy query: EntityLookup (keyword) + TimeRange (recency)
+                                                let mut all_entries: Vec<(u64, String)> = Vec::new(); // (created_at, content)
+                                                
+                                                // Strategy 1: Keyword-based EntityLookup
+                                                if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::EntityLookup { entity: query_val.to_string() }).await {
+                                                    for e in results.iter().filter(|e| e.memory_type == telos_memory::MemoryType::Semantic || e.memory_type == telos_memory::MemoryType::InteractionEvent) {
+                                                        all_entries.push((e.created_at, e.content.clone()));
+                                                    }
+                                                }
+                                                
+                                                // Strategy 2: Recent interactions (last 1 hour)
+                                                let one_hour_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                                                let one_hour_ago = one_hour_ago.saturating_sub(3600_000);
+                                                if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange { start: one_hour_ago, end: u64::MAX }).await {
+                                                    for e in results.iter().filter(|e| e.memory_type == telos_memory::MemoryType::InteractionEvent) {
+                                                        if !all_entries.iter().any(|(_, c)| c == &e.content) {
                                                             all_entries.push((e.created_at, e.content.clone()));
                                                         }
                                                     }
-                                                    
-                                                    // Strategy 2: Recent interactions (last 1 hour)
-                                                    let one_hour_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                                                    let one_hour_ago = one_hour_ago.saturating_sub(3600_000);
-                                                    if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::TimeRange { start: one_hour_ago, end: u64::MAX }).await {
-                                                        for e in results.iter().filter(|e| e.memory_type == telos_memory::MemoryType::InteractionEvent) {
-                                                            if !all_entries.iter().any(|(_, c)| c == &e.content) {
-                                                                all_entries.push((e.created_at, e.content.clone()));
-                                                            }
-                                                        }
-                                                    }
-                                                    
-                                                    // Sort chronologically (oldest first) and format with ordinals
-                                                    all_entries.sort_by_key(|(ts, _)| *ts);
-                                                    
-                                                    if !all_entries.is_empty() {
-                                                        let formatted: Vec<String> = all_entries.iter().enumerate()
-                                                            .map(|(i, (_, content))| format!("#{}: {}", i + 1, content))
-                                                            .collect();
-                                                        let merged = formatted.join("\n");
-                                                        let truncated: String = if merged.chars().count() > 2000 { merged.chars().take(2000).collect::<String>() + "..." } else { merged };
-                                                        memory_findings = format!("[TOOL RESULT: memory_read]\nFound relevant memories (chronological order, #1 = earliest):\n{}\n\n", truncated);
-                                                    } else {
-                                                        memory_findings = format!("[TOOL RESULT: memory_read]\nNo relevant memories found for '{}'.\n\n", query_val);
-                                                    }
+                                                }
+                                                
+                                                // Sort chronologically (oldest first) and format with ordinals
+                                                all_entries.sort_by_key(|(ts, _)| *ts);
+                                                
+                                                if !all_entries.is_empty() {
+                                                    let formatted: Vec<String> = all_entries.iter().enumerate()
+                                                        .map(|(i, (_, content))| format!("#{}: {}", i + 1, content))
+                                                        .collect();
+                                                    let merged = formatted.join("\n");
+                                                    let truncated: String = if merged.chars().count() > 2000 { merged.chars().take(2000).collect::<String>() + "..." } else { merged };
+                                                    memory_findings = format!("[TOOL RESULT: memory_read] STATUS=SUCCESS\nFound relevant memories (chronological order, #1 = earliest):\n{}\n\n", truncated);
+                                                } else {
+                                                    memory_findings = format!("[TOOL RESULT: memory_read] STATUS=SUCCESS\nNo results for '{}'.\n\n", query_val);
                                                 }
                                             }
 
@@ -676,28 +663,27 @@ pub async fn run_event_loop(
 
                                             let mut write_result = String::new();
                                             if !content_val.is_empty() {
-                                                if let Some(mem_any) = registry_clone.get_memory_os() {
-                                                    if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<RedbGraphStore>>() {
-                                                        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                                                        let entry = telos_memory::MemoryEntry::new(
-                                                            format!("profile_explicit_{}", timestamp),
-                                                            telos_memory::MemoryType::UserProfile,
-                                                            content_val.to_string(),
-                                                            timestamp,
-                                                            None,
-                                                        );
-                                                        match mem_os.store(entry).await {
-                                                            Ok(_) => {
-                                                                debug!("[Daemon] Successfully stored user fact via memory_write: {}", content_val);
-                                                                write_result = format!("[TOOL RESULT: memory_write]\nSuccessfully stored user fact: \"{}\". Now confirm to the user that you have remembered this information, using a warm and personalized tone.\n\n", content_val);
-                                                            }
-                                                            Err(e) => {
-                                                                error!("[Daemon] Failed to store via memory_write: {:?}", e);
-                                                                write_result = format!("[TOOL RESULT: memory_write]\nFailed to store: {:?}. Inform user that storage encountered an issue but you will remember within this session.\n\n", e);
-                                                            }
-                                                        }
+                                                let mem_os = registry_clone.memory_os.clone();
+                                                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                                                let entry = telos_memory::MemoryEntry::new(
+                                                    format!("profile_explicit_{}", timestamp),
+                                                    telos_memory::MemoryType::UserProfileStatic,
+                                                    content_val.to_string(),
+                                                    timestamp,
+                                                    None,
+                                                );
+                                                match mem_os.store(entry).await {
+                                                    Ok(_) => {
+                                                        debug!("[Daemon] Successfully stored user fact via memory_write: {}", content_val);
+                                                        write_result = format!("[TOOL RESULT: memory_write] STATUS=SUCCESS\nStored: \"{}\"\n\n", content_val);
+                                                    }
+                                                    Err(e) => {
+                                                        error!("[Daemon] Failed to store via memory_write: {:?}", e);
+                                                        write_result = format!("[TOOL RESULT: memory_write] STATUS=FAILURE\nError: {:?}\n\n", e);
                                                     }
                                                 }
+                                            } else {
+                                                write_result = format!("[TOOL RESULT: memory_write] STATUS=FAILURE\nError: empty content\n\n");
                                             }
 
                                             let existing_mem = router_input.memory_context.unwrap_or_default();
@@ -721,21 +707,152 @@ pub async fn run_event_loop(
                                     if route_data.get("tool").is_some() && route_data.get("direct_reply").is_none() && route_data.get("route").is_none() {
                                         debug!("[Daemon] Router exhausted all tool attempts without converging. Triggering final synthesis pass.");
                                         let existing_mem = router_input.memory_context.unwrap_or_default();
+                                        let system_note = if !memory_write_dedup.is_empty() {
+                                            "[SYSTEM: All memory operations completed. Produce a direct_reply now.]"
+                                        } else {
+                                            "[SYSTEM NOTE: You have used all your tool attempts. You MUST now make a final decision: either provide a direct_reply with your best answer based on whatever information you found, or route to an appropriate expert. Do NOT request any more tools.]"
+                                        };
                                         router_input.memory_context = Some(format!(
-                                            "{}[SYSTEM NOTE: You have used all your tool attempts. You MUST now make a final decision: either provide a direct_reply with your best answer based on whatever information you found (even if partial), or route to an appropriate expert if you believe only a deeper search pipeline can answer the question. Do NOT request any more tools.]\n\n",
-                                            existing_mem
+                                            "{}{}\n\n",
+                                            existing_mem, system_note
                                         ));
                                         route_result = router.execute(router_input.clone(), registry_clone.as_ref()).await;
                                     }
                                 }
                             }
                             
+                            // --- MEMORY-WRITE SHORT-CIRCUIT ---
+                            // If memory was written during this router turn but the router didn't
+                            // produce a direct_reply (it routed to an expert instead), short-circuit:
+                            // The expert would just fail trying to "plan" a confirmation message anyway.
+                            if !memory_write_dedup.is_empty() && route_result.success {
+                                if let Some(ref rd) = route_result.output {
+                                    let has_route = rd.get("route").is_some();
+                                    let has_direct = rd.get("direct_reply").is_some();
+                                    
+                                    if has_route || has_direct {
+                                        debug!("[Daemon] Memory-write short-circuit: memory was written but router dispatched to expert. Generating direct confirmation.");
+                                        let facts_stored: Vec<&String> = memory_write_dedup.iter().collect();
+                                        let soul_content = crate::agents::prompt_builder::get_soul();
+                                        let confirm_prompt = format!(
+                                            "[IDENTITY & VALUES]\n{}\n\nYou just stored the following facts in memory: {:?}.\n\
+                                            Generate a brief, warm confirmation to the user that you've remembered this information.\n\
+                                            Be natural and conversational. Use the persona described above. Reply in the user's language.",
+                                            soul_content, facts_stored
+                                        );
+
+                                        let confirm_req = telos_model_gateway::LlmRequest {
+                                            session_id: format!("memory_confirm_{}", trace_id),
+                                            messages: vec![
+                                                telos_model_gateway::Message { role: "system".to_string(), content: confirm_prompt },
+                                                telos_model_gateway::Message { role: "user".to_string(), content: payload.to_string() },
+                                            ],
+                                            required_capabilities: telos_model_gateway::Capability { requires_vision: false, strong_reasoning: false },
+                                            budget_limit: 500,
+                                            tools: None,
+                                        };
+
+                                        let confirm_text = match gateway_clone.generate(confirm_req).await {
+                                            Ok(res) => res.content,
+                                            Err(_) => format!("好的，我已经记住了：{}", facts_stored.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")),
+                                        };
+
+                                        // Emit as direct reply
+                                        broker_bg.publish_feedback(AgentFeedback::Output {
+                                            task_id: trace_id.to_string(),
+                                            session_id: session_id.clone(),
+                                            content: confirm_text.clone(),
+                                            is_final: true,
+                                            silent: false,
+                                        });
+
+                                        // Push to session logs
+                                        {
+                                            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                                            {
+                                                let mut state_w = session_logs_loop.write().await;
+                                                state_w.logs.push_back(telos_context::LogEntry {
+                                                    timestamp,
+                                                    message: format!("Assistant: {}", confirm_text),
+                                                });
+                                            }
+
+                                            let gw_for_compress = gateway_clone.clone();
+                                            let logs_for_push = session_logs_loop.clone();
+                                            let confirm_for_compress = confirm_text.clone();
+                                            tokio::spawn(async move {
+                                                let compressed = compress_for_session_log(&confirm_for_compress, &gw_for_compress).await;
+                                                let mut state_w = logs_for_push.write().await;
+                                                for entry in state_w.logs.iter_mut().rev() {
+                                                    if entry.timestamp == timestamp {
+                                                        entry.message = format!("Assistant: {}", compressed);
+                                                        break;
+                                                    }
+                                                }
+                                            });
+                                        }
+
+                                        // Persist interaction to long-term memory
+                                        {
+                                            let mem_os = registry_clone.memory_os.clone();
+                                            let conversation = format!("[User]: {}\n[Assistant ({} Persona)]: {}", payload, config.router_persona_name, confirm_text);
+                                            let conv_for_profile = conversation.clone();
+                                            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                                            let entry = telos_memory::MemoryEntry::new(
+                                                uuid::Uuid::new_v4().to_string(),
+                                                telos_memory::MemoryType::InteractionEvent,
+                                                conversation,
+                                                current_time,
+                                                None,
+                                            );
+                                            if let Err(e) = mem_os.store(entry).await {
+                                                error!("[Daemon] Failed to store memory-write confirmation interaction: {:?}", e);
+                                            }
+                                            let gw_for_profile = gateway_clone.clone();
+                                            let mem_for_profile = registry_clone.memory_os.clone();
+                                            tokio::spawn(async move {
+                                                extract_and_store_user_profile(&conv_for_profile, gw_for_profile, mem_for_profile).await;
+                                            });
+                                        }
+
+                                        broker_bg.publish_feedback(AgentFeedback::TaskCompleted {
+                                            task_id: trace_id.to_string(),
+                                            summary: TaskSummary {
+                                                fulfilled: true,
+                                                completed: true,
+                                                total_nodes: 1,
+                                                completed_nodes: 1,
+                                                failed_nodes: 0,
+                                                total_time_ms: task_start_time.elapsed().as_millis() as u64,
+                                                summary: "Memory Write Confirmed (Short-Circuit)".to_string(),
+                                                failed_node_ids: vec![],
+                                            },
+                                        });
+
+                                        {
+                                            let mut w = active_tasks_spawn.write().await;
+                                            w.remove(&trace_id.to_string());
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+
                             if !route_result.success {
                                 let error_msg = route_result.error.map(|e| e.message).unwrap_or_else(|| "Unknown routing error".to_string());
+                                // P2: Detect content filter and provide user-friendly message
+                                let user_msg = if error_msg.to_lowercase().contains("contentfilter")
+                                    || error_msg.to_lowercase().contains("content_filter")
+                                    || error_msg.to_lowercase().contains("content filter")
+                                    || error_msg.contains("ResponsibleAIPolicyViolation") {
+                                    "抱歉，这个话题的讨论可能涉及敏感内容，模型端对此有一定限制。我可以尝试从不同角度来回答这个问题，或者请您换一种方式提问。".to_string()
+                                } else {
+                                    format!("Routing Failed: {}", error_msg)
+                                };
                                 broker_bg.publish_feedback(AgentFeedback::Output {
                                     task_id: trace_id.to_string(),
                                     session_id: session_id.clone(),
-                                    content: format!("Routing Failed: {}", error_msg),
+                                    content: user_msg,
                                     is_final: true,
                                     silent: false,
                                 });
@@ -766,7 +883,13 @@ pub async fn run_event_loop(
                             // --- DIRECT REPLY SHORT-CIRCUIT (with QA Gate) ---
                             if let Some(direct_reply) = route_data.get("direct_reply").and_then(|v| v.as_str()) {
                                 debug!("[Daemon] Router generated a direct reply. Running QA verification...");
-                                
+                                // Record route decision metric: direct_reply
+                                crate::core::metrics_store::record(crate::core::metrics_store::MetricEvent::RouteDecision {
+                                    timestamp_ms: crate::core::metrics_store::now_ms(),
+                                    task_id: trace_id.to_string(),
+                                    route: "direct_reply".to_string(),
+                                    reason: "Router chose direct reply".to_string(),
+                                });
                                 // QA Gate: evaluate direct_reply quality before accepting
                                 let qa_result = router.evaluate(&payload, direct_reply, registry_clone.as_ref()).await;
                                 let qa_accepted = if qa_result.success {
@@ -807,18 +930,38 @@ pub async fn run_event_loop(
                                             });
                                         }
 
-                                        // Phase 2: Asynchronously compress and replace the log entry
+                                        // Phase 2: Asynchronously compress older responses to preserve immediate context
                                         let gw_for_compress = gateway_clone.clone();
                                         let logs_for_push = session_logs_loop.clone();
                                         tokio::spawn(async move {
-                                            let compressed = compress_for_session_log(&reply_text, &gw_for_compress).await;
-                                            
-                                            // Find the specific entry by timestamp and replace it
-                                            let mut state_w = logs_for_push.write().await;
-                                            for entry in state_w.logs.iter_mut().rev() {
-                                                if entry.timestamp == timestamp {
-                                                    entry.message = format!("Assistant: {}", compressed);
-                                                    break;
+                                            let target_info = {
+                                                let state_r = logs_for_push.read().await;
+                                                let len = state_r.logs.len();
+                                                if len > 4 {
+                                                    let mut found = None;
+                                                    for i in 0..(len - 4) {
+                                                        let msg = &state_r.logs[i].message;
+                                                        if msg.starts_with("Assistant: ") && !msg.starts_with("Assistant: [摘要]") && msg.len() > 500 {
+                                                            found = Some((state_r.logs[i].timestamp, msg.clone()));
+                                                            break;
+                                                        }
+                                                    }
+                                                    found
+                                                } else {
+                                                    None
+                                                }
+                                            };
+
+                                            if let Some((target_ts, target_msg)) = target_info {
+                                                let text_to_compress = target_msg.strip_prefix("Assistant: ").unwrap_or(&target_msg);
+                                                let compressed = compress_for_session_log(text_to_compress, &gw_for_compress).await;
+                                                
+                                                let mut state_w = logs_for_push.write().await;
+                                                for entry in state_w.logs.iter_mut() {
+                                                    if entry.timestamp == target_ts {
+                                                        entry.message = format!("Assistant: {}", compressed);
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         });
@@ -839,28 +982,27 @@ pub async fn run_event_loop(
                                     });
 
                                     // Persist to long-term memory
-                                    if let Some(mem_any) = registry_clone.get_memory_os() {
-                                        if let Ok(mem_os) = mem_any.downcast::<std::sync::Arc<RedbGraphStore>>() {
-                                            let conversation = format!("[User]: {}\n[Assistant ({} Persona)]: {}", payload, config.router_persona_name, direct_reply);
-                                            let conv_for_profile = conversation.clone();
-                                            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                                            let entry = telos_memory::MemoryEntry::new(
-                                                uuid::Uuid::new_v4().to_string(),
-                                                telos_memory::MemoryType::InteractionEvent,
-                                                conversation,
-                                                current_time,
-                                                None,
-                                            );
-                                            if let Err(e) = mem_os.store(entry).await {
-                                                error!("[Daemon] Failed to store direct reply interaction memory: {:?}", e);
-                                            }
-                                            // Background: Extract user preferences from this conversation
-                                            let gw_for_profile = gateway_clone.clone();
-                                            let mem_for_profile = registry_clone.memory_os.clone();
-                                            tokio::spawn(async move {
-                                                extract_and_store_user_profile(&conv_for_profile, gw_for_profile, mem_for_profile).await;
-                                            });
+                                    {
+                                        let mem_os = registry_clone.memory_os.clone();
+                                        let conversation = format!("[User]: {}\n[Assistant ({} Persona)]: {}", payload, config.router_persona_name, direct_reply);
+                                        let conv_for_profile = conversation.clone();
+                                        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                                        let entry = telos_memory::MemoryEntry::new(
+                                            uuid::Uuid::new_v4().to_string(),
+                                            telos_memory::MemoryType::InteractionEvent,
+                                            conversation,
+                                            current_time,
+                                            None,
+                                        );
+                                        if let Err(e) = mem_os.store(entry).await {
+                                            error!("[Daemon] Failed to store direct reply interaction memory: {:?}", e);
                                         }
+                                        // Background: Extract user preferences from this conversation
+                                        let gw_for_profile = gateway_clone.clone();
+                                        let mem_for_profile = registry_clone.memory_os.clone();
+                                        tokio::spawn(async move {
+                                            extract_and_store_user_profile(&conv_for_profile, gw_for_profile, mem_for_profile).await;
+                                        });
                                     }
 
                                     // Remove from active tasks
@@ -891,6 +1033,14 @@ pub async fn run_event_loop(
                             let enriched_task = route_data.get("enriched_task").and_then(|v| v.as_str()).unwrap_or(&enriched_payload);
                             enriched_payload = enriched_task.to_string();
 
+                            // Record route decision metric: expert route
+                            crate::core::metrics_store::record(crate::core::metrics_store::MetricEvent::RouteDecision {
+                                timestamp_ms: crate::core::metrics_store::now_ms(),
+                                task_id: trace_id.to_string(),
+                                route: expert_route.to_string(),
+                                reason: route_reason.to_string(),
+                            });
+
                             broker_bg.publish_feedback(AgentFeedback::Output {
                                 task_id: trace_id.to_string(),
                                 session_id: session_id.clone(),
@@ -912,6 +1062,7 @@ pub async fn run_event_loop(
                                 required_tokens: 2000,
                                 query: enriched_payload.clone(),
                             };
+                            let ctx_start = std::time::Instant::now();
                             let actual_ctx = context_manager_spawn.compress_for_node(&raw_ctx, &ctx_req).await
                             .unwrap_or_else(|e| {
                                 debug!("[Daemon] Context compression failed: {:?}, using empty context", e);
@@ -920,6 +1071,14 @@ pub async fn run_event_loop(
                                     summary_tree: vec![],
                                     precise_facts: vec![],
                                 }
+                            });
+                            let ctx_elapsed = ctx_start.elapsed().as_millis() as u64;
+                            crate::core::metrics_store::record(crate::core::metrics_store::MetricEvent::ContextCompression {
+                                timestamp_ms: crate::core::metrics_store::now_ms(),
+                                task_id: trace_id.to_string(),
+                                elapsed_ms: ctx_elapsed,
+                                facts_count: actual_ctx.precise_facts.len(),
+                                summary_count: actual_ctx.summary_tree.len(),
                             });
 
                             debug!(
@@ -993,6 +1152,7 @@ pub async fn run_event_loop(
                                     required_tokens: 2000,
                                     query: enriched_payload.clone(),
                                 };
+                                let ctx_start2 = std::time::Instant::now();
                                 let actual_ctx = context_manager_spawn.compress_for_node(&raw_ctx, &ctx_req).await
                                 .unwrap_or_else(|e| {
                                     debug!("[Daemon] Context compression failed: {:?}, using empty context", e);
@@ -1002,6 +1162,14 @@ pub async fn run_event_loop(
                                         precise_facts: vec![],
                                     }
                                 });
+                                let ctx_elapsed2 = ctx_start2.elapsed().as_millis() as u64;
+                                crate::core::metrics_store::record(crate::core::metrics_store::MetricEvent::ContextCompression {
+                                    timestamp_ms: crate::core::metrics_store::now_ms(),
+                                    task_id: trace_id.to_string(),
+                                    elapsed_ms: ctx_elapsed2,
+                                    facts_count: actual_ctx.precise_facts.len(),
+                                    summary_count: actual_ctx.summary_tree.len(),
+                                });
 
                                 debug!(
                                     "[Daemon] Context prepared with {} summary nodes and {} precise facts",
@@ -1009,14 +1177,29 @@ pub async fn run_event_loop(
                                     actual_ctx.precise_facts.len()
                                 );
 
-                                execution_engine
-                                    .run_graph(
+                                let graph_result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(180),
+                                    execution_engine.run_graph(
                                         &mut graph,
                                         &actual_ctx,
                                         registry_clone.as_ref(),
                                         broker_bg.as_ref(),
                                     )
-                                    .await;
+                                ).await;
+
+                                if graph_result.is_err() {
+                                    tracing::warn!("[Daemon] DAG execution timed out after 180s (single attempt {}/{})", attempt, MAX_ATTEMPTS);
+                                    broker_bg.publish_feedback(AgentFeedback::Output {
+                                        task_id: trace_id.to_string(),
+                                        session_id: session_id.clone(),
+                                        content: format!("⚠️ Execution attempt {}/{} timed out after 180s", attempt, MAX_ATTEMPTS),
+                                        is_final: false,
+                                        silent: false,
+                                    });
+                                    loop_failed_nodes += 1;
+                                    loop_summary = format!("DAG execution timed out on attempt {}", attempt);
+                                    break;
+                                }
 
                                 // Calculate task summary
                                 total_time_ms = task_start_time.elapsed().as_millis() as u64;
@@ -1059,7 +1242,13 @@ pub async fn run_event_loop(
                                                     let error_str = res
                                                         .error
                                                         .as_ref()
-                                                        .map(|e| format!("{}: {}", e.error_type, e.message))
+                                                        .map(|e| {
+                                                            let mut s = format!("{}: {}", e.error_type, e.message);
+                                                            if let Some(ref td) = e.technical_detail {
+                                                                s.push_str(&format!("\nDetail: {}", td));
+                                                            }
+                                                            s
+                                                        })
                                                         .unwrap_or_else(|| "Unknown error".to_string());
                                                     final_results
                                                         .push(format!("[{}] Failed: {}", node_id, error_str));
@@ -1075,14 +1264,7 @@ pub async fn run_event_loop(
                                     final_results.join("\n")
                                 };
 
-                                // Detect if the result actually contains error messages
-                                let result_has_error = combined_result.to_lowercase().contains("error")
-                                    || combined_result.to_lowercase().contains("failed")
-                                    || combined_result.to_lowercase().contains("not found")
-                                    || combined_result.to_lowercase().contains("unavailable")
-                                    || combined_result.contains("失败");
-
-                                let task_success = failed_nodes == 0 && !result_has_error;
+                                let task_success = failed_nodes == 0;
 
                                 // Build summary message
                                 let summary = if task_success {
@@ -1157,7 +1339,13 @@ pub async fn run_event_loop(
                                 loop_final_trace_steps.clear();
                                 for (node_id, output) in &graph.node_results {
                                     let input_data = graph.node_metadata.get(node_id).map(|m| m.prompt_preview.clone()).unwrap_or_default();
-                                    let error_opt = output.error.as_ref().map(|e| telos_core::NodeError::ExecutionFailed(e.message.clone()));
+                                    let error_opt = output.error.as_ref().map(|e| {
+                                        let mut msg = e.message.clone();
+                                        if let Some(ref td) = e.technical_detail {
+                                            msg.push_str(&format!(" | Detail: {}", td));
+                                        }
+                                        telos_core::NodeError::ExecutionFailed(msg)
+                                    });
                                     loop_final_trace_steps.push(telos_evolution::TraceStep {
                                         node_id: node_id.clone(),
                                         input_data,
@@ -1252,17 +1440,38 @@ pub async fn run_event_loop(
                                     });
                                 }
 
-                                // Phase 2: Asynchronously compress and replace
+                                // Phase 2: Asynchronously compress older responses to preserve immediate context
                                 let gw_for_compress = gateway_clone.clone();
                                 let logs_for_push = session_logs_loop.clone();
                                 tokio::spawn(async move {
-                                    let compressed = compress_for_session_log(&response_text, &gw_for_compress).await;
-                                    
-                                    let mut state_w = logs_for_push.write().await;
-                                    for entry in state_w.logs.iter_mut().rev() {
-                                        if entry.timestamp == timestamp {
-                                            entry.message = format!("Assistant: {}", compressed);
-                                            break;
+                                    let target_info = {
+                                        let state_r = logs_for_push.read().await;
+                                        let len = state_r.logs.len();
+                                        if len > 4 {
+                                            let mut found = None;
+                                            for i in 0..(len - 4) {
+                                                let msg = &state_r.logs[i].message;
+                                                if msg.starts_with("Assistant: ") && !msg.starts_with("Assistant: [摘要]") && msg.len() > 500 {
+                                                    found = Some((state_r.logs[i].timestamp, msg.clone()));
+                                                    break;
+                                                }
+                                            }
+                                            found
+                                        } else {
+                                            None
+                                        }
+                                    };
+
+                                    if let Some((target_ts, target_msg)) = target_info {
+                                        let text_to_compress = target_msg.strip_prefix("Assistant: ").unwrap_or(&target_msg);
+                                        let compressed = compress_for_session_log(text_to_compress, &gw_for_compress).await;
+                                        
+                                        let mut state_w = logs_for_push.write().await;
+                                        for entry in state_w.logs.iter_mut() {
+                                            if entry.timestamp == target_ts {
+                                                entry.message = format!("Assistant: {}", compressed);
+                                                break;
+                                            }
                                         }
                                     }
                                 });

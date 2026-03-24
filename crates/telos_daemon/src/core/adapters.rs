@@ -55,8 +55,10 @@ impl ModelProvider for GatewayAdapter {
         });
 
         let model_name = self.inner.model_name().to_string();
+        let call_start = std::time::Instant::now();
         match self.inner.generate_chat_with_tools(messages, tools).await {
             Ok(resp) => {
+                let elapsed_ms = call_start.elapsed().as_millis() as u64;
                 // Approximate tokens: ~4 chars per token
                 let mut total_len = 0;
                 for m in &req.messages {
@@ -77,6 +79,7 @@ impl ModelProvider for GatewayAdapter {
                     model: model_name.clone(),
                     tokens: estimated_tokens,
                     estimated_cost: cost,
+                    elapsed_ms,
                 });
                 
                 Ok(LlmResponse {

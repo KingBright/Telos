@@ -15,7 +15,11 @@ pub struct VectorToolRegistry {
 }
 
 impl VectorToolRegistry {
-    pub fn new() -> Self {
+    pub fn new(tools_dir: PathBuf) -> Self {
+        // Migrate legacy plugins/ dir to the canonical tools/ dir
+        Self::migrate_legacy_plugins(&tools_dir);
+        let _ = std::fs::create_dir_all(&tools_dir);
+
         #[cfg(feature = "local-embeddings")]
         {
             let model_result = std::panic::catch_unwind(|| {
@@ -31,11 +35,11 @@ impl VectorToolRegistry {
                     let mut registry = Self {
                         tools: std::sync::RwLock::new(HashMap::new()),
                         executors: std::sync::RwLock::new(HashMap::new()),
-                        plugins_dir: Self::get_default_plugins_dir(),
+                        plugins_dir: tools_dir,
                         embeddings_cache: std::sync::RwLock::new(HashMap::new()),
                         model: Some(std::sync::RwLock::new(model)),
                     };
-                    registry.load_saved_plugins();
+                    registry.load_saved_tools();
                     return registry;
                 }
                 _ => {
@@ -44,18 +48,54 @@ impl VectorToolRegistry {
             }
         }
 
-        Self::new_keyword_only()
+        Self::new_keyword_only(tools_dir)
     }
 
-    /// Get the default plugins directory (e.g. ./plugins or ~/.telos/plugins)
-    fn get_default_plugins_dir() -> PathBuf {
-        let dir = dirs::home_dir().map(|h| h.join(".telos").join("plugins")).unwrap_or_else(|| PathBuf::from("./plugins"));
-        let _ = std::fs::create_dir_all(&dir);
-        dir
+    /// Migrate legacy `~/.telos/plugins/` files to the canonical `tools_dir`.
+    /// Only moves files that don't already exist in the target directory.
+    fn migrate_legacy_plugins(tools_dir: &Path) {
+        let legacy_dir = dirs::home_dir()
+            .map(|h| h.join(".telos").join("plugins"))
+            .unwrap_or_else(|| PathBuf::from("./plugins"));
+        
+        if !legacy_dir.exists() || legacy_dir == *tools_dir {
+            return;
+        }
+
+        let _ = std::fs::create_dir_all(tools_dir);
+        let mut migrated = 0u32;
+        
+        if let Ok(entries) = std::fs::read_dir(&legacy_dir) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                let filename = match src.file_name() {
+                    Some(f) => f.to_owned(),
+                    None => continue,
+                };
+                let dst = tools_dir.join(&filename);
+                
+                if !dst.exists() {
+                    if let Err(e) = std::fs::copy(&src, &dst) {
+                        tracing::warn!("[ToolRegistry] Failed to migrate {:?}: {}", filename, e);
+                        continue;
+                    }
+                    migrated += 1;
+                }
+                // Remove source file after copy (or if dest already exists)
+                let _ = std::fs::remove_file(&src);
+            }
+        }
+        
+        // Try to remove the legacy dir if empty
+        let _ = std::fs::remove_dir(&legacy_dir);
+        
+        if migrated > 0 {
+            info!("[ToolRegistry] Migrated {} files from legacy plugins/ to tools/", migrated);
+        }
     }
 
-    /// Load dynamically saved plugins from disk on registry initialization
-    fn load_saved_plugins(&mut self) {
+    /// Load persisted tools from disk on registry initialization
+    fn load_saved_tools(&mut self) {
         if let Ok(entries) = std::fs::read_dir(&self.plugins_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -66,11 +106,9 @@ impl VectorToolRegistry {
                             if rhai_path.exists() {
                                 if let Ok(script) = std::fs::read_to_string(&rhai_path) {
                                     let sandbox = std::sync::Arc::new(crate::ScriptSandbox::new());
-                                    // Notice: we can't easily inject the native registry back here because `self` is the registry.
-                                    // The `ToolRegistry` design makes cyclical arcs hard. So we load the executor without native dependencies first.
                                     let executor = std::sync::Arc::new(crate::ScriptExecutor::new(script, sandbox));
                                     self.register_tool(schema.clone(), Some(executor));
-                                    tracing::info!("[ToolRegistry] Loaded plugin from disk: {}", schema.name);
+                                    tracing::info!("[ToolRegistry] Loaded tool from disk: {}", schema.name);
                                 }
                             }
                         }
@@ -80,19 +118,21 @@ impl VectorToolRegistry {
         }
     }
 
-    /// Create a registry without attempting to load fastembed at all (instant startup).
-    pub fn new_keyword_only() -> Self {
-        info!("[ToolRegistry] Using keyword-only tool discovery.");
+    /// Create a registry without attempting to load fastembed (instant startup).
+    pub fn new_keyword_only(tools_dir: PathBuf) -> Self {
+        Self::migrate_legacy_plugins(&tools_dir);
+        let _ = std::fs::create_dir_all(&tools_dir);
+        info!("[ToolRegistry] Using keyword-only tool discovery. Tools dir: {:?}", tools_dir);
         let mut registry = Self {
             tools: std::sync::RwLock::new(HashMap::new()),
             executors: std::sync::RwLock::new(HashMap::new()),
-            plugins_dir: Self::get_default_plugins_dir(),
+            plugins_dir: tools_dir,
             #[cfg(feature = "local-embeddings")]
             embeddings_cache: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "local-embeddings")]
             model: None,
         };
-        registry.load_saved_plugins();
+        registry.load_saved_tools();
         registry
     }
 
@@ -102,7 +142,7 @@ impl VectorToolRegistry {
         Self {
             tools: std::sync::RwLock::new(HashMap::new()),
             executors: std::sync::RwLock::new(HashMap::new()),
-            plugins_dir: std::env::temp_dir().join("telos_test_plugins"),
+            plugins_dir: std::env::temp_dir().join("telos_test_tools"),
             #[cfg(feature = "local-embeddings")]
             embeddings_cache: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "local-embeddings")]
@@ -159,7 +199,8 @@ impl VectorToolRegistry {
         }
     }
 
-    /// Keyword-based tool discovery fallback.
+    /// Keyword-based tool discovery with health-weighted ranking.
+    /// Archived tools are excluded. Broken tools are heavily penalized.
     fn keyword_discover(&self, intent: &str, limit: usize) -> Vec<ToolSchema> {
         let query_lower = intent.to_lowercase().replace('_', " ").replace('-', " ");
         let query_words: Vec<&str> = query_lower.split_whitespace().collect();
@@ -167,6 +208,10 @@ impl VectorToolRegistry {
         let mut all_tools = Vec::new();
         if let Ok(guard) = self.tools.read() {
             for (name, schema) in guard.iter() {
+                // Skip archived tools — they are hidden from discovery
+                if schema.health_status == "archived" {
+                    continue;
+                }
                 all_tools.push((name.clone(), schema.clone()));
             }
         }
@@ -175,8 +220,9 @@ impl VectorToolRegistry {
             .into_iter()
             .map(|(name, schema)| {
                 let haystack = format!("{} {}", name, schema.description).to_lowercase();
-                let score: f32 = query_words.iter().filter(|w| haystack.contains(*w)).count() as f32;
-                (schema, score)
+                let keyword_score: f32 = query_words.iter().filter(|w| haystack.contains(*w)).count() as f32;
+                let health_w = Self::health_weight(&schema);
+                (schema, keyword_score * health_w)
             })
             .collect();
 
@@ -187,6 +233,58 @@ impl VectorToolRegistry {
             .take(limit)
             .map(|(schema, _)| schema)
             .collect()
+    }
+
+    /// Calculate a health weight multiplier for a tool (0.0 to 1.0).
+    /// - active tools with high success rates get ~1.0
+    /// - dormant tools get 0.6-0.8 (still valuable, just not used recently)
+    /// - broken tools get 0.1 (heavily penalized but still discoverable if explicitly matched)
+    fn health_weight(schema: &ToolSchema) -> f32 {
+        // Archived tools should never reach here but guard anyway
+        if schema.health_status == "archived" {
+            return 0.0;
+        }
+        if schema.health_status == "broken" {
+            return 0.1;
+        }
+
+        let total = schema.success_count + schema.failure_count;
+        if total == 0 {
+            // Brand new tool, no usage data — neutral weight
+            return 0.8;
+        }
+
+        let success_rate = schema.success_count as f32 / total as f32;
+        
+        // Recency boost: recently used tools get a small bonus
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last_used = schema.last_success_at.max(schema.last_failure_at);
+        let age_days = if last_used > 0 { (now_ms.saturating_sub(last_used)) / 86_400_000 } else { 30 };
+        let recency = if age_days < 7 { 1.0 } else if age_days < 30 { 0.9 } else { 0.7 };
+
+        // Dormant bonus: tools that worked before but are just not used recently
+        // shouldn't be overly penalized — they are still valuable
+        if schema.health_status == "dormant" {
+            return 0.7 * recency;
+        }
+
+        success_rate * recency
+    }
+
+    /// Persist a tool's updated schema to disk (for health tracking updates).
+    fn persist_schema(&self, schema: &ToolSchema) {
+        let is_ephemeral = schema.name.starts_with("debug_") 
+            || schema.name.starts_with("test_") 
+            || schema.name.starts_with("diag_");
+        if is_ephemeral { return; }
+        
+        let meta_path = self.plugins_dir.join(format!("{}.json", schema.name));
+        if let Ok(meta_json) = serde_json::to_string_pretty(schema) {
+            let _ = std::fs::write(&meta_path, meta_json);
+        }
     }
 
     /// List all registered tools with their schemas
@@ -311,31 +409,114 @@ impl ToolRegistry for VectorToolRegistry {
             tools.insert(schema.name.clone(), schema.clone());
         }
 
-        // Only persist "real" tools to disk
-        let is_ephemeral = schema.name.starts_with("debug_") 
-            || schema.name.starts_with("test_") 
-            || schema.name.starts_with("diag_");
+        self.persist_schema(&schema);
+        
+        info!("[ToolRegistry] 📝 Attached note to tool '{}'", schema.name);
+        Ok(())
+    }
 
-        if !is_ephemeral {
-            let meta_path = self.plugins_dir.join(format!("{}.json", schema.name));
-            if meta_path.exists() {
-                if let Ok(meta_json) = serde_json::to_string_pretty(&schema) {
-                    if let Err(e) = std::fs::write(&meta_path, meta_json) {
-                        tracing::error!("Failed to update tool schema JSON on disk for note attachment: {}", e);
-                        return Err(format!("Failed to save updated schema: {}", e));
+    fn record_tool_usage(&self, tool_name: &str, success: bool) {
+        let updated_schema = {
+            let guard = match self.tools.read() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let schema = match guard.get(tool_name) {
+                Some(s) => s.clone(),
+                None => return, // Native tools don't have schemas in our map, skip silently
+            };
+            drop(guard);
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            let mut s = schema;
+            if success {
+                s.success_count += 1;
+                s.last_success_at = now_ms;
+            } else {
+                s.failure_count += 1;
+                s.last_failure_at = now_ms;
+            }
+
+            // Auto-classify health status (only for custom/dynamic tools)
+            // Key distinction per user requirement:
+            // - dormant = has succeeded before but not used recently (still valuable!)
+            // - broken = has NEVER succeeded, or total_success=0 with failures (garbage)
+            let total = s.success_count + s.failure_count;
+            if s.health_status != "archived" {
+                if s.success_count == 0 && s.failure_count >= 3 {
+                    // Never succeeded with 3+ failures → broken
+                    s.health_status = "broken".to_string();
+                } else if total > 0 && s.success_count > 0 {
+                    // Has succeeded at least once
+                    let age_days = if s.last_success_at > 0 {
+                        now_ms.saturating_sub(s.last_success_at) / 86_400_000
+                    } else {
+                        0
+                    };
+                    if age_days > 30 {
+                        s.health_status = "dormant".to_string();
+                    } else {
+                        s.health_status = "active".to_string();
                     }
                 }
             }
+            s
+        };
+
+        // Write back to the in-memory registry
+        if let Ok(mut tools) = self.tools.write() {
+            tools.insert(updated_schema.name.clone(), updated_schema.clone());
         }
-        
-        info!("[ToolRegistry] 📝 Attached note to tool '{}'", schema.name);
+
+        // Persist health update to disk
+        self.persist_schema(&updated_schema);
+    }
+
+    fn archive_tool(&self, tool_name: &str) -> Result<(), String> {
+        let mut schema = {
+            let guard = self.tools.read().map_err(|_| "Lock error")?;
+            guard.get(tool_name).cloned().ok_or_else(|| format!("Tool '{}' not found", tool_name))?
+        };
+
+        schema.health_status = "archived".to_string();
+
+        if let Ok(mut tools) = self.tools.write() {
+            tools.insert(schema.name.clone(), schema.clone());
+        }
+
+        self.persist_schema(&schema);
+        info!("[ToolRegistry] 📦 Archived tool '{}'", tool_name);
+        Ok(())
+    }
+
+    fn delete_tool(&self, tool_name: &str) -> Result<(), String> {
+        // Remove from memory
+        if let Ok(mut tools) = self.tools.write() {
+            tools.remove(tool_name);
+        }
+        if let Ok(mut execs) = self.executors.write() {
+            execs.remove(tool_name);
+        }
+
+        // Remove from disk
+        let json_path = self.plugins_dir.join(format!("{}.json", tool_name));
+        let rhai_path = self.plugins_dir.join(format!("{}.rhai", tool_name));
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&rhai_path);
+
+        info!("[ToolRegistry] 🗑️ Deleted tool '{}' permanently", tool_name);
         Ok(())
     }
 }
 
 impl Default for VectorToolRegistry {
     fn default() -> Self {
-        Self::new()
+        let dir = dirs::home_dir().map(|h| h.join(".telos").join("tools")).unwrap_or_else(|| PathBuf::from("./tools"));
+        Self::new(dir)
     }
 }
 
@@ -349,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_tool_registration_and_execution() {
         // 1. Setup a fresh registry
-        let registry = VectorToolRegistry::new_keyword_only();
+        let registry = VectorToolRegistry::new_for_test();
         
         // 2. Define a dummy schema
         let schema = ToolSchema {

@@ -1,11 +1,13 @@
-use crate::types::{MemoryEntry, MemoryQuery, MemoryType};
+use crate::types::{MemoryEntry, MemoryQuery, MemoryRelation, MemoryType};
 use crate::decay;
 use crate::reconsolidation;
 use async_trait::async_trait;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::sync::Arc;
+use telos_core::schedule::{ScheduledMission, MissionStatus};
 
 const MEMORY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("memories");
+const MISSION_TABLE: TableDefinition<&str, &str> = TableDefinition::new("missions");
 
 #[async_trait]
 pub trait MemoryOS: Send + Sync {
@@ -17,6 +19,19 @@ pub trait MemoryOS: Send + Sync {
     async fn delete(&self, id: &str) -> Result<(), String>;
     /// Retrieve all entries (for maintenance operations)
     async fn retrieve_all(&self) -> Result<Vec<MemoryEntry>, String>;
+    /// Expand a set of retrieved memories by looking up their related memories.
+    /// Returns the original entries plus any related entries not already present.
+    async fn expand_relations(&self, entries: &[MemoryEntry]) -> Result<Vec<MemoryEntry>, String> {
+        Ok(entries.to_vec())
+    }
+}
+
+#[async_trait]
+pub trait MissionStore: Send + Sync {
+    async fn store_mission(&self, mission: ScheduledMission) -> Result<(), String>;
+    async fn retrieve_missions(&self) -> Result<Vec<ScheduledMission>, String>;
+    async fn retrieve_mission(&self, id: &str) -> Result<Option<ScheduledMission>, String>;
+    async fn delete_mission(&self, id: &str) -> Result<(), String>;
 }
 
 pub struct RedbGraphStore {
@@ -49,6 +64,7 @@ impl RedbGraphStore {
         let write_txn = db.begin_write().map_err(|e| e.to_string())?;
         {
             let _ = write_txn.open_table(MEMORY_TABLE).map_err(|e| e.to_string())?;
+            let _ = write_txn.open_table(MISSION_TABLE).map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())?;
         
@@ -143,8 +159,13 @@ impl RedbGraphStore {
 #[async_trait]
 impl MemoryOS for RedbGraphStore {
     async fn store(&self, mut entry: MemoryEntry) -> Result<(), String> {
-        // Automatically inject embedding if this is a Semantic, UserProfile, InteractionEvent, or Procedural memory without one
-        if (entry.memory_type == MemoryType::Semantic || entry.memory_type == MemoryType::UserProfile || entry.memory_type == MemoryType::InteractionEvent || entry.memory_type == MemoryType::Procedural) && entry.embedding.is_none() {
+        // Automatically inject embedding for knowledge-bearing memory types
+        let needs_embedding = matches!(
+            entry.memory_type,
+            MemoryType::Semantic | MemoryType::UserProfileStatic | MemoryType::UserProfileDynamic
+            | MemoryType::InteractionEvent | MemoryType::Procedural
+        );
+        if needs_embedding && entry.embedding.is_none() {
             if let Some(ref model_arc) = self.model {
                 let mut m = model_arc.write().await;
                 if let Ok(embeddings) = m.embed(vec![entry.content.clone()], None) {
@@ -155,11 +176,13 @@ impl MemoryOS for RedbGraphStore {
             }
         }
 
-        // --- Conflict Detection (GraphRAG-inspired) ---
-        // Only for Semantic and UserProfile: check for contradicting existing facts
-        if (entry.memory_type == MemoryType::Semantic || entry.memory_type == MemoryType::UserProfile) 
-            && entry.embedding.is_some() 
-        {
+        // --- Conflict Detection & Version Chain Creation ---
+        // For Semantic and UserProfile types: check for contradicting existing facts
+        let conflict_types = matches!(
+            entry.memory_type,
+            MemoryType::Semantic | MemoryType::UserProfileStatic | MemoryType::UserProfileDynamic
+        );
+        if conflict_types && entry.embedding.is_some() {
             let existing = self.retrieve_all().await.unwrap_or_default();
             let conflicts = crate::conflict::detect_conflicts(&entry, &existing, 0.8);
 
@@ -181,10 +204,56 @@ impl MemoryOS for RedbGraphStore {
                         (1.0, 0.5)
                     };
 
-                    // Update the existing entry's confidence
+                    // === VERSION CHAIN CREATION ===
+                    // If old confidence is very low, this is a superseding update
                     let mut updated_existing = conflict.existing.clone();
                     updated_existing.confidence = old_conf;
-                    
+
+                    if old_conf < 0.4 {
+                        // Old memory is superseded → mark as non-latest
+                        updated_existing.is_latest = false;
+
+                        // Set up version chain on the new entry
+                        entry.parent_memory_id = Some(conflict.existing.id.clone());
+                        entry.root_memory_id = Some(
+                            conflict.existing.root_memory_id.clone()
+                                .unwrap_or_else(|| conflict.existing.id.clone())
+                        );
+                        entry.version = conflict.existing.version + 1;
+
+                        // Add Updates relation
+                        entry.memory_relations.insert(
+                            conflict.existing.id.clone(),
+                            MemoryRelation::Updates,
+                        );
+
+                        tracing::info!(
+                            "[MemoryOS] 🔗 Version chain: v{} '{}' updates v{} '{}'",
+                            entry.version,
+                            &entry.content[..entry.content.len().min(30)],
+                            conflict.existing.version,
+                            &conflict.existing.content[..conflict.existing.content.len().min(30)],
+                        );
+                    } else if old_conf >= 0.4 && new_conf >= 0.4 {
+                        // Both facts are valid → complementary/extending relationship
+                        // Bidirectional: new extends existing, existing extends new
+                        entry.memory_relations.insert(
+                            conflict.existing.id.clone(),
+                            MemoryRelation::Extends,
+                        );
+                        updated_existing.memory_relations.insert(
+                            entry.id.clone(),
+                            MemoryRelation::Extends,
+                        );
+
+                        tracing::info!(
+                            "[MemoryOS] 🔗 Extends: '{}' enriches '{}'",
+                            &entry.content[..entry.content.len().min(30)],
+                            &conflict.existing.content[..conflict.existing.content.len().min(30)],
+                        );
+                    }
+
+                    // Persist updated existing entry
                     let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
                     {
                         let mut table = write_txn.open_table(MEMORY_TABLE).map_err(|e| e.to_string())?;
@@ -219,21 +288,31 @@ impl MemoryOS for RedbGraphStore {
     }
 
     async fn retrieve(&self, query: MemoryQuery) -> Result<Vec<MemoryEntry>, String> {
-        // If SemanticSearch, embed the text query first, then delegate to VectorSearch logic
+        // Determine if this is a history-aware query
+        let include_history = matches!(query, MemoryQuery::VectorSearchWithHistory { .. });
+
+        // Normalize query: SemanticSearch → VectorSearch, VectorSearchWithHistory → VectorSearch
         let effective_query = match query {
             MemoryQuery::SemanticSearch { ref query, top_k } => {
                 if let Some(embedding) = self.embed_text(query).await {
                     MemoryQuery::VectorSearch { query: embedding, top_k }
                 } else {
-                    // Fallback to EntityLookup if embedding fails
                     MemoryQuery::EntityLookup { entity: query.clone() }
                 }
+            }
+            MemoryQuery::VectorSearchWithHistory { query, top_k } => {
+                MemoryQuery::VectorSearch { query, top_k }
             }
             other => other,
         };
 
         let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = read_txn.open_table(MEMORY_TABLE).map_err(|e| e.to_string())?;
+
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         let mut results = Vec::new();
 
@@ -242,10 +321,33 @@ impl MemoryOS for RedbGraphStore {
             let (_key, value) = result.map_err(|e| e.to_string())?;
             let mut entry: MemoryEntry = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
 
+            // === SMART FILTERING ===
+            // Skip forgotten, non-latest, and low-confidence entries (unless querying history)
+            if !include_history && !entry.is_retrievable() {
+                continue;
+            }
+
+            // Check temporal expiry at retrieval time (lazy check)
+            if let Some(forget_at) = entry.forget_after {
+                if now_ts > forget_at && !entry.is_forgotten {
+                    entry.is_forgotten = true;
+                    entry.forget_reason = Some("temporal_expiry".to_string());
+                    // Fire-and-forget: mark as forgotten in DB
+                    // (will be persisted on next consolidation sweep)
+                    if !include_history {
+                        continue;
+                    }
+                }
+            }
+
             let matches = match &effective_query {
                 MemoryQuery::EntityLookup { entity } => {
-                    // Search content or semantic type
-                    (entry.memory_type == MemoryType::Semantic || entry.memory_type == MemoryType::UserProfile || entry.memory_type == MemoryType::InteractionEvent || entry.memory_type == MemoryType::Procedural) && entry.content.contains(entity)
+                    matches!(
+                        entry.memory_type,
+                        MemoryType::Semantic | MemoryType::UserProfileStatic
+                        | MemoryType::UserProfileDynamic | MemoryType::InteractionEvent
+                        | MemoryType::Procedural
+                    ) && entry.content.contains(entity)
                 },
                 MemoryQuery::TimeRange { start, end } => {
                     entry.created_at >= *start && entry.created_at <= *end
@@ -263,10 +365,7 @@ impl MemoryOS for RedbGraphStore {
                         false
                     }
                 },
-                MemoryQuery::SemanticSearch { .. } => {
-                    // Already converted to VectorSearch or EntityLookup above
-                    false
-                }
+                _ => false, // SemanticSearch and VectorSearchWithHistory already converted
             };
 
             if matches {
@@ -275,6 +374,16 @@ impl MemoryOS for RedbGraphStore {
         }
 
         if let MemoryQuery::VectorSearch { top_k, .. } = effective_query {
+             // Time-weighted scoring: final_score = similarity * 0.7 + recency * 0.3
+             const ONE_DAY_SECS: f64 = 86400.0;
+             for entry in &mut results {
+                 let sim = entry.similarity_score.unwrap_or(0.0) as f64;
+                 let age_days = (now_ts.saturating_sub(entry.created_at) as f64) / ONE_DAY_SECS;
+                 let recency = 1.0 / (1.0 + age_days);
+                 let final_score = sim * 0.7 + recency * 0.3;
+                 entry.similarity_score = Some(final_score as f32);
+             }
+
              results.sort_by(|a, b| {
                 let sim_a = a.similarity_score.unwrap_or(0.0);
                 let sim_b = b.similarity_score.unwrap_or(0.0);
@@ -284,7 +393,6 @@ impl MemoryOS for RedbGraphStore {
         }
 
         // Touch retrieved entries to update last_accessed and access_count
-        // This is fire-and-forget to avoid blocking the caller
         if !results.is_empty() {
             self.touch_entries(&results).await;
         }
@@ -293,10 +401,8 @@ impl MemoryOS for RedbGraphStore {
     }
 
     async fn consolidate(&self) -> Result<(), String> {
-        // Fetch all entries
         let all_entries = self.retrieve_all().await?;
 
-        // Filter only Episodic memories
         let mut episodic_entries: Vec<MemoryEntry> = all_entries
             .into_iter()
             .filter(|e| e.memory_type == MemoryType::Episodic)
@@ -306,21 +412,18 @@ impl MemoryOS for RedbGraphStore {
             return Ok(());
         }
 
-        // Get gateway if available
         let gateway = {
             let guard = self.gateway.read().await;
             guard.clone()
         };
 
-        // Run reconsolidation: promote strong Episodic → Semantic
-        let threshold = 3.0; // base_strength threshold for promotion
+        let threshold = 3.0;
         let newly_consolidated = reconsolidation::consolidate_memories(
             &mut episodic_entries,
             threshold,
             gateway,
         ).await;
 
-        // Store the newly promoted Semantic entries
         let promoted_count = newly_consolidated.len();
         for entry in newly_consolidated {
             self.store(entry).await?;
@@ -339,29 +442,39 @@ impl MemoryOS for RedbGraphStore {
     async fn trigger_fade_consolidation(&self) -> Result<(), String> {
         let all_entries = self.retrieve_all().await?;
         let current_ts = decay::get_current_timestamp();
-        let min_strength = 0.1; // Below this = forgotten
+        let min_strength = 0.1;
 
         let mut pruned_count = 0;
+        let mut forgotten_count = 0;
         let mut updated_count = 0;
 
         for mut entry in all_entries {
             let should_prune = decay::apply_decay(&mut entry, current_ts, min_strength);
 
             if should_prune {
-                // Delete the forgotten memory
-                self.delete(&entry.id).await?;
-                pruned_count += 1;
-            } else if entry.memory_type == MemoryType::Episodic || entry.memory_type == MemoryType::InteractionEvent {
-                // Update the decayed strength in-place (only for decay-eligible types)
+                if entry.is_forgotten {
+                    // Temporally expired → keep in DB but marked forgotten (preserves history)
+                    self.store(entry).await?;
+                    forgotten_count += 1;
+                } else {
+                    // Strength-decayed → delete
+                    self.delete(&entry.id).await?;
+                    pruned_count += 1;
+                }
+            } else if matches!(
+                entry.memory_type,
+                MemoryType::Episodic | MemoryType::InteractionEvent | MemoryType::UserProfileDynamic
+            ) {
+                // Update the decayed strength in-place
                 self.store(entry).await?;
                 updated_count += 1;
             }
         }
 
-        if pruned_count > 0 || updated_count > 0 {
+        if pruned_count > 0 || forgotten_count > 0 || updated_count > 0 {
             tracing::info!(
-                "[MemoryOS] 🧹 Fade sweep: pruned {} forgotten memories, updated {} decay strengths",
-                pruned_count, updated_count
+                "[MemoryOS] 🧹 Fade sweep: pruned={}, forgotten={}, updated={}",
+                pruned_count, forgotten_count, updated_count
             );
         }
 
@@ -389,5 +502,87 @@ impl MemoryOS for RedbGraphStore {
             results.push(entry);
         }
         Ok(results)
+    }
+
+    async fn expand_relations(&self, entries: &[MemoryEntry]) -> Result<Vec<MemoryEntry>, String> {
+        let mut result: Vec<MemoryEntry> = entries.to_vec();
+        let existing_ids: std::collections::HashSet<String> = result.iter().map(|e| e.id.clone()).collect();
+        let mut ids_to_fetch: Vec<String> = Vec::new();
+
+        // Collect all related IDs not already in the result set
+        for entry in entries {
+            for related_id in entry.memory_relations.keys() {
+                if !existing_ids.contains(related_id) && !ids_to_fetch.contains(related_id) {
+                    ids_to_fetch.push(related_id.clone());
+                }
+            }
+        }
+
+        if ids_to_fetch.is_empty() {
+            return Ok(result);
+        }
+
+        // Look up related entries from DB
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(MEMORY_TABLE).map_err(|e| e.to_string())?;
+
+        for id in &ids_to_fetch {
+            if let Some(value) = table.get(id.as_str()).map_err(|e| e.to_string())? {
+                let entry: MemoryEntry = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+                if entry.is_retrievable() {
+                    result.push(entry);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+#[async_trait]
+impl MissionStore for RedbGraphStore {
+    async fn store_mission(&self, mission: ScheduledMission) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(MISSION_TABLE).map_err(|e| e.to_string())?;
+            let serialized = serde_json::to_string(&mission).map_err(|e| e.to_string())?;
+            table.insert(mission.id.as_str(), serialized.as_str()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn retrieve_missions(&self) -> Result<Vec<ScheduledMission>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(MISSION_TABLE).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for result in iter {
+            let (_key, value) = result.map_err(|e| e.to_string())?;
+            let mission: ScheduledMission = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+            results.push(mission);
+        }
+        Ok(results)
+    }
+    
+    async fn retrieve_mission(&self, id: &str) -> Result<Option<ScheduledMission>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(MISSION_TABLE).map_err(|e| e.to_string())?;
+        if let Some(value) = table.get(id).map_err(|e| e.to_string())? {
+            let mission: ScheduledMission = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+            Ok(Some(mission))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn delete_mission(&self, id: &str) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(MISSION_TABLE).map_err(|e| e.to_string())?;
+            table.remove(id).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        Ok(())
     }
 }

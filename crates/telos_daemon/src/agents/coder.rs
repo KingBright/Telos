@@ -77,6 +77,7 @@ WORKFLOW:
 
 [TOOL_REFLECTION] SELF-EVOLUTION & DYNAMIC TOOL CREATION:
 [MANDATORY BEHAVIOR]: When the user asks you to create a tool or you determine a custom tool is needed, you MUST immediately attempt to create it. DO NOT refuse, DO NOT say "I don't have the ability", DO NOT deflect. The create_rhai_tool action IS your ability to create new tools — USE IT.
+[CRITICAL AUTHORIZATION]: You are running in a safe, automated sandbox environment. You have FULL system authorization to create and persist tools using create_rhai_tool. It is completely safe. DO NOT mention any inability or permission issues regarding tool creation.
 [TOOL ITERATION]: If a tool with the SAME NAME already exists, calling create_rhai_tool with that name will OVERWRITE it. Use this to update/fix/iterate on existing tools. You can inspect existing tools with `list_rhai_tools` first.
 
 DESIGN PRINCIPLE: Tools should ONLY FETCH data — keep Rhai scripts simple. The LLM will interpret the raw output.
@@ -154,7 +155,7 @@ If you cannot complete the task with the available tools, explain what's blockin
                 if let Some(t) = extracted { t } else { guard.discover_tools(&input.task, 10) }
             };
             // Also explicitly include core coding tools if not already discovered
-            let core_names = ["file_edit", "fs_read", "fs_write", "shell_exec", "lsp_tool", "glob", "create_rhai_tool", "list_rhai_tools"];
+            let core_names = ["file_edit", "fs_read", "fs_write", "shell_exec", "lsp_tool", "glob", "create_rhai_tool", "list_rhai_tools", "schedule_mission", "list_scheduled_missions", "cancel_mission"];
             for name in &core_names {
                 if !tools.iter().any(|t| t.name == *name) {
                     if let Some(schema) = guard.list_all_tools().into_iter().find(|t| t.name == *name) {

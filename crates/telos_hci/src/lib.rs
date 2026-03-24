@@ -255,6 +255,12 @@ pub enum AgentEvent {
         payload: Vec<u8>,
         trace_id: Uuid,
     },
+    SystemMission {
+        mission_id: String,
+        context: String,
+        origin_channel: String,
+        trace_id: Uuid,
+    },
     UserApproval {
         task_id: String,
         node_id: Option<String>,
@@ -291,6 +297,7 @@ impl AgentEvent {
         match self {
             AgentEvent::UserInput { trace_id, .. } => *trace_id,
             AgentEvent::AutoTrigger { trace_id, .. } => *trace_id,
+            AgentEvent::SystemMission { trace_id, .. } => *trace_id,
             AgentEvent::UserApproval { trace_id, .. } => *trace_id,
             AgentEvent::ReplanRequested { trace_id, .. } => *trace_id,
             AgentEvent::UserIntervention { trace_id, .. } => *trace_id,

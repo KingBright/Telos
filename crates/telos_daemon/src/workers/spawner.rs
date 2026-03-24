@@ -318,7 +318,7 @@ pub fn spawn_background_tasks(
             ).await {
                 Ok(entries) => entries.into_iter()
                     .filter(|e| matches!(e.memory_type, 
-                        telos_memory::MemoryType::InteractionEvent | telos_memory::MemoryType::UserProfile))
+                        telos_memory::MemoryType::InteractionEvent | telos_memory::MemoryType::UserProfileStatic | telos_memory::MemoryType::UserProfileDynamic))
                     .take(20) // Cap to avoid huge prompts
                     .map(|e| e.content)
                     .collect::<Vec<_>>(),

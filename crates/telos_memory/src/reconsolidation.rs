@@ -1,4 +1,4 @@
-use crate::types::{MemoryEntry, MemoryType};
+use crate::types::{MemoryEntry, MemoryRelation, MemoryType};
 
 /// Memory reconsolidation mimics the brain's process of turning short-term
 /// episodic experiences into long-term semantic facts or procedural skills.
@@ -46,19 +46,19 @@ pub async fn consolidate_memories(
             }
 
             // We clone it to add to the semantic graph
-            let semantic_entry = MemoryEntry {
-                id: format!("sem_{}", entry.id),
-                memory_type: MemoryType::Semantic,
+            let mut semantic_entry = MemoryEntry::new(
+                format!("sem_{}", entry.id),
+                MemoryType::Semantic,
                 content, // Promoted content
-                base_strength: 5.0, // Fixed high strength
-                current_strength: 5.0,
-                created_at: entry.created_at,
-                last_accessed: entry.last_accessed,
-                embedding: entry.embedding.clone(),
-                access_count: 0,
-                confidence: 1.0, // Freshly consolidated = full confidence
-                similarity_score: None,
-            };
+                entry.created_at,
+                entry.embedding.clone(),
+            );
+            semantic_entry.base_strength = 5.0; // Fixed high strength
+            semantic_entry.current_strength = 5.0;
+            semantic_entry.last_accessed = entry.last_accessed;
+            semantic_entry.is_static = true; // Consolidated facts don't decay
+            // Link to source episodic memory via Derives relation
+            semantic_entry.memory_relations.insert(entry.id.clone(), MemoryRelation::Derives);
 
             newly_consolidated.push(semantic_entry);
             // We intentionally do NOT change the original episodic memory type to Semantic.

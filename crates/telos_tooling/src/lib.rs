@@ -26,6 +26,17 @@ type ToolCreationHookFn = Box<dyn Fn(&str, bool, bool) + Send + Sync>;
 static TOOL_METRICS_HOOK: OnceLock<ToolMetricsHookFn> = OnceLock::new();
 static TOOL_CREATION_HOOK: OnceLock<ToolCreationHookFn> = OnceLock::new();
 
+/// Global reference to a ToolRegistry for recording tool health metrics.
+/// Set once at daemon startup after registry construction.
+#[cfg(feature = "full")]
+static TOOL_HEALTH_REGISTRY: OnceLock<std::sync::Arc<dyn ToolRegistry>> = OnceLock::new();
+
+/// Register the global tool health registry reference. Must be called after wrapping the registry.
+#[cfg(feature = "full")]
+pub fn set_tool_health_registry(registry: std::sync::Arc<dyn ToolRegistry>) {
+    let _ = TOOL_HEALTH_REGISTRY.set(registry);
+}
+
 /// Register a global callback that fires after every tool execution.
 /// Should be called once at daemon startup.
 pub fn set_tool_metrics_hook(
@@ -64,9 +75,15 @@ impl ToolExecutor for InstrumentedToolExecutor {
         let duration = start.elapsed();
         let success = result.is_ok();
 
-        // Fire the global hook if registered
+        // Fire the global metrics hook if registered
         if let Some(hook) = TOOL_METRICS_HOOK.get() {
             hook(&self.tool_name, success, duration);
+        }
+
+        // Record tool health (success/failure counts)
+        #[cfg(feature = "full")]
+        if let Some(registry) = TOOL_HEALTH_REGISTRY.get() {
+            registry.record_tool_usage(&self.tool_name, success);
         }
 
         result
@@ -118,10 +135,35 @@ pub struct ToolSchema {
     /// Experience notes accumulated from past usage failures or QA feedback
     #[serde(default)]
     pub experience_notes: Vec<String>,
+    
+    // ─── Health Tracking ────────────────────────────────────────
+    /// Cumulative successful invocations
+    #[serde(default)]
+    pub success_count: u32,
+    /// Cumulative failed invocations
+    #[serde(default)]
+    pub failure_count: u32,
+    /// Epoch ms of last successful call (0 = never succeeded)
+    #[serde(default)]
+    pub last_success_at: u64,
+    /// Epoch ms of last failed call (0 = never failed)
+    #[serde(default)]
+    pub last_failure_at: u64,
+    /// Health status: "active", "dormant", "broken", "archived"
+    /// - active: recently used and working
+    /// - dormant: has succeeded before but not used recently (still valuable)
+    /// - broken: never succeeded or extremely high failure rate (candidate for deletion)
+    /// - archived: manually hidden from discovery (preserved on disk but invisible)
+    #[serde(default = "default_health_status")]
+    pub health_status: String,
 }
 
 fn default_version() -> String {
     "1.0.0".to_string()
+}
+
+fn default_health_status() -> String {
+    "active".to_string()
 }
 
 impl ToolSchema {
@@ -137,6 +179,11 @@ impl ToolSchema {
             parent_tool: None,
             change_reason: None,
             experience_notes: Vec::new(),
+            success_count: 0,
+            failure_count: 0,
+            last_success_at: 0,
+            last_failure_at: 0,
+            health_status: default_health_status(),
         }
     }
 
@@ -151,7 +198,13 @@ impl ToolSchema {
             iteration: self.iteration + 1,
             parent_tool: Some(self.name.clone()),
             change_reason: Some(reason.into()),
-            experience_notes: self.experience_notes.clone(), // Preserve experience notes across iterations or clear them? Usually preserve is safer unless specified otherwise.
+            experience_notes: self.experience_notes.clone(),
+            // Preserve health stats across iterations
+            success_count: self.success_count,
+            failure_count: self.failure_count,
+            last_success_at: self.last_success_at,
+            last_failure_at: self.last_failure_at,
+            health_status: self.health_status.clone(),
         }
     }
 
@@ -196,6 +249,12 @@ pub trait ToolRegistry: Send + Sync {
     fn list_all_tools(&self) -> Vec<ToolSchema>;
     fn register_dynamic_tool(&self, schema: ToolSchema, executor: std::sync::Arc<dyn ToolExecutor>) -> Result<(), String>;
     fn attach_tool_note(&self, tool_name: &str, note: String) -> Result<(), String>;
+    /// Record a tool usage event (success or failure) to update health metrics.
+    fn record_tool_usage(&self, tool_name: &str, success: bool);
+    /// Archive a tool (hide from discovery but keep on disk).
+    fn archive_tool(&self, tool_name: &str) -> Result<(), String>;
+    /// Delete a tool permanently (remove from memory and disk).
+    fn delete_tool(&self, tool_name: &str) -> Result<(), String>;
 }
 
 /// A wrapper that allows an Arc<tokio::sync::RwLock<dyn ToolRegistry>> to be used where Arc<dyn ToolRegistry> is expected.
@@ -260,6 +319,28 @@ impl<T: ToolRegistry + ?Sized> ToolRegistry for SharedToolRegistry<T> {
     fn attach_tool_note(&self, tool_name: &str, note: String) -> Result<(), String> {
         if let Ok(guard) = self.inner.try_read() {
             guard.attach_tool_note(tool_name, note)
+        } else {
+            Err("Registry is locked".into())
+        }
+    }
+
+    fn record_tool_usage(&self, tool_name: &str, success: bool) {
+        if let Ok(guard) = self.inner.try_read() {
+            guard.record_tool_usage(tool_name, success);
+        }
+    }
+
+    fn archive_tool(&self, tool_name: &str) -> Result<(), String> {
+        if let Ok(guard) = self.inner.try_read() {
+            guard.archive_tool(tool_name)
+        } else {
+            Err("Registry is locked".into())
+        }
+    }
+
+    fn delete_tool(&self, tool_name: &str) -> Result<(), String> {
+        if let Ok(guard) = self.inner.try_read() {
+            guard.delete_tool(tool_name)
         } else {
             Err("Registry is locked".into())
         }

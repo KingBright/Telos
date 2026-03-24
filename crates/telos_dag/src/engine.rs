@@ -846,6 +846,19 @@ impl ExecutionEngine for TokioExecutionEngine {
                                     execution_time_ms,
                                 });
 
+                                // Record NodeExecution performance metric
+                                let node_type_for_metric = graph.node_metadata.get(&node_id)
+                                    .map(|m| m.task_type.clone())
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                telos_core::metrics::record(telos_core::metrics::MetricEvent::NodeExecution {
+                                    timestamp_ms: telos_core::metrics::now_ms(),
+                                    task_id: graph_id.clone(),
+                                    node_id: node_id.clone(),
+                                    node_type: node_type_for_metric,
+                                    elapsed_ms: execution_time_ms,
+                                    success: true,
+                                });
+
                                 let node_idx = graph.node_indices.get(&node_id).unwrap();
                                 let mut outgoing = graph.edges.neighbors_directed(*node_idx, Direction::Outgoing).detach();
                                 while let Some(neighbor_idx) = outgoing.next_node(&graph.edges) {
@@ -895,6 +908,19 @@ impl ExecutionEngine for TokioExecutionEngine {
                                         stack_trace: None,
                                         retry_suggested: false,
                                     }),
+                                });
+
+                                // Record NodeExecution metric for failed node
+                                let node_type_for_metric = graph.node_metadata.get(&node_id)
+                                    .map(|m| m.task_type.clone())
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                telos_core::metrics::record(telos_core::metrics::MetricEvent::NodeExecution {
+                                    timestamp_ms: telos_core::metrics::now_ms(),
+                                    task_id: graph_id.clone(),
+                                    node_id: node_id.clone(),
+                                    node_type: node_type_for_metric,
+                                    elapsed_ms: execution_time_ms,
+                                    success: false,
                                 });
 
                                 // Graph pruning: mark all downstream dependents as Skipped

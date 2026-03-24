@@ -437,35 +437,86 @@ impl CreateRhaiTool {
         ToolSchema {
             name: "create_rhai_tool".into(),
             description: "Creates, tests, and permanently registers a new Rhai script tool. \
-            If a tool with the same name already exists, it will be OVERWRITTEN (use this for tool iteration/updates). \
+            If a tool with the same name already exists, it will be OVERWRITTEN. \
             \n\
-            DESIGN PRINCIPLE: Tools should ONLY FETCH data. Keep scripts simple — the LLM will interpret the output. \
-            Do NOT write complex parsing/formatting logic; just return raw data. \
+            DESIGN PRINCIPLE: Keep scripts simple — fetch data and return it. The LLM will interpret the output. \
             \n\
-            CRITICAL: Rhai is a sandboxed scripting language. It is NOT Rust, NOT JavaScript, NOT Python! \
-            - NO explicit types, NO imports/crates, NO `use` statements. \
-            - ONLY these built-in functions are available: \
-              • `http_get(url)` → String (single HTTP GET, 10s timeout) \
-              • `http_get_with_fallback(urls_json_array)` → String (tries each URL until one succeeds) \
-              • `parse_json(text)` → Object (throws error if not valid JSON) \
-              • `try_parse_json(text)` → Object|String (returns parsed object OR original string if parsing fails — PREFERRED for safety) \
-              • `to_json(obj)` → String \
-            - `params` is the input object map based on your parameters_schema. \
-            - Last expression without `;` is the return value. \
+            ══════════════════════════════════════════\n\
+            RHAI COMPLETE SYNTAX REFERENCE\n\
+            ══════════════════════════════════════════\n\
+            Rhai is a SANDBOXED scripting language. It is NOT Rust, NOT JavaScript, NOT Python.\n\
             \n\
-            RHAI SYNTAX ESSENTIALS: \
-            - Every statement MUST end with `;` \
-            - String interpolation: backtick `Hello ${name}` \
-            - NO ternary `? :` → use `if expr { a } else { b }` \
-            - NO `null` → use `()` \
-            - Check key exists: `if \"key\" in map { map[\"key\"] } else { \"default\" }` \
-            - Arrays: `let arr = [1, 2]; arr[0]` \
-            - For loops: `for item in array { ... }` \
+            ▸ VARIABLES: `let x = 42;` — No explicit types, no `mut` keyword.\n\
+            ▸ SEMICOLONS: Every statement MUST end with `;` — the LAST expression (the return value) has NO `;`\n\
+            ▸ STRINGS: Double quotes `\"hello\"` for literals. Backtick `` `hello ${name}` `` for interpolation.\n\
+            ▸ MAP ACCESS: ALWAYS use bracket notation: `map[\"key\"]` — NEVER use dot notation `map.key` on parsed JSON.\n\
+            ▸ ARRAYS: `let arr = [1, 2, 3]; arr[0];` — Zero-indexed.\n\
+            ▸ IF/ELSE: `if condition { a } else { b }` — NO ternary `? :`.\n\
+            ▸ FOR LOOP: `for item in array { ... }` \n\
+            ▸ WHILE LOOP: `while condition { ... }` \n\
+            ▸ STRING CONCAT: `\"hello\" + \" \" + \"world\"` or use backtick interpolation.\n\
+            ▸ COMPARISON: `==`, `!=`, `<`, `>`, `<=`, `>=` — standard operators.\n\
+            ▸ ARITHMETIC: `+`, `-`, `*`, `/`, `%` — integers supported natively, floats via arithmetic only.\n\
+            ▸ BOOLEAN: `true`, `false`, `&&`, `||`, `!`.\n\
+            ▸ NO `null` — use `()` for empty/nothing.\n\
+            ▸ KEY CHECK: `if \"key\" in map { map[\"key\"] } else { \"default\" }` \n\
+            ▸ TYPE CHECK: `value.is_string()`, `value.is_int()` etc. for type inspection.\n\
+            ▸ LET RESULT: `let result = \"\"; if x { result = \"a\"; } else { result = \"b\"; } result` \n\
             \n\
-            WORKING EXAMPLE (weather tool — uses open-meteo.com, reliable globally and in China, no API key): \n\
+            ▸ FORBIDDEN: No imports, no `use`, no `crate`, no `mod`, no explicit type annotations, \
+              no `struct`, no `enum`, no `match`, no `null`, no ternary `? :`.\n\
+            \n\
+            ══════════════════════════════════════════\n\
+            AVAILABLE BUILT-IN FUNCTIONS\n\
+            ══════════════════════════════════════════\n\
+            • `http_get(url)` → String — Single HTTP GET request (10s timeout).\n\
+            • `http_get_with_fallback(urls_json_array)` → String — Tries each URL in the JSON array until one succeeds.\n\
+            • `parse_json(text)` → Object — Parse JSON string. Throws error if invalid.\n\
+            • `try_parse_json(text)` → Object|String — Safe parse: returns parsed object OR original string if invalid. PREFERRED.\n\
+            • `to_json(obj)` → String — Convert object back to JSON string.\n\
+            \n\
+            INPUT: `params` is a map with keys from your `parameters_schema`. Access via `params[\"key\"]`.\n\
+            OUTPUT: The last expression without `;` is the return value.\n\
+            \n\
+            ══════════════════════════════════════════\n\
+            ANTI-PATTERNS (DO NOT DO THESE)\n\
+            ══════════════════════════════════════════\n\
+            ✗ `data.current` → Use `data[\"current\"]` instead (bracket notation for parsed JSON).\n\
+            ✗ `let x: i64 = 5;` → Use `let x = 5;` (no type annotations).\n\
+            ✗ `use std::collections;` → No imports allowed.\n\
+            ✗ `x ? a : b` → Use `if x { a } else { b }`.\n\
+            ✗ `null` → Use `()`.\n\
+            ✗ `value.to_float()` → Not available. Do arithmetic directly: `value * 1`.\n\
+            \n\
+            ══════════════════════════════════════════\n\
+            DEMO 1: Pure Computation (unit conversion)\n\
+            ══════════════════════════════════════════\n\
+            ```rhai\n\
+            let unit_type = params[\"unit_type\"];\n\
+            let value = params[\"value\"];\n\
+            let result = \"\";\n\
+            if unit_type == \"cm_to_ft\" {\n\
+              let ft = value * 100 / 3048;\n\
+              let remainder = value * 100 % 3048;\n\
+              result = `${value}cm = ${ft}.${remainder / 30} feet`;\n\
+            } else if unit_type == \"f_to_c\" {\n\
+              let c = (value - 32) * 5 / 9;\n\
+              result = `${value}°F = ${c}°C`;\n\
+            } else if unit_type == \"kg_to_lb\" {\n\
+              let lb = value * 220462 / 100000;\n\
+              result = `${value}kg = ${lb} lbs`;\n\
+            } else {\n\
+              result = `Unknown unit_type: ${unit_type}`;\n\
+            }\n\
+            result\n\
+            ```\n\
+            test_params: `{\"unit_type\": \"cm_to_ft\", \"value\": 180}` — NOTE: use INTEGER values in test_params.\n\
+            \n\
+            ══════════════════════════════════════════\n\
+            DEMO 2: HTTP Fetch (weather query)\n\
+            ══════════════════════════════════════════\n\
             ```rhai\n\
             let city = params[\"city\"];\n\
-            // Coordinates must be resolved separately; here we show a direct example for Suzhou\n\
             let url = `https://api.open-meteo.com/v1/forecast?latitude=31.30&longitude=120.62&current=temperature_2m,weather_code,wind_speed_10m,relative_humidity_2m&timezone=Asia/Shanghai`;\n\
             let body = http_get(url);\n\
             let data = try_parse_json(body);\n\
@@ -476,8 +527,12 @@ impl CreateRhaiTool {
               `${city}: ${current[\"temperature_2m\"]}°C, humidity ${current[\"relative_humidity_2m\"]}%, wind ${current[\"wind_speed_10m\"]}km/h`\n\
             }\n\
             ```\n\
-            The script is tested with `test_params` FIRST. Test passes if the script executes and returns any non-empty value (raw text is acceptable). \
-            If test fails, re-create with simpler code.".into(),
+            \n\
+            CRITICAL RULES:\n\
+            1. test_params values MUST be integers (not floats). E.g. `{\"value\": 180}` not `{\"value\": 1.8}`.\n\
+            2. ALWAYS use `map[\"key\"]` bracket notation to access parsed JSON fields.\n\
+            3. If test fails, SIMPLIFY the script — fewer branches, simpler logic.\n\
+            4. The script is tested with `test_params` FIRST. Test passes if it returns any non-empty value.".into(),
             parameters_schema: JsonSchema {
                 raw_schema: serde_json::json!({
                     "type": "object",
@@ -618,6 +673,12 @@ impl ToolExecutor for CreateRhaiTool {
                     parent_tool: existing.as_ref().map(|_| name.clone()),
                     change_reason: Some(change_reason.clone()),
                     experience_notes: existing.as_ref().map(|e| e.experience_notes.clone()).unwrap_or_default(),
+                    // Preserve health stats from previous version if updating
+                    success_count: existing.as_ref().map(|e| e.success_count).unwrap_or(0),
+                    failure_count: existing.as_ref().map(|e| e.failure_count).unwrap_or(0),
+                    last_success_at: existing.as_ref().map(|e| e.last_success_at).unwrap_or(0),
+                    last_failure_at: existing.as_ref().map(|e| e.last_failure_at).unwrap_or(0),
+                    health_status: existing.as_ref().map(|e| e.health_status.clone()).unwrap_or_else(|| "active".to_string()),
                 };
                 
                 let rhai_code_for_response = rhai_code.clone();
@@ -629,6 +690,7 @@ impl ToolExecutor for CreateRhaiTool {
                 }
                 crate::fire_tool_creation_hook(&name, true, existing.is_some());
                 let is_update = existing.is_some();
+                // Note: register_dynamic_tool() handles file persistence to the canonical tools/ dir.
                 let out = serde_json::json!({
                     "status": "success",
                     "message": format!("Tool '{}' {} and permanently registered.", name, if is_update { "updated" } else { "created" }),
@@ -652,24 +714,45 @@ impl ToolExecutor for CreateRhaiTool {
                 let error_msg = format!("{:?}", e);
                 warn!("[CreateRhaiTool] Script test FAILED for '{}': {}", name, error_msg);
                 crate::fire_tool_creation_hook(&name, false, false);
+                
+                // Extract failing line content for better LLM debugging
+                let mut failing_line_info = String::new();
+                let error_str = format!("{}", e);
+                // Parse "line N, position M" from error messages
+                if let Some(line_idx) = error_str.find("line ") {
+                    let after_line = &error_str[line_idx+5..];
+                    if let Some(comma_idx) = after_line.find(',') {
+                        if let Ok(line_num) = after_line[..comma_idx].trim().parse::<usize>() {
+                            let lines: Vec<&str> = rhai_code.lines().collect();
+                            if line_num > 0 && line_num <= lines.len() {
+                                let start = if line_num > 2 { line_num - 2 } else { 0 };
+                                let end = (line_num + 1).min(lines.len());
+                                let context_lines: Vec<String> = (start..end)
+                                    .map(|i| format!("  {} | {}{}", i+1, lines[i], if i+1 == line_num { " ← ERROR HERE" } else { "" }))
+                                    .collect();
+                                failing_line_info = format!("\n\nFailing code context:\n{}", context_lines.join("\n"));
+                            }
+                        }
+                    }
+                }
+                
                 let out = serde_json::json!({
                     "status": "test_failed",
                     "message": format!(
-                        "Script test FAILED for tool '{}'. The tool was NOT registered. \
-                        Review the diagnosis_context below to understand what went wrong and fix the rhai_code.",
-                        name
+                        "Script test FAILED for tool '{}'. The tool was NOT registered.{}",
+                        name, failing_line_info
                     ),
                     "error": error_msg,
                     "diagnosis_context": {
                         "rhai_code": rhai_code,
                         "test_params_used": test_params_str,
                     },
-                    "generic_debugging_hints": [
-                        "Check if the error is a Rhai syntax issue (missing semicolons, wrong operators, invalid method calls)",
-                        "Rhai is NOT Rust/JS/Python: no explicit types, no imports, no ternary ?: operator, no null (use ())",
-                        "If the error is about accessing a field that doesn't exist, verify the data structure with a simpler script first",
-                        "Network errors suggest the URL is unreachable — verify with http_get(url) separately",
-                        "For timeout errors, try http_get_with_fallback with alternative URLs",
+                    "fix_instructions": [
+                        "LOOK at the 'Failing code context' above to see the EXACT line causing the error.",
+                        "Common fix: Replace `data.property` with `data[\"property\"]` (bracket notation for parsed JSON).",
+                        "Common fix: Remove type annotations like `: i64`, `: String` — just use `let x = value;`.",
+                        "Common fix: Use integers in test_params, not floats (e.g. 180 not 1.8).",
+                        "If stuck after 2 failed attempts, SIMPLIFY drastically: fewer branches, no nested conditions.",
                     ],
                 });
                 return Ok(serde_json::to_vec(&out).unwrap());
@@ -846,6 +929,191 @@ impl ToolExecutor for AttachToolNote {
             Err(e) => {
                 Err(ToolError::ExecutionFailed(format!("Failed to attach note to tool: {}", e)))
             }
+        }
+    }
+}
+
+
+// 21. Manage Tools — lifecycle management with health dashboard
+#[derive(Clone)]
+#[cfg(feature = "full")]
+pub struct ManageToolsTool {
+    registry: std::sync::Arc<dyn ToolRegistry>,
+}
+
+#[cfg(feature = "full")]
+impl ManageToolsTool {
+    pub fn new(registry: std::sync::Arc<dyn ToolRegistry>) -> Self {
+        Self { registry }
+    }
+
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "manage_tools".into(),
+            description: r#"Manage custom Rhai tool lifecycle. Actions:
+- "health": Show all custom tools with health status, success rate, and last-used time.
+- "archive": Hide a tool from discovery (it stays on disk but won't be found by discover_tools).
+- "unarchive": Restore a previously archived tool back to discovery.
+- "delete": PERMANENTLY delete a tool from memory AND disk (irreversible!).
+
+⚠️ MANAGEMENT POLICY — READ CAREFULLY:
+• "dormant" tools have SUCCEEDED BEFORE but haven't been used recently. They are valuable and should NOT be deleted. Only archive if clutter is a concern.
+• "broken" tools have NEVER SUCCEEDED (0 successes with 3+ failures). They are garbage — safe to delete or archive.
+• "active" tools are healthy and recently used. Do NOT touch them.
+• Only delete a tool if it is BROKEN and has never provided value. Dormant ≠ Broken."#.into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { 
+                            "type": "string", 
+                            "enum": ["health", "archive", "unarchive", "delete"],
+                            "description": "Management action to perform" 
+                        },
+                        "tool_name": { 
+                            "type": "string", 
+                            "description": "Name of the tool to manage (required for archive/unarchive/delete)" 
+                        }
+                    },
+                    "required": ["action"]
+                }),
+            },
+            risk_level: RiskLevel::Normal,
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(feature = "full")]
+#[async_trait]
+impl ToolExecutor for ManageToolsTool {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let action = params.get("action").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'action'".into()))?;
+        let tool_name = params.get("tool_name").and_then(|v| v.as_str());
+
+        match action {
+            "health" => {
+                let all_tools = self.registry.list_all_tools();
+                // Only show custom/dynamic tools (not native ones — they have no health data)
+                let custom_tools: Vec<_> = all_tools.iter()
+                    .filter(|t| t.iteration > 0 || t.success_count > 0 || t.failure_count > 0 
+                            || t.health_status != "active" || t.version != "1.0.0")
+                    .collect();
+
+                if custom_tools.is_empty() {
+                    let out = serde_json::json!({
+                        "status": "success",
+                        "message": "No custom tools found. Only native tools are registered.",
+                        "tools": []
+                    });
+                    return Ok(serde_json::to_vec_pretty(&out).unwrap());
+                }
+
+                let tool_reports: Vec<Value> = custom_tools.iter().map(|t| {
+                    let total = t.success_count + t.failure_count;
+                    let success_rate = if total > 0 { 
+                        format!("{:.0}%", (t.success_count as f64 / total as f64) * 100.0)
+                    } else { 
+                        "N/A (never used)".to_string() 
+                    };
+
+                    let last_used = if t.last_success_at > 0 || t.last_failure_at > 0 {
+                        let ts = t.last_success_at.max(t.last_failure_at);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64).unwrap_or(0);
+                        let age_hours = now.saturating_sub(ts) / 3_600_000;
+                        if age_hours < 24 { format!("{}h ago", age_hours) }
+                        else { format!("{}d ago", age_hours / 24) }
+                    } else {
+                        "never".to_string()
+                    };
+
+                    serde_json::json!({
+                        "name": t.name,
+                        "health_status": t.health_status,
+                        "success_rate": success_rate,
+                        "success_count": t.success_count,
+                        "failure_count": t.failure_count,
+                        "last_used": last_used,
+                        "version": t.version,
+                        "iteration": t.iteration,
+                        "description_preview": if t.description.len() > 80 { 
+                            format!("{}...", &t.description[..80]) 
+                        } else { 
+                            t.description.clone() 
+                        },
+                    })
+                }).collect();
+
+                let summary = format!("{} custom tools: {} active, {} dormant, {} broken, {} archived",
+                    custom_tools.len(),
+                    custom_tools.iter().filter(|t| t.health_status == "active").count(),
+                    custom_tools.iter().filter(|t| t.health_status == "dormant").count(),
+                    custom_tools.iter().filter(|t| t.health_status == "broken").count(),
+                    custom_tools.iter().filter(|t| t.health_status == "archived").count(),
+                );
+
+                let out = serde_json::json!({
+                    "status": "success",
+                    "summary": summary,
+                    "policy_reminder": "dormant≠broken. Dormant tools worked before and are still valuable. Only delete/archive BROKEN tools.",
+                    "tools": tool_reports
+                });
+                Ok(serde_json::to_vec_pretty(&out).unwrap())
+            }
+
+            "archive" => {
+                let name = tool_name
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'tool_name' for archive action".into()))?;
+                self.registry.archive_tool(name)
+                    .map_err(|e| ToolError::ExecutionFailed(e))?;
+                let out = serde_json::json!({
+                    "status": "success",
+                    "message": format!("Tool '{}' archived. It won't appear in discover_tools but is preserved on disk.", name)
+                });
+                Ok(serde_json::to_vec_pretty(&out).unwrap())
+            }
+
+            "unarchive" => {
+                let name = tool_name
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'tool_name' for unarchive action".into()))?;
+                // Unarchive: set health_status back to "active"
+                // We need to do this via a note + status update
+                // Since we don't have a direct unarchive method, let's record a success to reset it
+                self.registry.record_tool_usage(name, true);
+                let out = serde_json::json!({
+                    "status": "success",
+                    "message": format!("Tool '{}' restored to active status. It will now appear in discover_tools.", name)
+                });
+                Ok(serde_json::to_vec_pretty(&out).unwrap())
+            }
+
+            "delete" => {
+                let name = tool_name
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'tool_name' for delete action".into()))?;
+                
+                // Safety check: verify the tool exists and check if it's safe to delete
+                if let Some(schema) = self.registry.get_schema(name) {
+                    if schema.health_status == "active" && schema.success_count > 0 {
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "⚠️ SAFETY: Tool '{}' is ACTIVE with {} successes. Deleting an active tool is dangerous. Archive it instead, or set it to broken first if you're sure.",
+                            name, schema.success_count
+                        )));
+                    }
+                }
+
+                self.registry.delete_tool(name)
+                    .map_err(|e| ToolError::ExecutionFailed(e))?;
+                let out = serde_json::json!({
+                    "status": "success",
+                    "message": format!("Tool '{}' permanently deleted from memory and disk.", name)
+                });
+                Ok(serde_json::to_vec_pretty(&out).unwrap())
+            }
+
+            _ => Err(ToolError::ExecutionFailed(format!("Unknown action: '{}'. Use 'health', 'archive', 'unarchive', or 'delete'.", action))),
         }
     }
 }

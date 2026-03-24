@@ -88,8 +88,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.global_concurrency_permits,
     ));
 
-    let tool_registry = crate::core::setup::build_tool_registry(&config, gateway.clone()).await;
-
     // Initialize MemoryOS - we no longer use PID-suffix fallbacks to avoid file sprawl.
     let memory_os_instance = match RedbGraphStore::new(&config.db_path) {
         Ok(store) => Arc::new(store),
@@ -98,6 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             panic!("MemoryOS initialization failed");
         }
     };
+
+    let tool_registry = crate::core::setup::build_tool_registry(&config, gateway.clone(), memory_os_instance.clone()).await;
     let system_context = Arc::new(tokio::sync::RwLock::new(telos_core::SystemContext {
         current_time: String::new(),
         location: config.default_location.clone().unwrap_or_else(|| "Unknown Location".to_string()),
@@ -194,6 +194,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     metrics_store.restore_counters();
     let _ = crate::core::metrics_store::METRICS_STORE.set(metrics_store.clone());
+    // Install sink in telos_core so ALL crates can emit metrics via telos_core::metrics::record()
+    telos_core::metrics::install_sink(metrics_store.clone() as std::sync::Arc<dyn telos_core::metrics::MetricsSink>);
     info!("Persistent metrics store initialized at {:?}", metrics_db_path);
 
     // --- API SERVER ---
@@ -213,6 +215,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let axum_server = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
+
+    // Start Scheduler Actor
+    let scheduler = crate::workers::scheduler::SchedulerActor::new(
+        memory_os_instance.clone(),
+        broker.clone(),
+    );
+    scheduler.run().await;
 
     crate::workers::event_loop::run_event_loop(
         event_rx,

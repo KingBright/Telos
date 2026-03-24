@@ -34,18 +34,22 @@ pub fn detect_conflicts(
     let mut conflicts = Vec::new();
 
     for existing in existing_entries {
-        // Only check same-type conflicts (Semantic vs Semantic, UserProfile vs UserProfile)
-        if existing.memory_type != new_entry.memory_type {
+        // Skip non-latest and forgotten entries (they've been superseded)
+        if !existing.is_latest || existing.is_forgotten {
+            continue;
+        }
+
+        // Only check knowledge-bearing types for conflicts
+        let is_conflict_type = matches!(
+            existing.memory_type,
+            MemoryType::Semantic | MemoryType::UserProfileStatic | MemoryType::UserProfileDynamic
+        );
+        if !is_conflict_type {
             continue;
         }
 
         // Skip self-comparison
         if existing.id == new_entry.id {
-            continue;
-        }
-
-        // Only check Semantic and UserProfile types
-        if existing.memory_type != MemoryType::Semantic && existing.memory_type != MemoryType::UserProfile {
             continue;
         }
 
@@ -180,50 +184,34 @@ mod tests {
 
     #[test]
     fn test_detect_conflicts_basic() {
-        let new_entry = MemoryEntry {
-            id: "new_1".to_string(),
-            memory_type: MemoryType::UserProfile,
-            content: "User likes blue".to_string(),
-            base_strength: 1.0,
-            current_strength: 1.0,
-            created_at: 100,
-            last_accessed: 100,
-            embedding: Some(vec![1.0, 0.0, 0.0]),
-            access_count: 0,
-            confidence: 1.0,
-            similarity_score: None,
-        };
+        let new_entry = MemoryEntry::new(
+            "new_1".to_string(),
+            MemoryType::UserProfileStatic,
+            "User likes blue".to_string(),
+            100,
+            Some(vec![1.0, 0.0, 0.0]),
+        );
 
         let existing = vec![
-            MemoryEntry {
-                id: "old_1".to_string(),
-                memory_type: MemoryType::UserProfile,
-                content: "User likes red".to_string(),
-                base_strength: 1.0,
-                current_strength: 1.0,
-                created_at: 50,
-                last_accessed: 50,
-                embedding: Some(vec![0.95, 0.05, 0.0]), // very similar vector
-                access_count: 0,
-                confidence: 1.0,
-                similarity_score: None,
-            },
-            MemoryEntry {
-                id: "old_2".to_string(),
-                memory_type: MemoryType::Semantic,
-                content: "Rust is fast".to_string(),
-                base_strength: 1.0,
-                current_strength: 1.0,
-                created_at: 50,
-                last_accessed: 50,
-                embedding: Some(vec![0.0, 1.0, 0.0]), // different vector
-                access_count: 0,
-                confidence: 1.0,
-                similarity_score: None,
-            },
+            MemoryEntry::new(
+                "old_1".to_string(),
+                MemoryType::UserProfileStatic,
+                "User likes red".to_string(),
+                50,
+                Some(vec![0.95, 0.05, 0.0]), // very similar vector
+            ),
+            MemoryEntry::new(
+                "old_2".to_string(),
+                MemoryType::Semantic,
+                "Rust is fast".to_string(),
+                50,
+                Some(vec![0.0, 1.0, 0.0]), // different vector
+            ),
         ];
 
         let conflicts = detect_conflicts(&new_entry, &existing, 0.8);
+        // old_1 has similar vector but is UserProfileStatic (same type as new_entry) -> conflict
+        // old_2 is Semantic (different content space), but still knowledge-bearing -> checked but low similarity
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].existing.id, "old_1");
     }

@@ -412,14 +412,27 @@ impl ReactLoop {
 
     /// Convert a ReactResult into an AgentOutput
     pub fn to_agent_output(result: ReactResult) -> AgentOutput {
-        if result.completed_normally || !result.content.is_empty() {
+        if result.completed_normally {
             let mut output = AgentOutput::success(serde_json::json!({
                 "text": result.content,
                 "react_meta": {
                     "iterations": result.iterations,
                     "tool_calls": result.tool_calls_made,
                     "tokens_used": result.tokens_used,
-                    "completed_normally": result.completed_normally,
+                    "completed_normally": true,
+                }
+            }));
+            output.trace_logs = result.trace_logs;
+            output
+        } else if !result.content.is_empty() {
+            // Partial result: has content but hit limits
+            let mut output = AgentOutput::success(serde_json::json!({
+                "text": result.content,
+                "react_meta": {
+                    "iterations": result.iterations,
+                    "tool_calls": result.tool_calls_made,
+                    "tokens_used": result.tokens_used,
+                    "completed_normally": false,
                 }
             }));
             output.trace_logs = result.trace_logs;

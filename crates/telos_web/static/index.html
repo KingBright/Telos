@@ -83,13 +83,6 @@
                 </div>
                 <h1 class="text-sm font-bold tracking-[0.2em] uppercase text-slate-100">TELOS DASHBOARD</h1>
             </div>
-            <div class="h-4 w-[1px] bg-glass-border"></div>
-            <div class="flex items-center gap-4 text-[10px] font-mono tracking-widest text-slate-400">
-                <span class="flex items-center gap-2">
-                    <span class="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"></span>
-                    SYSTEM: ONLINE
-                </span>
-            </div>
         </div>
         <div class="flex items-center gap-4">
             <!-- Tab Navigation -->
@@ -108,6 +101,12 @@
                 </button>
                 <button class="tab-btn px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="workflows" onclick="switchTab('workflows')">
                     <span class="material-symbols-outlined text-sm align-middle mr-1">account_tree</span>Workflows
+                </button>
+                <button class="tab-btn px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="performance" onclick="switchTab('performance')">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">speed</span>Perf
+                </button>
+                <button class="tab-btn px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="missions" onclick="switchTab('missions')">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">schedule</span>Missions
                 </button>
                 <button class="tab-btn px-3 py-2 text-[10px] font-bold tracking-widest uppercase" data-tab="traces" onclick="switchTab('traces')">
                     <span class="material-symbols-outlined text-sm align-middle mr-1">timeline</span>Traces
@@ -199,6 +198,31 @@
                 <div class="metric-card rounded-lg p-4">
                     <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Success Rate</div>
                     <div id="m_task_rate" class="text-2xl font-mono font-bold text-primary">—</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Scheduled Missions -->
+        <div class="mb-6">
+            <h3 class="text-[10px] font-bold tracking-widest text-slate-500 uppercase mb-3 flex items-center gap-2">
+                <span class="material-symbols-outlined text-sm text-slate-600">schedule</span> Scheduled Missions
+            </h3>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Active</div>
+                    <div id="m_ms_active" class="text-2xl font-mono font-bold text-blue-400">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Executions</div>
+                    <div id="m_ms_executions" class="text-2xl font-mono font-bold text-slate-100">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Completed</div>
+                    <div id="m_ms_completed" class="text-2xl font-mono font-bold text-primary">0</div>
+                </div>
+                <div class="metric-card rounded-lg p-4">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Failed</div>
+                    <div id="m_ms_failed" class="text-2xl font-mono font-bold text-red-400">0</div>
                 </div>
             </div>
         </div>
@@ -719,23 +743,247 @@
             <div class="text-center py-12 text-slate-500 font-mono text-sm">Loading traces...</div>
         </div>
     </main>
-    
-    <!-- Footer -->
-    <footer class="h-8 border-t border-glass-border bg-background-dark/80 backdrop-blur-md px-6 flex items-center justify-between text-[10px] font-mono text-slate-500 uppercase tracking-widest">
-        <div class="flex items-center gap-6">
-            <span class="flex items-center gap-2">
-                <span class="h-1.5 w-1.5 rounded-full bg-primary"></span>
-                Gateway: LOCALHOST
-            </span>
-            <span class="flex items-center gap-2">
-                <span class="h-1.5 w-1.5 rounded-full bg-primary animate-pulse"></span>
-                DB: CONNECTED
-            </span>
+
+    <!-- ==================== TAB 7: MISSIONS ==================== -->
+    <main id="tab-missions" class="flex-1 p-6 max-w-[1920px] mx-auto w-full hidden">
+        <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xs font-bold tracking-[0.2em] text-slate-400 uppercase">Scheduled Missions (Cron)</h2>
+            <div class="flex items-center gap-3">
+                <button onclick="fetchMissions()" class="text-[10px] font-mono font-bold tracking-widest uppercase px-3 py-1.5 rounded border border-primary/30 bg-primary/10 hover:bg-primary/20 transition-colors text-primary">
+                    <span class="material-symbols-outlined text-sm align-middle mr-1">refresh</span>Refresh
+                </button>
+            </div>
         </div>
-        <div class="flex items-center gap-6">
-            <span class="text-slate-300">MODE: AGENT-OS LIVE</span>
+
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Active</div>
+                <div id="ms_active" class="text-3xl font-mono font-bold text-blue-400">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Executions</div>
+                <div id="ms_executions" class="text-3xl font-mono font-bold text-slate-100">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Completed</div>
+                <div id="ms_completed" class="text-3xl font-mono font-bold text-primary">0</div>
+            </div>
+            <div class="metric-card rounded-lg p-5 text-center">
+                <div class="text-[10px] font-mono text-slate-500 uppercase mb-2">Total Failed</div>
+                <div id="ms_failed" class="text-3xl font-mono font-bold text-red-400">0</div>
+            </div>
         </div>
-    </footer>
+
+        <!-- Missions Table -->
+        <section class="glass-panel rounded-lg p-6">
+            <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
+                <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Active Cron Jobs</h3>
+                <span class="material-symbols-outlined text-slate-500 text-sm">schedule</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-[11px] font-mono">
+                    <thead>
+                        <tr class="text-slate-500 uppercase tracking-wider border-b border-glass-border">
+                            <th class="text-left py-2 px-3">Mission ID</th>
+                            <th class="text-left py-2 px-3">Instruction</th>
+                            <th class="text-left py-2 px-3">Cron</th>
+                            <th class="text-center py-2 px-3">Status</th>
+                            <th class="text-right py-2 px-3">Executions</th>
+                            <th class="text-right py-2 px-3">Last Run</th>
+                            <th class="text-right py-2 px-3">Next Run</th>
+                            <th class="text-center py-2 px-3">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="missions_table">
+                        <tr><td colspan="8" class="text-center py-4 text-slate-600">No scheduled missions</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <!-- ==================== TAB 8: PERFORMANCE ==================== -->
+    <main id="tab-performance" class="flex-1 p-6 max-w-[1920px] mx-auto w-full hidden">
+        <!-- Time Range Bar -->
+        <div class="flex items-center justify-between mb-6">
+            <h2 class="text-xs font-bold tracking-[0.2em] text-slate-400 uppercase">Performance Latency</h2>
+            <div class="flex items-center gap-2">
+                <label class="text-[10px] font-mono text-slate-500 uppercase">Time Range:</label>
+                <select id="perfRangeSelect" onchange="onRangeChange('performance')" class="text-[10px] font-mono bg-glass border border-glass-border text-slate-300 rounded px-2 py-1 outline-none focus:border-primary/50">
+                    <option value="hour">Last Hour</option>
+                    <option value="day" selected>Last 24h</option>
+                    <option value="week">Last Week</option>
+                    <option value="month">Last Month</option>
+                    <option value="year">Last Year</option>
+                    <option value="all">All Time</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            <div class="metric-card rounded-lg p-5">
+                <div class="flex items-center gap-2 mb-3">
+                    <span class="material-symbols-outlined text-sm text-blue-400">model_training</span>
+                    <div class="text-[10px] font-mono text-slate-500 uppercase">LLM Latency</div>
+                </div>
+                <div class="flex items-baseline gap-2">
+                    <div id="pf_llm_avg" class="text-2xl font-mono font-bold text-blue-400">—</div>
+                    <div class="text-[10px] font-mono text-slate-500">avg ms</div>
+                </div>
+                <div class="flex items-baseline gap-2 mt-1">
+                    <span class="text-[10px] font-mono text-slate-500">max</span>
+                    <span id="pf_llm_max" class="text-[11px] font-mono text-slate-400">—</span>
+                    <span class="text-[10px] font-mono text-slate-600">ms</span>
+                    <span class="text-[10px] font-mono text-slate-500 ml-2">n=</span>
+                    <span id="pf_llm_n" class="text-[11px] font-mono text-slate-400">0</span>
+                </div>
+            </div>
+            <div class="metric-card rounded-lg p-5">
+                <div class="flex items-center gap-2 mb-3">
+                    <span class="material-symbols-outlined text-sm text-green-400">task_alt</span>
+                    <div class="text-[10px] font-mono text-slate-500 uppercase">Node Execution</div>
+                </div>
+                <div class="flex items-baseline gap-2">
+                    <div id="pf_node_avg" class="text-2xl font-mono font-bold text-green-400">—</div>
+                    <div class="text-[10px] font-mono text-slate-500">avg ms</div>
+                </div>
+                <div class="flex items-baseline gap-2 mt-1">
+                    <span class="text-[10px] font-mono text-slate-500">max</span>
+                    <span id="pf_node_max" class="text-[11px] font-mono text-slate-400">—</span>
+                    <span class="text-[10px] font-mono text-slate-600">ms</span>
+                    <span class="text-[10px] font-mono text-slate-500 ml-2">n=</span>
+                    <span id="pf_node_n" class="text-[11px] font-mono text-slate-400">0</span>
+                </div>
+            </div>
+            <div class="metric-card rounded-lg p-5">
+                <div class="flex items-center gap-2 mb-3">
+                    <span class="material-symbols-outlined text-sm text-purple-400">database</span>
+                    <div class="text-[10px] font-mono text-slate-500 uppercase">Memory Retrieval</div>
+                </div>
+                <div class="flex items-baseline gap-2">
+                    <div id="pf_mem_avg" class="text-2xl font-mono font-bold text-purple-400">—</div>
+                    <div class="text-[10px] font-mono text-slate-500">avg ms</div>
+                </div>
+                <div class="flex items-baseline gap-2 mt-1">
+                    <span class="text-[10px] font-mono text-slate-500">max</span>
+                    <span id="pf_mem_max" class="text-[11px] font-mono text-slate-400">—</span>
+                    <span class="text-[10px] font-mono text-slate-600">ms</span>
+                    <span class="text-[10px] font-mono text-slate-500 ml-2">n=</span>
+                    <span id="pf_mem_n" class="text-[11px] font-mono text-slate-400">0</span>
+                </div>
+            </div>
+            <div class="metric-card rounded-lg p-5">
+                <div class="flex items-center gap-2 mb-3">
+                    <span class="material-symbols-outlined text-sm text-orange-400">compress</span>
+                    <div class="text-[10px] font-mono text-slate-500 uppercase">Context Compress</div>
+                </div>
+                <div class="flex items-baseline gap-2">
+                    <div id="pf_ctx_avg" class="text-2xl font-mono font-bold text-orange-400">—</div>
+                    <div class="text-[10px] font-mono text-slate-500">avg ms</div>
+                </div>
+                <div class="flex items-baseline gap-2 mt-1">
+                    <span class="text-[10px] font-mono text-slate-500">max</span>
+                    <span id="pf_ctx_max" class="text-[11px] font-mono text-slate-400">—</span>
+                    <span class="text-[10px] font-mono text-slate-600">ms</span>
+                    <span class="text-[10px] font-mono text-slate-500 ml-2">n=</span>
+                    <span id="pf_ctx_n" class="text-[11px] font-mono text-slate-400">0</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Trend Chart -->
+        <section class="glass-panel rounded-lg p-6 mb-6">
+            <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
+                <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Latency Trend</h3>
+                <div class="flex items-center gap-4 text-[10px] font-mono">
+                    <span class="flex items-center gap-1"><span class="inline-block w-3 h-0.5 bg-blue-400 rounded"></span>LLM</span>
+                    <span class="flex items-center gap-1"><span class="inline-block w-3 h-0.5 bg-green-400 rounded"></span>Node</span>
+                    <span class="flex items-center gap-1"><span class="inline-block w-3 h-0.5 bg-purple-400 rounded"></span>Memory</span>
+                    <span class="flex items-center gap-1"><span class="inline-block w-3 h-0.5 bg-orange-400 rounded"></span>Context</span>
+                </div>
+            </div>
+            <canvas id="perfTrendCanvas" width="900" height="220" style="width:100%;height:220px;"></canvas>
+        </section>
+
+        <!-- Route Decision Distribution -->
+        <section class="glass-panel rounded-lg p-6 mb-6">
+            <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
+                <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Route Decision Distribution</h3>
+                <span class="material-symbols-outlined text-slate-500 text-sm">alt_route</span>
+            </div>
+            <div class="flex items-center gap-6">
+                <div class="flex-1">
+                    <div class="flex items-center justify-between text-[11px] font-mono mb-2">
+                        <span class="text-primary flex items-center gap-2"><span class="h-2 w-2 rounded-full bg-primary"></span>Direct Reply</span>
+                        <span id="pf_route_direct" class="text-slate-300 font-bold">0</span>
+                    </div>
+                    <div class="h-2 w-full bg-glass-border rounded-full overflow-hidden mb-4">
+                        <div id="pf_route_direct_bar" class="h-full bg-primary transition-all" style="width:0%"></div>
+                    </div>
+                    <div class="flex items-center justify-between text-[11px] font-mono mb-2">
+                        <span class="text-blue-400 flex items-center gap-2"><span class="h-2 w-2 rounded-full bg-blue-400"></span>Expert Route</span>
+                        <span id="pf_route_expert" class="text-slate-300 font-bold">0</span>
+                    </div>
+                    <div class="h-2 w-full bg-glass-border rounded-full overflow-hidden">
+                        <div id="pf_route_expert_bar" class="h-full bg-blue-400 transition-all" style="width:0%"></div>
+                    </div>
+                </div>
+                <div class="text-center px-6 border-l border-glass-border">
+                    <div class="text-[10px] font-mono text-slate-500 uppercase mb-1">Total Routes</div>
+                    <div id="pf_route_total" class="text-2xl font-mono font-bold text-slate-200">0</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Breakdown Tables -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <section class="glass-panel rounded-lg p-6">
+                <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
+                    <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Node Type Breakdown</h3>
+                    <span class="material-symbols-outlined text-slate-500 text-sm">category</span>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-[11px] font-mono">
+                        <thead>
+                            <tr class="text-slate-500 uppercase tracking-wider border-b border-glass-border">
+                                <th class="text-left py-2 px-3">Type</th>
+                                <th class="text-right py-2 px-3">Count</th>
+                                <th class="text-right py-2 px-3">Avg (ms)</th>
+                                <th class="text-right py-2 px-3">Total (ms)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="pf_node_type_table">
+                            <tr><td colspan="4" class="text-center py-4 text-slate-600">No data yet</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+            <section class="glass-panel rounded-lg p-6">
+                <div class="flex items-center justify-between border-b border-glass-border pb-3 mb-4">
+                    <h3 class="text-xs font-bold tracking-widest text-slate-400 uppercase">Memory Query Type Breakdown</h3>
+                    <span class="material-symbols-outlined text-slate-500 text-sm">search</span>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-[11px] font-mono">
+                        <thead>
+                            <tr class="text-slate-500 uppercase tracking-wider border-b border-glass-border">
+                                <th class="text-left py-2 px-3">Query Type</th>
+                                <th class="text-right py-2 px-3">Count</th>
+                                <th class="text-right py-2 px-3">Avg (ms)</th>
+                                <th class="text-right py-2 px-3">Total (ms)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="pf_mem_type_table">
+                            <tr><td colspan="4" class="text-center py-4 text-slate-600">No data yet</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+    </main>
+
 </div>
 <script src="/js/app.js"></script>
 </body>

@@ -11,7 +11,7 @@ description: LLM Agent Evaluation and Optimization Workflow
 ## 阶段一：准备与全量回归测试 (Test)
 
 1. **构建与环境对齐**: 确保所有的代码修改已被编译 (`cargo build`)，并且 Daemon 已基于最新二进制重启。
-2. **执行基准用例集**: 运行标准的测试脚本（例如 `./run_tests.sh`），该脚本应包含能够覆盖所有 Agent 类别（Research, Coder, Architect, General）和所有工具集的多个用例。包含但不限于：
+2. **执行基准用例集**: 运行标准的测试脚本（例如使用 `run_eval_headless.py`），该脚本应包含能够覆盖所有 Agent 类别（Research, Coder, Architect, General）和所有工具集的多个用例。包含但不限于：
    - 信息检索与事实核查（依赖联网和地理时间信息）
    - 代码编写与文件系统交互
    - 跨阶段长流转任务（如撰写复杂的旅行计划）

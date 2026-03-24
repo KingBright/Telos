@@ -163,6 +163,12 @@ RULES:
                     parent_tool: Some(tool_name.to_string()),
                     change_reason: Some(change_reason.clone()),
                     experience_notes: old_schema.experience_notes.clone(),
+                    // Preserve health stats, reset health to active since mutation is a fix
+                    success_count: old_schema.success_count,
+                    failure_count: old_schema.failure_count,
+                    last_success_at: old_schema.last_success_at,
+                    last_failure_at: old_schema.last_failure_at,
+                    health_status: "active".to_string(),
                 };
 
                 let executor = Arc::new(ScriptExecutor::new(new_code.clone(), sandbox));

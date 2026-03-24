@@ -150,12 +150,40 @@ impl ScriptSandbox {
         Self { engine }
     }
 
+    /// Sanitize JSON params for Rhai compatibility.
+    /// Rhai's serde implementation rejects f64 values, so we convert floats to integers.
+    fn sanitize_params(value: Value) -> Value {
+        match value {
+            Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    // Convert float to integer (Rhai doesn't accept floats via serde)
+                    Value::Number(serde_json::Number::from(f as i64))
+                } else {
+                    Value::Number(n)
+                }
+            }
+            Value::Object(map) => {
+                let sanitized: serde_json::Map<String, Value> = map.into_iter()
+                    .map(|(k, v)| (k, Self::sanitize_params(v)))
+                    .collect();
+                Value::Object(sanitized)
+            }
+            Value::Array(arr) => {
+                Value::Array(arr.into_iter().map(Self::sanitize_params).collect())
+            }
+            other => other,
+        }
+    }
+
     /// Execute a script with the given JSON parameters.
     pub fn execute(&self, script: &str, params: Value) -> Result<Value, ToolError> {
         let mut scope = Scope::new();
         
+        // Sanitize params: convert floats to integers for Rhai compatibility
+        let sanitized_params = Self::sanitize_params(params);
+        
         // Convert JSON params to Rhai Dynamic
-        let dynamic_params = to_dynamic(params)
+        let dynamic_params = to_dynamic(sanitized_params)
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to convert params to Rhai: {}", e)))?;
         
         scope.push("params", dynamic_params);

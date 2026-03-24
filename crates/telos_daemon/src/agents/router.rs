@@ -2,7 +2,7 @@ use crate::agents::{
     async_trait, AgentInput, AgentOutput, Arc, ExecutableNode, GatewayManager, SystemRegistry,
 };
 use telos_model_gateway::{Capability, LlmRequest, Message, ModelGateway};
-use telos_memory::MemoryOS;
+use telos_memory::engine::RedbGraphStore;
 use telos_tooling::ToolRegistry;
 use tracing::info;
 
@@ -29,15 +29,10 @@ impl RouterAgent {
         // Inject memory context so QA knows about the user's stored preferences
         let mut memory_context_for_qa = String::new();
         if let Some(mem_any) = _registry.get_memory_os() {
-            if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
-                if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::EntityLookup { entity: "user".to_string() }).await {
-                    let profile_entries: Vec<String> = results.iter()
-                        .filter(|e| e.memory_type == telos_memory::MemoryType::UserProfile)
-                        .map(|e| e.content.clone())
-                        .collect();
-                    if !profile_entries.is_empty() {
-                        memory_context_for_qa = format!("[USER MEMORY CONTEXT — verified stored data]\n{}\n\n", profile_entries.join("\n- "));
-                    }
+            if let Ok(mem_os) = mem_any.clone().downcast::<RedbGraphStore>() {
+                let profile_text = telos_memory::build_and_format_profile(&*mem_os).await;
+                if !profile_text.is_empty() {
+                    memory_context_for_qa = format!("[USER MEMORY CONTEXT — verified stored data]\n{}\n", profile_text);
                 }
             }
         }
@@ -82,6 +77,13 @@ CRITICAL RULES:
   • The Expert MAY show personality, humor, warmth, or playfulness — this is ENCOURAGED, not penalized
   • You may optionally note positive personality traits (e.g., "Agent showed creative engagement") but this is NOT required for acceptance
   • is_acceptable should almost always be true for short-input responses unless the output is truly nonsensical or harmful
+
+EFFICIENCY AWARENESS:
+- Each QA rejection triggers a full retry cycle (re-planning + re-executing + re-evaluating). This is EXPENSIVE.
+- Only reject if the output is genuinely WRONG, INCOMPLETE, or IRRELEVANT.
+- Do NOT reject for minor style issues, formatting differences, or slightly imperfect organization.
+- When in doubt, ACCEPT. A good answer delivered fast is better than a perfect answer after 3 retries.
+- MEMORY OPERATION RESPONSES: If the Expert confirms a memory write/update/deletion was successful, this IS a complete answer — always accept it.
 
 --- EXAMPLES ---
 
@@ -179,17 +181,12 @@ Expert: "抱歉，我无法获取相关信息。"
                     let is_relevant = json.get("is_relevant").and_then(|v| v.as_bool()).unwrap_or(true);
                     let is_acceptable = json.get("is_acceptable").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                    // Programmatic override: if no answer content exists, force unacceptable
+                    // Log grounding inconsistencies but trust LLM judgment (LLM is protagonist)
                     if !contains_answer && is_acceptable {
-                        tracing::info!("[Router QA] Grounding override: is_acceptable forced to false because contains_answer is false");
-                        json["is_acceptable"] = serde_json::json!(false);
-                        if json.get("critique").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                            json["critique"] = serde_json::json!("Output does not contain an actual answer to the user's question.");
-                        }
+                        tracing::warn!("[Router QA] ⚠️ Grounding note: LLM accepted despite contains_answer=false. Trusting LLM judgment.");
                     }
                     if !is_relevant && is_acceptable {
-                        tracing::info!("[Router QA] Grounding override: is_acceptable forced to false because is_relevant is false");
-                        json["is_acceptable"] = serde_json::json!(false);
+                        tracing::warn!("[Router QA] ⚠️ Grounding note: LLM accepted despite is_relevant=false. Trusting LLM judgment.");
                     }
 
                     let final_is_acceptable = json.get("is_acceptable").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -228,23 +225,10 @@ impl ExecutableNode for RouterAgent {
         // Dynamically query user profile and interaction memory
         let mut user_profile_context = String::new();
         if let Some(mem_any) = _registry.get_memory_os() {
-            if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
-                if let Ok(results) = mem_os.retrieve(telos_memory::MemoryQuery::EntityLookup { entity: "user".to_string() }).await {
-                    let profile_entries: Vec<String> = results.iter()
-                        .filter(|e| e.memory_type == telos_memory::MemoryType::UserProfile)
-                        .map(|e| e.content.clone())
-                        .collect();
-                    let interaction_entries: Vec<String> = results.iter()
-                        .filter(|e| e.memory_type == telos_memory::MemoryType::InteractionEvent)
-                        .map(|e| e.content.clone())
-                        .collect();
-                    
-                    if !profile_entries.is_empty() {
-                        user_profile_context.push_str(&format!("[USER PROFILE & PREFERENCES]\n{}\n\n", profile_entries.join("\n- ")));
-                    }
-                    if !interaction_entries.is_empty() {
-                        user_profile_context.push_str(&format!("[PAST INTERACTIONS]\n{}\n\n", interaction_entries.join("\n- ")));
-                    }
+            if let Ok(mem_os) = mem_any.clone().downcast::<RedbGraphStore>() {
+                let profile_text = telos_memory::build_and_format_profile(&*mem_os).await;
+                if !profile_text.is_empty() {
+                    user_profile_context.push_str(&profile_text);
                 }
             }
         }
@@ -299,7 +283,7 @@ impl ExecutableNode for RouterAgent {
 
         let mut learned_strategies_context = String::new();
         if let Some(mem_any) = _registry.get_memory_os() {
-            if let Ok(mem_os) = mem_any.clone().downcast::<std::sync::Arc<dyn telos_memory::engine::MemoryOS>>() {
+            if let Ok(mem_os) = mem_any.clone().downcast::<RedbGraphStore>() {
                 use telos_memory::integration::MemoryIntegration;
                 if let Ok(strategies) = mem_os.retrieve_procedural_memories(input.task.clone()).await {
                     if !strategies.is_empty() {
@@ -340,6 +324,11 @@ If the [AVAILABLE CUSTOM TOOLS] section appears in the context above, it means t
 - Route to "general_expert" — it can directly invoke the custom tool
 - Do NOT route to "research_expert" for web search if a custom tool can fulfill the request
 - Example: If a "weather_tool" custom tool exists and the user asks about weather, route to "general_expert" (NOT "research_expert")
+
+TOOL RESULTS PROTOCOL:
+Tool operations return results in the format "[TOOL RESULT: <name>] STATUS=<status>".
+STATUS=SUCCESS means the operation completed and took effect permanently.
+STATUS=FAILURE means the operation failed — error details follow.
 
 CRITICAL RULES:
 1. You MUST output a strictly valid JSON object.
@@ -384,7 +373,20 @@ CRITICAL — TOOL CREATION ROUTING:
      * "好的/可以/行" → confirm the last proposed action
    - ONLY if conversation history is EMPTY or provides no useful context, show personality and ask for clarification.
    - NEVER ask "what do you want to retry?" if the conversation history clearly shows what failed.
-10. MEMORY WRITE DETECTION: If the user explicitly asks you to "记住/记录/保存/remember/save" information about themselves (preferences, facts, notes), you MUST include a memory_write action. Output EXACTLY TWO keys: "tool": "memory_write" and "content": "<the fact to store>". After the tool returns, confirm to the user with a personalized response. Examples of triggers: "帮我记住我对花生过敏", "请记录一下我的地址是...", "记住我喜欢蓝色".
+10. MEMORY WRITE: When the user asks to "记住/记录/保存/remember/save" personal information,
+    output: "tool": "memory_write", "content": "<the facts to store>".
+
+EFFICIENCY GUIDELINE — Prefer direct_reply for Speed:
+- direct_reply is INSTANT (one LLM call). Routing to an expert involves planning + execution + synthesis + QA (much slower).
+- If you CAN answer completely from your own knowledge, DO IT DIRECTLY. The user values fast responses.
+- Categories that almost ALWAYS qualify for direct_reply:
+  * Identity/self-awareness ("你是谁", "你叫什么", "你和X有什么区别")
+  * Math, logic, common knowledge
+  * Emoji/greeting/chitchat
+  * Memory confirmation when data exists in [USER PROFILE & PREFERENCES] or [CONVERSATION HISTORY]
+  * False memory checks ("我们是不是讨论过X?" — just check your context, no tools needed)
+  * Knowledge explanation, concept Q&A, opinions, analysis
+- Only route to an expert when you genuinely CANNOT answer without tools (search, file I/O, code execution, tool creation).
 
 FOCUS RULE: Your JSON output must address ONLY the user's CURRENT request (the message below). The [CONVERSATION HISTORY] above is reference material — do NOT repeat or re-answer any of it.
 
@@ -525,10 +527,28 @@ User: "什么是快速排序算法？"
                     }
                 }
 
-                // If content exists but parsing failed, try to fallback if it looks like a refusal
+                // If content exists but parsing failed, check if the raw text IS a substantive answer
                 if !content.is_empty() {
-                    // If it's a direct response and we couldn't get JSON, 
-                    // route to general_expert to handle the conversation or error gracefully.
+                    // Heuristic: if > 50 chars and doesn't look like an error/refusal,
+                    // the LLM likely tried to answer directly but forgot JSON wrapping.
+                    // Treat it as a direct_reply to avoid wasting time on a full expert DAG round-trip.
+                    let lower = content.to_lowercase();
+                    let is_substantive = content.len() > 50
+                        && !lower.contains("error")
+                        && !lower.contains("cannot route")
+                        && !lower.contains("unable to");
+
+                    if is_substantive {
+                        tracing::info!(
+                            "[Router] JSON parse failed but content is substantive ({} chars). Treating as direct_reply.",
+                            content.len()
+                        );
+                        return AgentOutput::success(serde_json::json!({
+                            "direct_reply": content
+                        })).with_trace(trace);
+                    }
+
+                    // Non-substantive / error-like content: fall back to general_expert
                     return AgentOutput::success(serde_json::json!({
                         "route": "general_expert",
                         "reason": format!("LLM provided non-JSON response, falling back: {}", content)

@@ -4,6 +4,8 @@ pub mod config;
 pub mod project;
 
 pub mod agent_traits;
+pub mod metrics;
+pub mod schedule;
 
 // --- Core Primitives shared across Telos modules ---
 

@@ -247,7 +247,11 @@ REQUIRED JSON STRUCTURE:
                 }).unwrap_or_else(|| {
                     // No output value — check if there's an error message
                     if let Some(ref err) = out.error {
-                        format!("[Error] {}: {}", err.error_type, err.message)
+                        let mut s = format!("[Error] {}: {}", err.error_type, err.message);
+                        if let Some(ref td) = err.technical_detail {
+                            s.push_str(&format!("\nTechnical Detail: {}", td));
+                        }
+                        s
                     } else {
                         "[No output]".to_string()
                     }
@@ -332,6 +336,11 @@ REQUIRED JSON STRUCTURE:
             [TOOL OUTPUT INTERPRETATION]: Tool results may be in various formats (JSON, plain text, raw API response). \
             If a tool returned raw text or unstructured data, EXTRACT and INTERPRET the relevant information intelligently. \
             If a tool was successfully created or updated, report that clearly (e.g., 'Tool get_weather has been successfully created/updated'). \
+            [ERROR TRANSPARENCY — CRITICAL]: If ANY tool execution failed, encountered errors, or returned error messages, \
+            you MUST include the FULL error details in your response. Do NOT hide, minimize, or vaguely summarize errors. \
+            Specifically: (1) State which tool/step failed, (2) Include the exact error message, (3) Describe what the error means. \
+            If a tool creation (create_rhai_tool) failed with syntax errors, include the specific syntax error message and line number. \
+            The user NEEDS to see these details to understand and fix problems. NEVER say just 'an error occurred' — be specific. \
             [ABSOLUTE PROHIBITION]: Your final answer MUST be substantive text content, NOT a bare URL or list of URLs. If the tool results contain scraped web page content with actual data (weather, prices, news articles, etc.), EXTRACT and PRESENT that data as readable text. \
             [CRITICAL CONSTRAINT]: Filter the Tool Results STRICTLY against the Original Task constraints (especially time/date/location). \
             If the retrieved data is macroscopic, irrelevant SEO garbage, or completely empty, EXPLICITLY state the specific data deficiency directly (e.g., 'No specific data found for this context') INSTEAD of hallucinating misaligned fluff or summarizing generic information. \

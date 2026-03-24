@@ -6,7 +6,7 @@ use tracing::info;
 pub const SILENT_REPLY_TOKEN: &str = "<<SILENT>>";
 
 /// Core tools that should always be injected by default
-pub const CORE_TOOLS: &[&str] = &["web_search", "fs_read", "fs_write", "shell_exec", "file_edit", "discover_tools", "create_rhai_tool", "list_rhai_tools", "mutate_tool"];
+pub const CORE_TOOLS: &[&str] = &["web_search", "fs_read", "fs_write", "shell_exec", "file_edit", "discover_tools", "create_rhai_tool", "list_rhai_tools", "mutate_tool", "manage_tools", "schedule_mission", "list_scheduled_missions", "cancel_mission"];
 
 /// 全局缓存的 SOUL 内容（daemon 启动时加载一次）
 static SOUL_CONTENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -158,6 +158,13 @@ impl PromptBuilder {
         if !profile_context.is_empty() {
             self.sections.push(("USER_PROFILE".into(), profile_context.to_string()));
         }
+        self
+    }
+
+    /// 注入 System Mission 指令
+    pub fn with_system_mission(mut self, origin_channel: &str) -> Self {
+        self.sections.push(("SYSTEM_MISSION".into(), 
+            format!("[SYSTEM MISSION]\nYou are executing an autonomous scheduled mission. Fulfill it and dispatch the result to `origin_channel` ({}). If you fail, log the failure for standard evolution.\n", origin_channel)));
         self
     }
 

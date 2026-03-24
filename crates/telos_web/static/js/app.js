@@ -1,7 +1,7 @@
 // ==================== GLOBALS ====================
 let currentTab = 'metrics';
 let backendUptimeSeconds = 0;
-const tabRanges = { metrics: 'day', knowledge: 'day', tokens: 'day', tools: 'day', workflows: 'day' };
+const tabRanges = { metrics: 'day', knowledge: 'day', tokens: 'day', tools: 'day', workflows: 'day', performance: 'day' };
 
 // ==================== HELPERS ====================
 function fmt(n) {
@@ -31,6 +31,8 @@ function switchTab(tabName) {
     if (tabName === 'tokens') refreshTokensTab();
     if (tabName === 'tools') refreshToolsTab();
     if (tabName === 'workflows') refreshWorkflowsTab();
+    if (tabName === 'missions') refreshMissionsTab();
+    if (tabName === 'performance') refreshPerformanceTab();
 }
 
 // ==================== TIME RANGE ====================
@@ -42,6 +44,7 @@ function onRangeChange(tab) {
     if (tab === 'tokens') refreshTokensTab();
     if (tab === 'tools') refreshToolsTab();
     if (tab === 'workflows') refreshWorkflowsTab();
+    if (tab === 'performance') refreshPerformanceTab();
 }
 
 // ==================== TAB 1: METRICS OVERVIEW ====================
@@ -109,6 +112,19 @@ async function refreshMetricsTab() {
         // Agent Activity
         setText('m_proactive', fmt(live.agent?.proactive_interactions || 0));
         setText('m_sem_loop', fmt(live.task_flow?.semantic_loop_interventions || 0));
+
+        // Scheduled Missions (Overview)
+        try {
+            const msRes = await fetch('/api/v1/schedules/metrics');
+            if (msRes.ok) {
+                const msData = await msRes.json();
+                const msMetrics = msData.metrics || {};
+                setText('m_ms_active', fmt(msMetrics.total_active || 0));
+                setText('m_ms_executions', fmt(msMetrics.total_executions || 0));
+                setText('m_ms_completed', fmt(msMetrics.total_completed || 0));
+                setText('m_ms_failed', fmt(msMetrics.total_failed || 0));
+            }
+        } catch(e) { console.error('Overview missions metrics error:', e); }
 
         // Workflow Reuse
         const wfStored = agg.workflow_stored || 0;
@@ -502,6 +518,254 @@ function renderTraces(traces) {
     expandedTraceIds = savedExpanded;
 }
 
+// ==================== TAB 7: MISSIONS ====================
+async function refreshMissionsTab() {
+    try {
+        const [missionsRes, metricsRes] = await Promise.all([
+            fetch('/api/v1/schedules'),
+            fetch('/api/v1/schedules/metrics')
+        ]);
+        if (!missionsRes.ok || !metricsRes.ok) return;
+        const missionsData = await missionsRes.json();
+        const metricsData = await metricsRes.json();
+        
+        const metrics = metricsData.metrics || {};
+        setText('ms_active', fmt(metrics.total_active || 0));
+        setText('ms_completed', fmt(metrics.total_completed || 0));
+        setText('ms_failed', fmt(metrics.total_failed || 0));
+        setText('ms_executions', fmt(metrics.total_executions || 0));
+        
+        const missions = missionsData.schedules || [];
+        const tbody = document.getElementById('missions_table');
+        if (!tbody) return;
+        if (!missions.length) {
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4 text-slate-600">No scheduled missions</td></tr>';
+            return;
+        }
+        let html = '';
+        missions.forEach(m => {
+            const shortId = m.id.length > 12 ? m.id.substring(0, 8) + '…' : m.id;
+            const instruction = m.instruction || '';
+            const shortInst = instruction.length > 40 ? instruction.substring(0, 40) + '...' : instruction;
+            
+            let statusColor = 'text-slate-500';
+            if (m.status === 'Active') statusColor = 'text-blue-400';
+            else if (m.status === 'Completed') statusColor = 'text-primary';
+            else if (m.status === 'Failed') statusColor = 'text-red-400';
+            
+            const lastRun = m.last_run_at ? new Date(m.last_run_at * 1000).toLocaleString() : '—';
+            const nextRun = m.next_run_at ? new Date(m.next_run_at * 1000).toLocaleString() : '—';
+            
+            html += `<tr class="border-b border-glass-border/30 hover:bg-glass-border/10 transition-colors">
+                <td class="text-left py-2 px-3 text-slate-300" title="${escapeHtml(m.id)}">${escapeHtml(shortId)}</td>
+                <td class="text-left py-2 px-3 text-slate-300" title="${escapeHtml(instruction)}">${escapeHtml(shortInst)}</td>
+                <td class="text-left py-2 px-3 text-primary font-bold">${escapeHtml(m.cron_expr)}</td>
+                <td class="text-center py-2 px-3 ${statusColor} font-bold">${m.status}</td>
+                <td class="text-right py-2 px-3 text-slate-200">${m.execute_count}</td>
+                <td class="text-right py-2 px-3 text-slate-400 text-[10px]">${lastRun}</td>
+                <td class="text-right py-2 px-3 text-blue-400 text-[10px]">${nextRun}</td>
+                <td class="text-center py-2 px-3">
+                    <button onclick="cancelMission('${m.id}')" class="text-red-400 hover:text-red-300 transition-colors" title="Cancel Mission">
+                        <span class="material-symbols-outlined text-sm align-middle">cancel</span>
+                    </button>
+                </td>
+            </tr>`;
+        });
+        tbody.innerHTML = html;
+        
+    } catch (e) {
+        console.error('Missions tab error:', e);
+    }
+}
+
+async function fetchMissions() {
+    refreshMissionsTab();
+}
+
+async function cancelMission(id) {
+    if (!confirm('Are you sure you want to cancel this scheduled mission?')) return;
+    try {
+        const res = await fetch(`/api/v1/schedules/${id}`, { method: 'DELETE' });
+        if (res.ok) fetchMissions();
+        else alert('Failed to cancel mission');
+    } catch (e) {
+        console.error(e);
+        alert('Error cancelling mission');
+    }
+}
+
+// ==================== TAB 8: PERFORMANCE ====================
+async function refreshPerformanceTab() {
+    const range = tabRanges.performance;
+    try {
+        const res = await fetch(`/api/v1/metrics/performance?range=${range}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const s = data.summary || {};
+
+        // LLM
+        const llm = s.llm || {};
+        setText('pf_llm_avg', llm.count > 0 ? String(llm.avg_ms) : '—');
+        setText('pf_llm_max', llm.count > 0 ? String(llm.max_ms) : '—');
+        setText('pf_llm_n', String(llm.count || 0));
+
+        // Node
+        const node = s.node || {};
+        setText('pf_node_avg', node.count > 0 ? String(node.avg_ms) : '—');
+        setText('pf_node_max', node.count > 0 ? String(node.max_ms) : '—');
+        setText('pf_node_n', String(node.count || 0));
+
+        // Memory
+        const mem = s.memory || {};
+        setText('pf_mem_avg', mem.count > 0 ? String(mem.avg_ms) : '—');
+        setText('pf_mem_max', mem.count > 0 ? String(mem.max_ms) : '—');
+        setText('pf_mem_n', String(mem.count || 0));
+
+        // Context
+        const ctx = s.context || {};
+        setText('pf_ctx_avg', ctx.count > 0 ? String(ctx.avg_ms) : '—');
+        setText('pf_ctx_max', ctx.count > 0 ? String(ctx.max_ms) : '—');
+        setText('pf_ctx_n', String(ctx.count || 0));
+
+        // Route distribution
+        const routes = s.routes || {};
+        const direct = routes.direct_reply || 0;
+        const expert = routes.expert || 0;
+        const totalRoute = direct + expert;
+        setText('pf_route_direct', String(direct));
+        setText('pf_route_expert', String(expert));
+        setText('pf_route_total', String(totalRoute));
+        document.getElementById('pf_route_direct_bar').style.width = totalRoute > 0 ? `${(direct / totalRoute) * 100}%` : '0%';
+        document.getElementById('pf_route_expert_bar').style.width = totalRoute > 0 ? `${(expert / totalRoute) * 100}%` : '0%';
+
+        // Node type breakdown table
+        const nodeTypes = (node.by_type || []);
+        const ntBody = document.getElementById('pf_node_type_table');
+        if (ntBody) {
+            if (!nodeTypes.length) {
+                ntBody.innerHTML = '<tr><td colspan="4" class="text-center py-4 text-slate-600">No data yet</td></tr>';
+            } else {
+                ntBody.innerHTML = nodeTypes.map(t => `<tr class="border-b border-glass-border/30 hover:bg-glass-border/10">
+                    <td class="text-left py-2 px-3 text-slate-200">${escapeHtml(t.type)}</td>
+                    <td class="text-right py-2 px-3 text-slate-300">${t.count}</td>
+                    <td class="text-right py-2 px-3 text-green-400 font-bold">${t.avg_ms}</td>
+                    <td class="text-right py-2 px-3 text-slate-400">${fmt(t.total_ms)}</td>
+                </tr>`).join('');
+            }
+        }
+
+        // Memory query type breakdown table
+        const memTypes = (mem.by_type || []);
+        const mtBody = document.getElementById('pf_mem_type_table');
+        if (mtBody) {
+            if (!memTypes.length) {
+                mtBody.innerHTML = '<tr><td colspan="4" class="text-center py-4 text-slate-600">No data yet</td></tr>';
+            } else {
+                mtBody.innerHTML = memTypes.map(t => `<tr class="border-b border-glass-border/30 hover:bg-glass-border/10">
+                    <td class="text-left py-2 px-3 text-slate-200">${escapeHtml(t.type)}</td>
+                    <td class="text-right py-2 px-3 text-slate-300">${t.count}</td>
+                    <td class="text-right py-2 px-3 text-purple-400 font-bold">${t.avg_ms}</td>
+                    <td class="text-right py-2 px-3 text-slate-400">${fmt(t.total_ms)}</td>
+                </tr>`).join('');
+            }
+        }
+
+        // Trend chart (Canvas 2D)
+        drawPerfTrend(data.trend_buckets || []);
+    } catch (e) {
+        console.error('Performance tab error:', e);
+    }
+}
+
+function drawPerfTrend(buckets) {
+    const canvas = document.getElementById('perfTrendCanvas');
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    const W = rect.width, H = rect.height;
+    ctx.clearRect(0, 0, W, H);
+
+    if (!buckets.length) {
+        ctx.fillStyle = '#475569';
+        ctx.font = '11px JetBrains Mono, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('No trend data available', W / 2, H / 2);
+        return;
+    }
+
+    const pad = { top: 20, right: 16, bottom: 28, left: 50 };
+    const chartW = W - pad.left - pad.right;
+    const chartH = H - pad.top - pad.bottom;
+
+    const series = [
+        { key: 'llm_avg_ms', color: '#60a5fa' },
+        { key: 'node_avg_ms', color: '#4ade80' },
+        { key: 'memory_avg_ms', color: '#c084fc' },
+        { key: 'ctx_avg_ms', color: '#fb923c' },
+    ];
+
+    let maxVal = 1;
+    buckets.forEach(b => series.forEach(s => { if (b[s.key] > maxVal) maxVal = b[s.key]; }));
+    maxVal = Math.ceil(maxVal * 1.15);
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    const gridLines = 4;
+    for (let i = 0; i <= gridLines; i++) {
+        const y = pad.top + (chartH / gridLines) * i;
+        ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+        ctx.fillStyle = '#64748b'; ctx.font = '10px JetBrains Mono, monospace'; ctx.textAlign = 'right';
+        ctx.fillText(String(Math.round(maxVal - (maxVal / gridLines) * i)), pad.left - 6, y + 4);
+    }
+
+    // X-axis labels (show a few)
+    const labelEvery = Math.max(1, Math.floor(buckets.length / 6));
+    ctx.fillStyle = '#475569'; ctx.font = '9px JetBrains Mono, monospace'; ctx.textAlign = 'center';
+    buckets.forEach((b, i) => {
+        if (i % labelEvery !== 0) return;
+        const x = pad.left + (i / (buckets.length - 1 || 1)) * chartW;
+        const d = new Date(b.bucket_start_ms);
+        ctx.fillText(d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0'), x, H - 6);
+    });
+
+    // Draw each series
+    series.forEach(s => {
+        ctx.beginPath();
+        ctx.strokeStyle = s.color;
+        ctx.lineWidth = 1.5;
+        ctx.lineJoin = 'round';
+        buckets.forEach((b, i) => {
+            const x = pad.left + (i / (buckets.length - 1 || 1)) * chartW;
+            const y = pad.top + chartH - (b[s.key] / maxVal) * chartH;
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        // Area fill
+        const lastX = pad.left + chartW;
+        ctx.lineTo(lastX, pad.top + chartH);
+        ctx.lineTo(pad.left, pad.top + chartH);
+        ctx.closePath();
+        const hex = s.color;
+        const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+        ctx.fillStyle = `rgba(${r},${g},${b},0.06)`;
+        ctx.fill();
+    });
+
+    // Y-axis label
+    ctx.save();
+    ctx.translate(12, pad.top + chartH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillStyle = '#475569'; ctx.font = '9px JetBrains Mono, monospace'; ctx.textAlign = 'center';
+    ctx.fillText('avg ms', 0, 0);
+    ctx.restore();
+}
+
 // ==================== UPTIME ====================
 function updateUptimeClock() {
     const h = String(Math.floor(backendUptimeSeconds / 3600)).padStart(2, '0');
@@ -522,6 +786,8 @@ window.addEventListener('DOMContentLoaded', () => {
         else if (currentTab === 'tokens') refreshTokensTab();
         else if (currentTab === 'tools') refreshToolsTab();
         else if (currentTab === 'workflows') refreshWorkflowsTab();
+        else if (currentTab === 'missions') refreshMissionsTab();
+        else if (currentTab === 'performance') refreshPerformanceTab();
     }, 5000);
     
     // Uptime tick
