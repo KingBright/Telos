@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::time::Instant;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use telos_hci::{AgentEvent, AgentFeedback, EventBroker, TaskSummary, global_log_level};
 use telos_core::{config::TelosConfig, SystemRegistry};
 use telos_memory::engine::{MemoryOS, RedbGraphStore};
@@ -556,14 +556,35 @@ pub async fn run_event_loop(
                             let mut tool_attempts_used = 0u32;
                             let mut memory_write_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
                             let mut memory_read_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
+                            info!("[Router Diag] trace={} Starting router loop (max 3 attempts)", trace_id);
                             for attempt in 0..3 {
+                                info!("[Router Diag] trace={} attempt={}/3 calling router.execute()", trace_id, attempt + 1);
+                                let router_start = Instant::now();
                                 route_result = router.execute(router_input.clone(), registry_clone.as_ref()).await;
+                                let router_elapsed = router_start.elapsed();
+                                info!("[Router Diag] trace={} attempt={}/3 router.execute() returned in {:.1}s success={}", 
+                                    trace_id, attempt + 1, router_elapsed.as_secs_f64(), route_result.success);
                                 
+                                // Emit heartbeat so SSE idle watchdog stays alive during long routing
+                                broker_bg.publish_feedback(AgentFeedback::StateChanged {
+                                    task_id: trace_id.to_string(),
+                                    current_node: "routing".into(),
+                                    status: telos_core::NodeStatus::Running,
+                                });
+
                                 if !route_result.success {
+                                    error!("[Router Diag] trace={} attempt={}/3 FAILED: {:?}", trace_id, attempt + 1, route_result.error);
                                     break;
                                 }
 
                                 if let Some(route_data) = route_result.output.as_ref() {
+                                    // Log the decision type for diagnostics
+                                    let decision_type = if route_data.get("tool").is_some() { "tool" }
+                                        else if route_data.get("direct_reply").is_some() { "direct_reply" }
+                                        else if route_data.get("route").is_some() { "route" }
+                                        else { "unknown" };
+                                    info!("[Router Diag] trace={} attempt={}/3 decision_type={}", trace_id, attempt + 1, decision_type);
+
                                     // Intercept "tool"
                                     if let Some(tool_name) = route_data.get("tool").and_then(|v| v.as_str()) {
                                         if tool_name == "memory_read" {
@@ -694,9 +715,11 @@ pub async fn run_event_loop(
                                     }
                                     
                                     // If we reach here, it's either "direct_reply" or "route", routing is finished
+                                    info!("[Router Diag] trace={} routing loop finished (direct_reply or route)", trace_id);
                                     break;
                                 }
                             }
+                            info!("[Router Diag] trace={} exited router loop, success={}, tool_used={}", trace_id, route_result.success, tool_used);
                             
                             // --- GRACEFUL DEGRADATION: Final synthesis pass ---
                             // If the loop exhausted all 3 tool attempts without converging on
@@ -1395,15 +1418,19 @@ pub async fn run_event_loop(
                                                 is_final: false,
                                                 silent: false,
                                             });
+                                            // Truncate previous results to avoid bloating the prompt
+                                            let prev_results_truncated: String = combined_result.chars().take(3000).collect();
                                             enriched_payload = format!(
-                                                "Task:\n{}\n\n[PERSONA CONTEXT]\n{}\n\n[SYSTEM DIRECTIVE — MANDATORY]\n\
-                                                 Your previous attempt was REJECTED by the QA evaluator.\n\
-                                                 Critique: {}\n\n\
-                                                 You MUST autonomously retry with an improved strategy.\n\
-                                                 DO NOT ask the user for permission, clarification, or confirmation.\n\
-                                                 DO NOT say 'if you want me to continue' or similar phrases.\n\
-                                                 Execute the corrected approach IMMEDIATELY and deliver the result.",
-                                                payload, agents::prompt_builder::get_soul(), critique
+                                                "Task:\n{}\n\n[PERSONA CONTEXT]\n{}\n\n\
+                                                 [PREVIOUS ATTEMPT DATA — DO NOT RE-SEARCH]\n\
+                                                 The following data was already gathered. Reuse valid data; only search for MISSING pieces.\n{}\n\n\
+                                                 [QA CRITIQUE]\n{}\n\n\
+                                                 [SYSTEM DIRECTIVE]\n\
+                                                 Refine your approach based on the critique. Reuse valid data from above.\n\
+                                                 Only re-search if the data was genuinely wrong or missing.\n\
+                                                 Execute IMMEDIATELY without asking for permission.",
+                                                payload, agents::prompt_builder::get_soul(),
+                                                prev_results_truncated, critique
                                             );
                                         }
                                     } else {

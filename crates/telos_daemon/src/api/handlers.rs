@@ -142,9 +142,9 @@ use crate::core::metrics::*;
             serde_json::json!({"trace_id": trace_id_str}).to_string()
         ));
 
-        // Idle timeout: if no event arrives for 300s, the task is likely stalled.
+        // Idle timeout: if no event arrives for 600s, the task is likely stalled.
         // Complex tasks that keep producing heartbeats will never trigger this.
-        let idle_timeout = tokio::time::Duration::from_secs(300);
+        let idle_timeout = tokio::time::Duration::from_secs(600);
 
         loop {
             match tokio::time::timeout(idle_timeout, rx.recv()).await {
@@ -196,8 +196,14 @@ use crate::core::metrics::*;
                         _ => {}
                     }
                 }
-                Ok(Err(_)) => {
-                    // Channel closed
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    // Slow consumer fell behind — skip missed events but keep receiving.
+                    // This was previously `break`, silently killing SSE streams.
+                    tracing::warn!("[SSE] Broadcast lagged by {} events for task {}, continuing...", n, trace_id_str);
+                    continue;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    // Channel truly closed — broker is gone
                     break;
                 }
                 Err(_) => {

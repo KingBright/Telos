@@ -136,7 +136,7 @@ IMPORTANT RULES:
 - After editing, always verify with a compile/lint check
 - If a compile check fails, READ the error carefully and fix the specific issue
 - Do NOT repeat the same failing edit — adjust your approach
-- When done, provide a summary of all changes made
+- When done, provide a summary of all changes made.
 
 If you cannot complete the task with the available tools, explain what's blocking you."#
         );

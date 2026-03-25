@@ -113,7 +113,7 @@ REQUIRED JSON STRUCTURE:
                 content: msg.content.clone(),
             });
         }
-        messages.push(Message { role: "user".to_string(), content: format!("Task: {}", input.task) });
+        messages.push(Message { role: "user".to_string(), content: format!("Task: {}\n\nCRITICAL CONSTRAINT: You MUST output ONLY a valid JSON object matching the requested schema. DO NOT output any other conversational text or formatting. If you cannot provide a JSON plan, still output a valid JSON containing a tool or summary node.", input.task) });
 
         let req = LlmRequest {
             session_id: format!("research_{}", input.node_id),

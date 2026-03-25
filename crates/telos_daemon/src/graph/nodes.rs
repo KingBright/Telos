@@ -153,6 +153,8 @@ impl ExecutableNode for ToolNode {
                     // If the LLM outputted {"tool_name": "...", "parameters": {...}}, extract them.
                     if let Some(t) = p.get("tool_name").and_then(|v| v.as_str()) {
                         actual_tool_name = t.to_string();
+                    } else if let Some(t) = p.get("tool").and_then(|v| v.as_str()) {
+                        actual_tool_name = t.to_string();
                     }
                     if let Some(params) = p.get_mut("parameters") {
                         actual_params = params.take();

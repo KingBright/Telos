@@ -140,7 +140,7 @@ Conversation:
     let parsed: serde_json::Value = match serde_json::from_str(cleaned) {
         Ok(v) => v,
         Err(_) => {
-            debug!("[UserProfile] Failed to parse LLM extraction output: {}", &response_text[..response_text.len().min(200)]);
+            debug!("[UserProfile] Failed to parse LLM extraction output: {}", response_text.chars().take(200).collect::<String>());
             return;
         }
     };

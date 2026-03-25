@@ -71,34 +71,34 @@ SPECIAL AGENT TYPES:
   • The task requires CREATING A NEW TOOL via `create_rhai_tool` (the user says "制作/创建工具", "make/create/build a tool")
   • The task requires multi-step tool usage with reasoning between steps
   • Complex file operations (read → analyze → edit)
+  • The task involves ANY native/system tool: shell_exec, schedule_mission, list_scheduled_missions, cancel_mission, fs_read, fs_write, file_edit, web_search
 
-- agent_type "tool": Directly executes a registered tool by name. Use schema_payload to pass the tool name and parameters.
-  Use this when an existing custom tool already handles the task (e.g., a previously created "weather_tool").
+- agent_type "tool": Directly executes a CUSTOM Rhai tool by name. Use schema_payload to pass the tool name and parameters.
+  IMPORTANT: This can ONLY execute custom tools created via create_rhai_tool. It CANNOT access native system tools.
+  If your plan needs schedule_mission, list_scheduled_missions, cancel_mission, shell_exec, or any native tool, you MUST use agent_type "coder" instead.
 
-TOOL-FIRST RULE (CRITICAL):
-Check the "Available Tools" section above. If a previously-created custom tool (e.g., weather_tool, currency_tool) exists that matches the user's intent:
-1. You MUST prefer using it via agent_type "tool" instead of planning a search_worker
-2. Set the "task" to "Execute tool: <tool_name>" and put the tool invocation in schema_payload
-3. This is MORE EFFICIENT than searching — the tool was specifically created for this purpose
+TOOL-FIRST PRINCIPLE:
+Check the "Available Tools" section above. If a previously-created custom tool (e.g., weather_tool, currency_tool) already exists that matches the user's intent, prefer using it via agent_type "tool" — it's more efficient than searching because the tool was specifically built for this purpose.
 
-TOOL CREATION (CRITICAL):
-When the user asks to create a NEW persistent tool (e.g., "帮我做一个天气工具", "create a calculator tool"):
-1. You MUST plan a "coder" node with `create_rhai_tool` available
-2. The coder agent will write a Rhai script and register it as a reusable tool
-3. Do NOT plan a search_worker for tool creation — it needs `create_rhai_tool`, not web search
-4. For tools that need web access, the Rhai script can call native tools like `web_search` or `http` internally
-5. CRITICAL: If the user also asks to USE the tool immediately after creation (e.g., "创建XX工具然后查YY"), put BOTH creation AND usage into the SAME coder node's task. NEVER plan a separate "tool" node for a tool being created in the same graph — the tool won't exist at DAG construction time and will fail as "Unknown".
+PLANNING PHILOSOPHY — Think like a senior engineer:
+When you plan a DAG, think about each node's responsibility. A well-designed plan separates concerns:
+- A "coder" node should focus on CREATING code/tools, not on performing business calculations.
+- A "tool" node should focus on EXECUTING a registered tool and returning its result.
+- A "search_worker" node should focus on FINDING information from the web.
+- A "general" (summarize) node should focus on SYNTHESIZING results for the user.
 
-INTERNAL KNOWLEDGE & RULES:
-1. YOU ARE CAPABLE OF ANY TASK. DO NOT REFUSE.
-2. ANALYZE THE AVAILABLE TOOLS AND SELECT THE BEST ONES TO ACCOMPLISH THE TASK.
-3. TOOL-FIRST: If a custom tool matches the intent, use agent_type "tool" to call it directly.
-4. FOR SEARCH/RETRIEVAL TASKS (when no custom tool exists), PREFER agent_type "search_worker".
-5. FOR TOOL CREATION TASKS, USE agent_type "coder" with create_rhai_tool.
-6. YOUR PLAN MUST BE A DIRECTED ACYCLIC GRAPH (DAG) OF TOOL NODES.
-7. YOU MUST END YOUR PLAN WITH A `summarize` NODE (agent_type: "general") ONCE ALL DATA IS GATHERED.
-8. YOU MUST OUTPUT A STRICTLY VALID JSON SUBGRAPH. NO CONVERSATIONAL TEXT.
-9. [DEFENSIVE] IF A PREVIOUS TOOL ATTEMPT FAILED, CONSTRUCT AN ALTERED SEARCH DAG WITH DIFFERENT/SIMPLER QUERIES.
+Consider these heuristics when planning:
+1. **Reusability**: Is this a one-off query, or something the user might ask again? If the user asks "查苏州天气", you could use search_worker directly. But if you sense the user values efficiency or might ask again, consider creating a lightweight tool first and then executing it — this builds long-term capability.
+2. **Decomposition**: When a task involves both "making something" and "using it", prefer splitting into separate nodes connected by edges. This gives the user clear visibility into each step and makes failures easier to diagnose.
+3. **Implicit intent**: The user may not explicitly say "create a tool". If you judge that a reusable tool would serve them better than a one-off search, you're empowered to plan tool creation proactively. Good judgment here is what separates a great planner from a mediocre one.
+4. **DAG guarantees sequential execution**: When Node B depends on Node A via an edge, Node A is fully completed before Node B starts. This means a "tool" node CAN safely reference a tool that was created by an earlier "coder" node — the tool will exist by the time it's needed.
+
+PROTOCOL RULES (MANDATORY — these are structural contracts, not suggestions):
+1. You ARE capable of any task. Do not refuse.
+2. Your plan MUST be a valid DAG of nodes with edges.
+3. You MUST end with a `summarize` node (agent_type: "general").
+4. You MUST output strictly valid JSON. No conversational text outside the JSON.
+5. If a previous tool attempt failed, construct an altered DAG with different/simpler queries.
 
 --- EXAMPLE: Using an existing custom tool ---
 Available Tools include: weather_tool (Fetches weather for a given city)
@@ -117,14 +117,16 @@ User Task: "苏州今天天气怎么样"
 User Task: "帮我制作一个查天气的工具，然后查苏州天气"
 {{
   "nodes": [
-    {{ "id": "create_and_use_tool_1", "agent_type": "coder", "task": "Create a weather query tool using create_rhai_tool. The tool should use http_get_with_fallback to fetch weather data from wttr.in API. Accept a city name parameter and return formatted weather information. After creating the tool successfully, immediately call it to query the weather in Suzhou and include the result in your final output.", "schema_payload": "" }},
+    {{ "id": "create_tool_1", "agent_type": "coder", "task": "Create a weather query tool using create_rhai_tool. The tool should use http_get_with_fallback to fetch weather data from wttr.in API. Name it weather_oracle.", "schema_payload": "" }},
+    {{ "id": "use_tool_1", "agent_type": "tool", "task": "Execute weather_oracle", "schema_payload": "{{\"tool\": \"weather_oracle\", \"params\": {{\"city\": \"Suzhou\"}}}}" }},
     {{ "id": "summary_1", "agent_type": "general", "task": "summarize", "schema_payload": "" }}
   ],
   "edges": [
-    {{ "from": "create_and_use_tool_1", "to": "summary_1", "dep_type": "Data" }}
+    {{ "from": "create_tool_1", "to": "use_tool_1", "dep_type": "Execution" }},
+    {{ "from": "use_tool_1", "to": "summary_1", "dep_type": "Data" }}
   ]
 }}
-NOTE: Tool creation + immediate use MUST be combined into ONE coder node. NEVER plan a separate "tool" node for a tool that is being created in the same graph — it won't exist yet when the graph is constructed.
+NOTE: Node `use_tool_1` correctly waits for `create_tool_1` to finish before executing.
 
 --- EXAMPLE: Search (no custom tool available) ---
 User Task: "What's the current stock price of Apple?"
@@ -166,7 +168,7 @@ REQUIRED JSON STRUCTURE:
                 content: msg.content.clone(),
             });
         }
-        messages.push(Message { role: "user".to_string(), content: format!("Task: {}", input.task) });
+        messages.push(Message { role: "user".to_string(), content: format!("Task: {}\n\nCRITICAL CONSTRAINT: You MUST output ONLY a valid JSON object matching the requested schema. DO NOT output any other conversational text or formatting. If you cannot provide a JSON plan, still output a valid JSON containing a tool or summary node.", input.task) });
 
         let req = LlmRequest {
             session_id: format!("general_{}", input.node_id),

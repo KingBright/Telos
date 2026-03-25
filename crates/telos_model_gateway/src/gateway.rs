@@ -2,7 +2,8 @@
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore, OwnedSemaphorePermit};
 use async_trait::async_trait;
-use tracing::{warn, info};
+use tracing::{warn, info, error};
+use std::time::Duration;
 
 use crate::{
     LlmRequest, LlmResponse, GatewayError, QuotaExceededError, ModelGateway,
@@ -237,8 +238,27 @@ impl GatewayManager {
         let mut retries = initial_retries;
         let mut _permit = permit;
 
+        // Per-call timeout: prevents indefinite hangs when the API accepts
+        // the TCP connection but never sends a response.
+        const PER_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
         loop {
-            match self.provider.generate(req).await {
+            let call_result = match tokio::time::timeout(
+                PER_CALL_TIMEOUT,
+                self.provider.generate(req),
+            ).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    warn!("[Gateway] LLM API call timed out after {}s", PER_CALL_TIMEOUT.as_secs());
+                    Err(GatewayError::NetworkError {
+                        message: format!("LLM API call timed out after {}s", PER_CALL_TIMEOUT.as_secs()),
+                        kind: crate::NetworkErrorKind::ConnectionTimeout,
+                        retry_suggested: true,
+                    })
+                }
+            };
+
+            match call_result {
                 Ok(response) => {
                     self.circuit_breaker.lock().await.record_success();
                     return Ok(response);
@@ -295,14 +315,17 @@ impl GatewayManager {
                     }
                 }
             }
-        }
+        } // end loop
     }
 }
 
 #[async_trait]
 impl ModelGateway for GatewayManager {
     async fn generate(&self, req: LlmRequest) -> Result<LlmResponse, GatewayError> {
+        let session_tag = &req.session_id;
+        
         // 1. 检查熔断器，阻塞等待而不是直接拒绝
+        let mut cb_wait_count = 0u32;
         loop {
             let allow = {
                 let mut cb = self.circuit_breaker.lock().await;
@@ -313,21 +336,49 @@ impl ModelGateway for GatewayManager {
                 break;
             }
 
-            warn!("[Gateway] Circuit Breaker is active. Waiting 5s before re-evaluating...");
+            cb_wait_count += 1;
+            if cb_wait_count > 12 { // Max 60s waiting for circuit breaker
+                error!("[Gateway] Circuit Breaker stuck open for 60s, failing request for session={}", session_tag);
+                return Err(GatewayError::Other {
+                    message: "Circuit breaker stuck open for 60s".to_string(),
+                    is_retryable: true,
+                });
+            }
+            warn!("[Gateway] Circuit Breaker is active (attempt {}). Waiting 5s for session={}...", cb_wait_count, session_tag);
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
-        // 2. Acquire global concurrency semaphore permit.
-        //    This serializes all LLM requests system-wide, preventing concurrent
-        //    429 storms from overwhelming the API provider.
-        let permit = self.global_concurrency.clone().acquire_owned().await
-            .map_err(|_| GatewayError::Other {
-                message: "Global concurrency semaphore closed".to_string(),
-                is_retryable: false,
-            })?;
+        // 2. Acquire global concurrency semaphore permit with timeout.
+        let available = self.global_concurrency.available_permits();
+        info!("[Gateway] session={} acquiring semaphore permit (available: {}/{})", 
+            session_tag, available, 7);
+        
+        let permit = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.global_concurrency.clone().acquire_owned()
+        ).await {
+            Ok(Ok(permit)) => {
+                info!("[Gateway] session={} acquired permit", session_tag);
+                permit
+            }
+            Ok(Err(_)) => {
+                error!("[Gateway] session={} semaphore closed", session_tag);
+                return Err(GatewayError::Other {
+                    message: "Global concurrency semaphore closed".to_string(),
+                    is_retryable: false,
+                });
+            }
+            Err(_) => {
+                error!("[Gateway] session={} TIMEOUT waiting 60s for semaphore permit (available was: {})", session_tag, available);
+                return Err(GatewayError::NetworkError {
+                    message: format!("Semaphore acquisition timed out after 60s (available permits was: {})", available),
+                    kind: crate::NetworkErrorKind::ConnectionTimeout,
+                    retry_suggested: true,
+                });
+            }
+        };
 
         // 3. [THROTTLING] Proactively pace requests to avoid Zhipu API strict RPS limits.
-        // Even when holding a permit, wait before firing.
         if self.throttle_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(self.throttle_ms)).await;
         }

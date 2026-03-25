@@ -32,7 +32,7 @@ use telos_model_gateway::ModelGateway;
             },
             Message {
                 role: "user".into(),
-                content: format!("Compress this response:\n{}", &response[..response.len().min(2000)]),
+                content: format!("Compress this response:\n{}", response.chars().take(2000).collect::<String>()),
             },
         ],
         required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
@@ -46,7 +46,7 @@ use telos_model_gateway::ModelGateway;
             tracing::info!("[Compression] Summary length: {}, Content: {}", summary.len(), summary);
             if summary.is_empty() {
                 // Fallback: truncate
-                format!("[摘要] {}...", &response[..response.len().min(200)])
+                format!("[摘要] {}...", response.chars().take(200).collect::<String>())
             } else {
                 format!("[摘要] {}", summary)
             }
@@ -54,7 +54,7 @@ use telos_model_gateway::ModelGateway;
         Err(e) => {
             tracing::warn!("[Compression] LLM compression failed: {:?}", e);
             // Fallback: simple truncation if LLM fails
-            format!("[摘要] {}...", &response[..response.len().min(200)])
+            format!("[摘要] {}...", response.chars().take(200).collect::<String>())
         }
     }
 }

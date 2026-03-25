@@ -123,7 +123,7 @@ pub fn spawn_background_tasks(
                     trace_id,
                     step_count,
                     if nodes_used.is_empty() { "none".to_string() } else { nodes_used.join(", ") },
-                    if first_input.len() > 200 { format!("{}...", &first_input[..200]) } else { first_input },
+                    if first_input.len() > 200 { format!("{}...", first_input.chars().take(200).collect::<String>()) } else { first_input },
                     if has_reused_workflows { " (reused existing workflow template)" } else { "" },
                 );
                 let _ = registry_worker.memory_os.store_semantic_fact(summary).await;
@@ -152,7 +152,7 @@ pub fn spawn_background_tasks(
                     .map(|s| s.input_data.clone())
                     .unwrap_or_else(|| "Unknown task".to_string());
                 let note_with_context = format!("Failed on task '{}': {}", 
-                    &task_desc[..task_desc.len().min(100)], failure_note);
+                    task_desc.chars().take(100).collect::<String>(), failure_note);
                 
                 for wf_id in &trace.reused_workflow_ids {
                     crate::core::metrics_store::record(
@@ -185,7 +185,7 @@ pub fn spawn_background_tasks(
                     // --- SPECIES DIVERGENCE: ≥2 cumulative failures triggers variant generation ---
                     if failure_count >= 2 {
                         info!("[Daemon] 🧬 Template '{}' has {} failures — triggering species divergence.", 
-                            &wf_id[..wf_id.len().min(60)], failure_count);
+                            wf_id.chars().take(60).collect::<String>(), failure_count);
                         
                         // Retrieve the original template to pass to LLM
                         if let Ok(templates) = registry_worker.memory_os.retrieve_procedural_memories(wf_id.clone()).await {
@@ -234,7 +234,7 @@ pub fn spawn_background_tasks(
                                         let desc = content.lines()
                                             .find(|l: &&str| l.starts_with("[Description] "))
                                             .map(|l: &str| l.trim_start_matches("[Description] ").to_string())
-                                            .unwrap_or_else(|| format!("Variant of: {}", &wf_id[..wf_id.len().min(60)]));
+                                            .unwrap_or_else(|| format!("Variant of: {}", wf_id.chars().take(60).collect::<String>()));
                                         
                                         let template_json = if let Some(pos) = content.find("[TemplateJSON]") {
                                             content[pos + "[TemplateJSON]".len()..].trim().to_string()
@@ -249,7 +249,7 @@ pub fn spawn_background_tasks(
                                             ).await {
                                                 Ok(()) => {
                                                     info!("[Daemon] 🧬 Species divergence complete — new variant stored: {}", 
-                                                        &variant_desc[..variant_desc.len().min(80)]);
+                                                        variant_desc.chars().take(80).collect::<String>());
                                                 }
                                                 Err(e) => {
                                                     warn!("[Daemon] ⚠️ Failed to store diverged variant: {}", e);

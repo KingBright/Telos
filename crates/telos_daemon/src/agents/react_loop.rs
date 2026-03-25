@@ -363,8 +363,8 @@ impl ReactLoop {
         let executor = executor
             .ok_or_else(|| format!("Tool '{}' not found in registry", tool_name))?;
 
-        // Execute with timeout (30 seconds for most tools, 120 for shell)
-        let timeout_secs = if tool_name == "shell_exec" { 120 } else { 30 };
+        // Execute with timeout (30 seconds for most tools, 300 for shell compilation)
+        let timeout_secs = if tool_name == "shell_exec" { 300 } else { 30 };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             executor.call(params),

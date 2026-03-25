@@ -150,14 +150,14 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
                             tracing::debug!(
                                 "[MemoryOS] Procedural template matched (score={:.3}): {}",
                                 score,
-                                &e.content[..e.content.len().min(80)]
+                                e.content.chars().take(80).collect::<String>()
                             );
                             procedural_results.push(e.content);
                         } else {
                             tracing::debug!(
                                 "[MemoryOS] Filtered out low-relevance template (score={:.3} < {:.2}): {}",
                                 score, SIMILARITY_THRESHOLD,
-                                &e.content[..e.content.len().min(80)]
+                                e.content.chars().take(80).collect::<String>()
                             );
                         }
                     }
@@ -276,7 +276,7 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
             self.store(upgraded_entry).await?;
             tracing::info!(
                 "[MemoryOS] 🔄 Upgraded workflow template '{}' to version {} (strength: {:.1})",
-                &description[..description.len().min(60)], new_version, existing.base_strength + 0.5
+                description.chars().take(60).collect::<String>(), new_version, existing.base_strength + 0.5
             );
             Ok(true) // Upgraded existing
         } else {
@@ -362,13 +362,13 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
             tracing::info!(
                 "[MemoryOS] 📝 Attached failure note to workflow template (failures: {}): {}",
                 new_failure_count,
-                &template_description[..template_description.len().min(60)]
+                template_description.chars().take(60).collect::<String>()
             );
             Ok(new_failure_count)
         } else {
             tracing::debug!(
                 "[MemoryOS] No matching template found for failure note: {}",
-                &template_description[..template_description.len().min(60)]
+                template_description.chars().take(60).collect::<String>()
             );
             Ok(0) // No template found — nothing to annotate
         }
@@ -405,7 +405,7 @@ impl<T: MemoryOS + ?Sized> MemoryIntegration for T {
             tracing::info!(
                 "[MemoryOS] 📉 Penalized workflow template strength {:.1} → {:.1}: {}",
                 existing.base_strength, new_strength,
-                &template_description[..template_description.len().min(60)]
+                template_description.chars().take(60).collect::<String>()
             );
             Ok(())
         } else {

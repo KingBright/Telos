@@ -65,8 +65,8 @@ impl Default for ExponentialBackoff {
     fn default() -> Self {
         // More robust defaults for external API rate limits:
         // - 500ms base delay (longer than before)
-        // - 5 max retries
+        // - 3 max retries (reduced from 5 to work with 120s tokio timeout; worst-case ~360s)
         // - 30 seconds max delay
-        Self::new(500, 5, 30_000)
+        Self::new(500, 3, 30_000)
     }
 }
