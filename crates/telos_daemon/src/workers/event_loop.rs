@@ -1244,10 +1244,19 @@ pub async fn run_event_loop(
                                 use petgraph::Direction;
                                 
                                 for (node_id, &node_idx) in &graph.node_indices {
-                                    // A terminal node has no outgoing edges
-                                    if graph.edges.neighbors_directed(node_idx, Direction::Outgoing).count() == 0 {
-                                        // Ignore dummy nodes whose output is just "Research plan generated" if they spawned a subgraph
-                                        if let Some(res) = graph.node_results.get(node_id) {
+                                    if let Some(res) = graph.node_results.get(node_id) {
+                                        let is_terminal = graph.edges.neighbors_directed(node_idx, Direction::Outgoing).count() == 0;
+                                        
+                                        if !res.success {
+                                            let error_str = res.error.as_ref().map(|e| {
+                                                let mut s = format!("{}: {}", e.error_type, e.message);
+                                                if let Some(ref td) = e.technical_detail {
+                                                    s.push_str(&format!("\nDetail: {}", td));
+                                                }
+                                                s
+                                            }).unwrap_or_else(|| "Unknown error".to_string());
+                                            final_results.push(format!("[{}] Failed: {}", node_id, error_str));
+                                        } else if is_terminal {
                                             let output_str = res
                                                 .output
                                                 .as_ref()
@@ -1259,23 +1268,7 @@ pub async fn run_event_loop(
                                                 && !output_str.contains("SubGraph decomposition complete")
                                                 && !output_str.contains("Plan generated")
                                             {
-                                                if res.success {
-                                                    final_results.push(format!("[{}] {}", node_id, output_str));
-                                                } else {
-                                                    let error_str = res
-                                                        .error
-                                                        .as_ref()
-                                                        .map(|e| {
-                                                            let mut s = format!("{}: {}", e.error_type, e.message);
-                                                            if let Some(ref td) = e.technical_detail {
-                                                                s.push_str(&format!("\nDetail: {}", td));
-                                                            }
-                                                            s
-                                                        })
-                                                        .unwrap_or_else(|| "Unknown error".to_string());
-                                                    final_results
-                                                        .push(format!("[{}] Failed: {}", node_id, error_str));
-                                                }
+                                                final_results.push(format!("[{}] {}", node_id, output_str));
                                             }
                                         }
                                     }

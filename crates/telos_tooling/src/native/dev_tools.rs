@@ -1117,3 +1117,214 @@ impl ToolExecutor for ManageToolsTool {
         }
     }
 }
+
+// 23. Rhai Tool Studio - Unified Integrated Development Environment for Tools
+#[derive(Clone)]
+#[cfg(feature = "full")]
+pub struct RhaiToolStudio {
+    registry: std::sync::Arc<dyn ToolRegistry>,
+}
+
+#[cfg(feature = "full")]
+impl RhaiToolStudio {
+    pub fn new(registry: std::sync::Arc<dyn ToolRegistry>) -> Self {
+        Self { registry }
+    }
+
+    pub fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "rhai_tool_studio".into(),
+            description: "Unified Integrated Development Environment for dynamic Rhai tools. \
+            ACTIONS:\n\
+            - 'read': Inspect a tool's source code and schema. Requires 'tool_name'.\n\
+            - 'test_run': Execute a Rhai script in the sandbox without saving it. Requires 'rhai_code' and 'test_params'.\n\
+            - 'overwrite': Save/Update a tool permanently to disk. Requires 'tool_name', 'description', 'parameters_schema', and 'rhai_code'.\n\
+            - 'delete': Permanently delete a tool. Requires 'tool_name'.\n\
+            \n\
+            RHAI SYNTAX REFERENCE:\n\
+            ▸ STRINGS: Double quotes `\"hello\"`. Backtick interpolation: `` `hello ${name}` ``\n\
+            ▸ MAP ACCESS: MUST use bracket: `map[\"key\"]`\n\
+            ▸ HTTP: `http_get_with_fallback([\"url1\"])` -> returns string. `try_parse_json(text)` -> parses JSON safely.\n\
+            ▸ RETURN: Last expression without semicolon is returned.\n\
+            ".into(),
+            parameters_schema: JsonSchema {
+                raw_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["read", "test_run", "overwrite", "delete"], "description": "The action to perform" },
+                        "tool_name": { "type": "string", "description": "Name of the tool (for read, overwrite, delete)" },
+                        "description": { "type": "string", "description": "Description of the tool (for overwrite)" },
+                        "parameters_schema": { "type": "string", "description": "JSON string of the tool's input schema (for overwrite)" },
+                        "rhai_code": { "type": "string", "description": "The script code (for test_run, overwrite)" },
+                        "test_params": { "type": "string", "description": "JSON string of params to test the script with (for test_run)" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+            risk_level: RiskLevel::HighRisk,
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(feature = "full")]
+#[async_trait]
+impl ToolExecutor for RhaiToolStudio {
+    async fn call(&self, params: Value) -> Result<Vec<u8>, ToolError> {
+        let action = params.get("action").and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'action'".into()))?;
+        
+        match action {
+            "read" => {
+                let name = params.get("tool_name").and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'tool_name' for read action".into()))?;
+                    
+                if let Some(schema) = self.registry.get_schema(name) {
+                    let source_code = if let Some(exec) = self.registry.get_executor(name) {
+                        exec.source_code().unwrap_or_else(|| "(source code not available)".to_string())
+                    } else {
+                        "(executor not found/native tool)".to_string()
+                    };
+                    
+                    let out = serde_json::json!({
+                        "status": "success",
+                        "tool_name": name,
+                        "description": schema.description,
+                        "parameters_schema": schema.parameters_schema.raw_schema,
+                        "health": schema.health_status,
+                        "rhai_code": source_code,
+                    });
+                    Ok(serde_json::to_vec_pretty(&out).unwrap())
+                } else {
+                    let out = serde_json::json!({ "status": "error", "message": format!("Tool '{}' not found", name) });
+                    Ok(serde_json::to_vec_pretty(&out).unwrap())
+                }
+            }
+            "test_run" => {
+                let rhai_code = params.get("rhai_code").and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'rhai_code' for test_run".into()))?.to_string();
+                let test_params_str = params.get("test_params").and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'test_params' for test_run".into()))?;
+                let test_params: Value = serde_json::from_str(test_params_str)
+                    .map_err(|e| ToolError::ExecutionFailed(format!("Invalid test params JSON: {}", e)))?;
+                
+                let sandbox = std::sync::Arc::new(crate::script_sandbox::ScriptSandbox::new());
+                match sandbox.execute(&rhai_code, test_params) {
+                    Ok(result) => {
+                        let out = serde_json::json!({
+                            "status": "success",
+                            "test_output": result
+                        });
+                        Ok(serde_json::to_vec_pretty(&out).unwrap())
+                    }
+                    Err(e) => {
+                        let mut error_msg = format!("{}", e);
+                        let mut error_line = None;
+                        if let Some(line_idx) = error_msg.find("line ") {
+                            let after_line = &error_msg[line_idx+5..];
+                            if let Some(comma_idx) = after_line.find(',') {
+                                if let Ok(line_num) = after_line[..comma_idx].trim().parse::<usize>() {
+                                    error_line = Some(line_num);
+                                }
+                            }
+                        }
+                        
+                        let out = serde_json::json!({
+                            "status": "test_failed",
+                            "error": error_msg,
+                            "error_line": error_line,
+                            "available_functions": {
+                                "http_get": "http_get(url_string) -> String. Single URL fetch. Example: http_get(\"https://example.com/api\")",
+                                "http_get_with_fallback": "http_get_with_fallback(json_array_string) -> String. Tries URLs sequentially. The argument MUST be a JSON STRING, NOT a Rhai array. Example: http_get_with_fallback(\"[\\\"https://url1.com\\\", \\\"https://url2.com\\\"]\")",
+                                "parse_json": "parse_json(string) -> Map. Parses JSON string into Rhai object. Throws on invalid JSON.",
+                                "try_parse_json": "try_parse_json(string) -> Dynamic. Safe JSON parse: returns parsed object on success, original string on failure.",
+                                "to_json": "to_json(value) -> String. Converts Rhai value back to JSON string."
+                            },
+                            "hint": "IMPORTANT: http_get_with_fallback takes a JSON-encoded string array, NOT a Rhai array. Use: http_get_with_fallback(\"[\\\"url\\\"]\")"
+                        });
+                        Ok(serde_json::to_vec_pretty(&out).unwrap())
+                    }
+                }
+            }
+            "overwrite" => {
+                let name = params.get("tool_name").and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'tool_name' for overwrite".into()))?.to_string();
+                
+                if let Err(reason) = validate_tool_name(&name) {
+                    let out = serde_json::json!({ "status": "error", "message": format!("Tool name '{}' rejected: {}", name, reason) });
+                    return Ok(serde_json::to_vec_pretty(&out).unwrap());
+                }
+                
+                let description = params.get("description").and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'description'".into()))?.to_string();
+                let schema_str = params.get("parameters_schema").and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'parameters_schema'".into()))?;
+                let rhai_code = params.get("rhai_code").and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'rhai_code'".into()))?.to_string();
+                
+                let mut raw_schema: Value = serde_json::from_str(schema_str)
+                    .map_err(|e| ToolError::ExecutionFailed(format!("Invalid parameter schema JSON: {}", e)))?;
+                if let Value::String(s) = &raw_schema {
+                    raw_schema = serde_json::from_str(s).unwrap_or(raw_schema);
+                }
+                
+                let existing = self.registry.get_schema(&name);
+                let (version, iteration) = if let Some(ref old) = existing {
+                    (bump_patch_version(&old.version), old.iteration + 1)
+                } else {
+                    ("1.0.0".to_string(), 0)
+                };
+                
+                let new_schema = ToolSchema {
+                    name: name.clone(),
+                    description,
+                    parameters_schema: JsonSchema { raw_schema },
+                    risk_level: RiskLevel::Normal,
+                    version: version.clone(),
+                    iteration,
+                    parent_tool: existing.as_ref().map(|_| name.clone()),
+                    change_reason: Some("Updated via ToolStudio".to_string()),
+                    experience_notes: existing.as_ref().map(|e| e.experience_notes.clone()).unwrap_or_default(),
+                    success_count: existing.as_ref().map(|e| e.success_count).unwrap_or(0),
+                    failure_count: existing.as_ref().map(|e| e.failure_count).unwrap_or(0),
+                    last_success_at: existing.as_ref().map(|e| e.last_success_at).unwrap_or(0),
+                    last_failure_at: existing.as_ref().map(|e| e.last_failure_at).unwrap_or(0),
+                    health_status: existing.as_ref().map(|e| e.health_status.clone()).unwrap_or_else(|| "active".to_string()),
+                };
+                
+                let sandbox = std::sync::Arc::new(crate::script_sandbox::ScriptSandbox::new());
+                let new_executor = std::sync::Arc::new(crate::script_sandbox::ScriptExecutor::new(rhai_code, sandbox));
+                
+                if let Err(e) = self.registry.register_dynamic_tool(new_schema, new_executor) {
+                    crate::fire_tool_creation_hook(&name, false, existing.is_some());
+                    return Err(ToolError::ExecutionFailed(format!("Failed to register tool: {}", e)));
+                }
+                crate::fire_tool_creation_hook(&name, true, existing.is_some());
+                
+                let out = serde_json::json!({
+                    "status": "success",
+                    "message": format!("Tool '{}' successfully saved and registered.", name),
+                    "version": version
+                });
+                Ok(serde_json::to_vec_pretty(&out).unwrap())
+            }
+            "delete" => {
+                let name = params.get("tool_name").and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::ExecutionFailed("Missing 'tool_name' for delete".into()))?;
+                
+                if self.registry.get_schema(name).is_some() {
+                    self.registry.delete_tool(name).map_err(|e| ToolError::ExecutionFailed(e))?;
+                    let out = serde_json::json!({
+                        "status": "success",
+                        "message": format!("Tool '{}' permanently deleted.", name)
+                    });
+                    Ok(serde_json::to_vec_pretty(&out).unwrap())
+                } else {
+                    let out = serde_json::json!({ "status": "error", "message": format!("Tool '{}' not found", name) });
+                    Ok(serde_json::to_vec_pretty(&out).unwrap())
+                }
+            }
+            _ => Err(ToolError::ExecutionFailed(format!("Unknown action: {}", action)))
+        }
+    }
+}

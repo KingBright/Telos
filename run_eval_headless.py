@@ -19,7 +19,7 @@ import requests, json, time, os, uuid, sys, re
 
 API = "http://127.0.0.1:8321/api/v1/run_sync"
 BASE_URL = "http://127.0.0.1:8321"
-ITER = 34
+ITER = 35
 TRACES_DIR = "test_traces"
 os.makedirs(TRACES_DIR, exist_ok=True)
 
@@ -393,6 +393,16 @@ test_cases = [
         "category": "UTF8_Stress",
         "query": "你记得刚刚那段关于天地玄黄的超长文本吗？请把它提取为你的系统内部处理经验，起个名字叫 'CJK_String_Bounds_Test_Template'，在这个经验里，详细说明在 Rust 中切片（Slicing）多字节字符（如中日韩文、Emoji）时可能发生的 Panic 原因。",
         "description": "经验提取测试2 — 强制生成超长模板描述触发 spawner.rs 中的 60/80 截断",
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Category: Tool Mutation & Debugging ──
+    # ══════════════════════════════════════════════════════════════════
+    {
+        "id": 38,
+        "category": "ToolMutation",
+        "query": "我刚才让你创建的 `bmi_calculator` 工具，它的健康评级标准还是有问题的：对于亚洲人来说，BMI >= 24 就应该算是偏胖了，原来的脚本可能是用的世卫组织的 25。请帮我使用工具编辑器直接读取并修改这个现有的代码，加上亚洲人的标准，然后用你修改后的工具重新测一下身高174cm、体重65kg。",
+        "description": "动态工具调试 — 验证读取现有工具、Sandbox 测试和修改覆盖的能力",
     },
 ]
 

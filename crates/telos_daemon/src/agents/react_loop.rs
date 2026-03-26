@@ -220,8 +220,53 @@ impl ReactLoop {
                 response.finish_reason
             );
 
-            // 2. If no tool_calls → LLM is done, return content
+            // 2. If no tool_calls → check if the LLM leaked tool calls into text content
             if response.tool_calls.is_empty() {
+                // Detect tool calls embedded in text content (a known LLM hallucination pattern)
+                // Pattern: `[Tool calls: tool_name({...})]` or raw JSON with "action" field
+                let content_str = response.content.trim();
+                
+                // Check for the `[Tool calls: name(json)]` pattern that ReactLoop itself generates
+                // as assistant message placeholders — the LLM sometimes echoes this back
+                if let Some(rescued) = Self::try_extract_content_tool_call(content_str) {
+                    warn!(
+                        "[ReactLoop] ⚠️ Detected tool call leaked into text content: tool='{}'. Re-executing as real tool call.",
+                        rescued.0
+                    );
+                    let tool_result = self.execute_tool(&rescued.0, &rescued.1).await;
+                    total_tool_calls += 1;
+                    
+                    match tool_result {
+                        Ok(result_str) => {
+                            trace_logs.push(TraceLog::ToolCall {
+                                name: rescued.0.clone(),
+                                params: serde_json::from_str(&rescued.1)
+                                    .unwrap_or_else(|_| serde_json::json!({"raw": &rescued.1})),
+                                result: serde_json::json!({ "success": true, "len": result_str.len(), "rescued": true }),
+                            });
+                            // Feed the tool result back so the LLM can produce a proper final answer
+                            messages.push(Message {
+                                role: "assistant".to_string(),
+                                content: content_str.to_string(),
+                            });
+                            messages.push(Message {
+                                role: "tool".to_string(),
+                                content: format!(
+                                    "{{\"tool_call_id\": \"rescued_{}\", \"result\": {}}}",
+                                    rescued.0,
+                                    serde_json::to_string(&result_str).unwrap_or_else(|_| format!("\"{}\"", result_str))
+                                ),
+                            });
+                            // Continue the loop so the LLM can produce a proper text answer
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!("[ReactLoop] Rescued tool call failed: {:?}", err);
+                            // Fall through to return the content as-is
+                        }
+                    }
+                }
+                
                 info!("[ReactLoop] ✅ Completed normally after {} iterations, {} tool calls", iteration, total_tool_calls);
                 return ReactResult {
                     content: response.content,
@@ -280,12 +325,21 @@ impl ReactLoop {
                     Ok(result_str) => {
                         consecutive_errors = 0;
                         debug!("[ReactLoop] Tool {} succeeded: {} bytes", tool_call.name, result_str.len());
+                        
+                        // Truncate oversized tool results to preserve token budget
+                        let truncated = if result_str.len() > 4096 {
+                            warn!("[ReactLoop] ⚠️ Truncating tool result from {} to 4096 bytes to preserve token budget", result_str.len());
+                            format!("{}... [TRUNCATED from {} bytes. Full output omitted to save context space.]", &result_str[..4000], result_str.len())
+                        } else {
+                            result_str.clone()
+                        };
+                        
                         messages.push(Message {
                             role: "tool".to_string(),
                             content: format!(
                                 "{{\"tool_call_id\": \"{}\", \"result\": {}}}",
                                 tool_call.id,
-                                serde_json::to_string(result_str).unwrap_or_else(|_| format!("\"{}\"", result_str))
+                                serde_json::to_string(&truncated).unwrap_or_else(|_| format!("\"{}\"", truncated))
                             ),
                         });
 
@@ -443,6 +497,41 @@ impl ReactLoop {
                 &format!("ReAct loop failed after {} iterations", result.iterations),
             )
         }
+    }
+    /// Try to extract a tool call from text content that the LLM erroneously output as text 
+    /// instead of via the tool_calls API. Returns Some((tool_name, args_json)) if detected.
+    fn try_extract_content_tool_call(content: &str) -> Option<(String, String)> {
+        let trimmed = content.trim();
+        
+        // Pattern 1: `[Tool calls: tool_name({...json...})]` — the ReactLoop placeholder format
+        // that the LLM sometimes echoes back as its "answer"
+        if trimmed.starts_with("[Tool calls: ") && trimmed.ends_with(")]") {
+            // Extract: tool_name({...})
+            let inner = &trimmed["[Tool calls: ".len()..trimmed.len() - 1]; // strip trailing ]
+            if let Some(paren_pos) = inner.find('(') {
+                let tool_name = inner[..paren_pos].trim().to_string();
+                let args_with_paren = &inner[paren_pos..];
+                // Strip outer parens: (json) → json
+                if args_with_paren.starts_with('(') && args_with_paren.ends_with(')') {
+                    let args_json = &args_with_paren[1..args_with_paren.len() - 1];
+                    // Validate it's actually JSON
+                    if serde_json::from_str::<serde_json::Value>(args_json).is_ok() {
+                        return Some((tool_name, args_json.to_string()));
+                    }
+                }
+            }
+        }
+        
+        // Pattern 2: Raw JSON with "action" field → implicit rhai_tool_studio call
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if val.get("action").is_some() && (val.get("rhai_code").is_some() || val.get("tool_name").is_some()) {
+                    return Some(("rhai_tool_studio".to_string(), trimmed.to_string()));
+                }
+            }
+        }
+        
+        None
     }
 }
 

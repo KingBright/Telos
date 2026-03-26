@@ -67,15 +67,22 @@ SPECIAL AGENT TYPES:
   NOTE: search_worker already includes web scraping internally. DO NOT plan separate web_scrape nodes.
   KEYWORD HINTS: Include suggested search keywords in the "task" field: "Find Apple stock price — keywords: AAPL stock price today, Apple share price"
 
-- agent_type "coder": A ReAct agent that can use tools iteratively, including `create_rhai_tool`. Use this when:
-  • The task requires CREATING A NEW TOOL via `create_rhai_tool` (the user says "制作/创建工具", "make/create/build a tool")
+- agent_type "coder": A ReAct agent that can use tools iteratively, including `rhai_tool_studio`. Use this when:
+  • The task requires CREATING OR MODIFYING A TOOL via `rhai_tool_studio` (the user says "制作/创建工具", "modify a tool")
   • The task requires multi-step tool usage with reasoning between steps
   • Complex file operations (read → analyze → edit)
   • The task involves ANY native/system tool: shell_exec, schedule_mission, list_scheduled_missions, cancel_mission, fs_read, fs_write, file_edit, web_search
 
 - agent_type "tool": Directly executes a CUSTOM Rhai tool by name. Use schema_payload to pass the tool name and parameters.
-  IMPORTANT: This can ONLY execute custom tools created via create_rhai_tool. It CANNOT access native system tools.
+  IMPORTANT: This can ONLY execute custom tools created via rhai_tool_studio. It CANNOT access native system tools.
   If your plan needs schedule_mission, list_scheduled_missions, cancel_mission, shell_exec, or any native tool, you MUST use agent_type "coder" instead.
+
+RHAI SANDBOX FUNCTIONS (available inside Rhai scripts):
+  • http_get(url_string) → String — Fetch a single URL
+  • http_get_with_fallback(json_array_string) → String — Tries URLs sequentially. Arg must be a JSON STRING: http_get_with_fallback("[\"url1\",\"url2\"]")
+  • parse_json(string) → Map — Parse JSON string into object
+  • try_parse_json(string) → Dynamic — Safe parse: returns object on success, original string on failure
+  • to_json(value) → String — Convert value to JSON string
 
 TOOL-FIRST PRINCIPLE:
 Check the "Available Tools" section above. If a previously-created custom tool (e.g., weather_tool, currency_tool) already exists that matches the user's intent, prefer using it via agent_type "tool" — it's more efficient than searching because the tool was specifically built for this purpose.
@@ -117,12 +124,12 @@ User Task: "苏州今天天气怎么样"
 User Task: "帮我制作一个查天气的工具，然后查苏州天气"
 {{
   "nodes": [
-    {{ "id": "create_tool_1", "agent_type": "coder", "task": "Create a weather query tool using create_rhai_tool. The tool should use http_get_with_fallback to fetch weather data from wttr.in API. Name it weather_oracle.", "schema_payload": "" }},
+    {{ "id": "create_tool_1", "agent_type": "coder", "task": "Create a weather query tool using rhai_tool_studio. The tool should use http_get_with_fallback to fetch weather data from wttr.in API. Name it weather_oracle.", "schema_payload": "" }},
     {{ "id": "use_tool_1", "agent_type": "tool", "task": "Execute weather_oracle", "schema_payload": "{{\"tool\": \"weather_oracle\", \"params\": {{\"city\": \"Suzhou\"}}}}" }},
     {{ "id": "summary_1", "agent_type": "general", "task": "summarize", "schema_payload": "" }}
   ],
   "edges": [
-    {{ "from": "create_tool_1", "to": "use_tool_1", "dep_type": "Execution" }},
+    {{ "from": "create_tool_1", "to": "use_tool_1", "dep_type": "Control" }},
     {{ "from": "use_tool_1", "to": "summary_1", "dep_type": "Data" }}
   ]
 }}
@@ -159,80 +166,145 @@ REQUIRED JSON STRUCTURE:
             .with_role_instructions(&role_instructions)
             .build();
 
-        let mut messages = vec![
-            Message { role: "system".to_string(), content: system_prompt },
-        ];
-        for msg in &input.conversation_history {
-            messages.push(Message {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-            });
-        }
-        messages.push(Message { role: "user".to_string(), content: format!("Task: {}\n\nCRITICAL CONSTRAINT: You MUST output ONLY a valid JSON object matching the requested schema. DO NOT output any other conversational text or formatting. If you cannot provide a JSON plan, still output a valid JSON containing a tool or summary node.", input.task) });
-
-        let req = LlmRequest {
-            session_id: format!("general_{}", input.node_id),
-            messages,
-            required_capabilities: Capability {
-                requires_vision: false,
-                strong_reasoning: true,
-            },
-            budget_limit: 4000,
-            tools: None,
-        };
-
-        match self.gateway.generate(req.clone()).await {
-            Ok(res) => {
-                let trace = telos_core::TraceLog::LlmCall {
-                    request: serde_json::to_value(&req).unwrap_or_else(|_| serde_json::json!({})),
-                    response: serde_json::to_value(&res).unwrap_or_else(|_| serde_json::json!({})),
-                };
-                let content = res.content.trim();
-                
-                // Robust JSON extraction
-                let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
-                    if e > s { &content[s..=e] } else { content }
-                } else {
-                    content
-                };
-
-                let clean_reply = json_str
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim();
-
-                match serde_json::from_str::<telos_core::AgentSubGraph>(clean_reply) {
-                    Ok(sub_graph) => AgentOutput::with_subgraph(
-                        serde_json::json!({ "text": "Plan generated by GeneralAgent" }),
-                        sub_graph
-                    ).with_trace(trace),
-                    Err(e) => {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(clean_reply) {
-                            if let Some(tool) = val.get("tool").and_then(|t| t.as_str()) {
-                                let sub_node = telos_core::SubGraphNode {
-                                    id: format!("direct_call_{}", tool),
-                                    agent_type: "tool".to_string(),
-                                    task: format!("Execute tool: {}", tool),
-                                    schema_payload: serde_json::to_string(&val).unwrap_or_default(),
-                                    loop_config: None,
-                                    is_critic: false,
-                                };
-                                let sub_graph = telos_core::AgentSubGraph {
-                                    nodes: vec![sub_node],
-                                    edges: vec![],
-                                };
-                                return AgentOutput::with_subgraph(
-                                    serde_json::json!({ "text": "Plan generated by GeneralAgent" }),
-                                    sub_graph
-                                ).with_trace(trace);
-                            }
-                        }
-                        AgentOutput::failure("PlanParseError", &format!("Failed to parse plan: {} (Raw: {})", e, clean_reply)).with_trace(trace)
-                    }
+        // Add core investigation tools for Hybrid Planning
+        let mut plan_tools = tools.clone();
+        let core_exploration_tools = ["rhai_tool_studio", "web_search", "web_scrape"];
+        let guard = self.tool_registry.read().await;
+        for name in &core_exploration_tools {
+            if !plan_tools.iter().any(|t| t.name == *name) {
+                if let Some(schema) = guard.list_all_tools().into_iter().find(|t| t.name == *name) {
+                    plan_tools.push(schema);
                 }
             }
-            Err(e) => AgentOutput::failure("LLMError", &format!("{:?}", e)),
+        }
+        drop(guard);
+        
+        // Use ReactLoop for Hybrid Execution (Reason -> Act -> Plan)
+        let react = crate::agents::react_loop::ReactLoop::new(
+            self.gateway.clone(),
+            self.tool_registry.clone(),
+            crate::agents::react_loop::ReactConfig {
+                max_iterations: 10,
+                max_consecutive_errors: 3,
+                max_duplicate_calls: 2,
+                session_id: format!("general_hybrid_{}", input.node_id),
+                budget_limit: 128_000,
+            },
+        );
+        
+        let hybrid_task_prompt = format!("Task: {}\n\nCRITICAL HYBRID PLANNING CONSTRAINT: 
+You are a PLANNER. You can use the provided tools (like `rhai_tool_studio` or `web_search`) synchronously RIGHT NOW via the standard tool calling API. ALWAYS use tool calls to execute tools, NEVER output raw tool JSON directly in your text response.
+If you can resolve the user's request immediately using synchronous tools (e.g., verifying a web scrape and writing a script via `rhai_tool_studio`), DO IT first. 
+Once your investigation or synchronous actions are complete, you MUST end your turn by outputting a final valid JSON `AgentSubGraph` block inside the [FINAL_ANSWER] token. 
+If your synchronous actions successfully finished the entire user request and no further pipeline nodes are needed, return an empty graph:
+[FINAL_ANSWER]
+{{ \"nodes\": [], \"edges\": [] }}
+Do not output conversational text after the JSON.", input.task);
+
+        let result = react.run(
+            system_prompt,
+            hybrid_task_prompt,
+            plan_tools,
+            &input.conversation_history,
+        ).await;
+
+        let content = result.content.trim();
+
+        // Robust JSON extraction
+        let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
+            if e > s { &content[s..=e] } else { content }
+        } else {
+            content
+        };
+
+        let clean_reply = json_str
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        match serde_json::from_str::<telos_core::AgentSubGraph>(clean_reply) {
+            Ok(sub_graph) => {
+                // When the SubGraph is empty (task was completed entirely within ReactLoop),
+                // include the ReactLoop's actual text output so the downstream summarizer
+                // can see what was accomplished (e.g., weather data, tool creation result).
+                let output_text = if sub_graph.nodes.is_empty() {
+                    // Extract text before [FINAL_ANSWER] marker — that's the LLM's actual response
+                    let text_before_answer = if let Some(idx) = content.find("[FINAL_ANSWER]") {
+                        content[..idx].trim()
+                    } else {
+                        // No marker found — use content before the JSON block
+                        if let Some(json_start) = content.rfind('{') {
+                            let before = content[..json_start].trim();
+                            if before.is_empty() { content } else { before }
+                        } else {
+                            content
+                        }
+                    };
+                    info!("[GeneralAgent] ✅ Empty SubGraph — task completed in ReactLoop. Forwarding {} bytes of result text.", text_before_answer.len());
+                    serde_json::json!({ "text": text_before_answer })
+                } else {
+                    serde_json::json!({ "text": "Plan generated by GeneralAgent via hybrid execution" })
+                };
+                let mut out = AgentOutput::with_subgraph(output_text, sub_graph);
+                out.trace_logs = result.trace_logs;
+                out
+            },
+            Err(e) => {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(clean_reply) {
+                    let inferred_tool = val.get("tool").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        .or_else(|| {
+                            // If the LLM hallucinated a direct tool execution payload for rhai_tool_studio
+                            if val.get("action").is_some() {
+                                Some("rhai_tool_studio".to_string())
+                            } else {
+                                None
+                            }
+                        });
+
+                    if let Some(tool) = inferred_tool {
+                        let sub_node = telos_core::SubGraphNode {
+                            id: format!("direct_call_{}", tool),
+                            agent_type: "tool".to_string(),
+                            task: format!("Execute tool: {}", tool),
+                            schema_payload: serde_json::json!({
+                                "tool_name": tool,
+                                "parameters": val
+                            }).to_string(),
+                            loop_config: None,
+                            is_critic: false,
+                        };
+                        let sub_graph = telos_core::AgentSubGraph {
+                            nodes: vec![sub_node],
+                            edges: vec![],
+                        };
+                        let mut out = AgentOutput::with_subgraph(
+                            serde_json::json!({ "text": "Plan generated by GeneralAgent fallback" }),
+                            sub_graph
+                        );
+                        out.trace_logs = result.trace_logs;
+                        return out;
+                    }
+                }
+
+                // PHASE 4 FIX: If the ReactLoop completed successfully and used tools (e.g., created a tool),
+                // the LLM may return a natural language summary instead of an empty SubGraph JSON.
+                // In this case, treat the ReactLoop's text as the completed answer — no further DAG nodes needed.
+                let tool_calls_used = result.trace_logs.iter().any(|log| matches!(log, telos_core::TraceLog::ToolCall { .. }));
+                if tool_calls_used && !content.trim_start().starts_with('{') {
+                    info!("[GeneralAgent] ✅ ReactLoop completed with text result after tool calls. Treating as completed answer.");
+                    let mut out = AgentOutput::with_subgraph(
+                        serde_json::json!({ "text": content }),
+                        telos_core::AgentSubGraph { nodes: vec![], edges: vec![] }
+                    );
+                    out.trace_logs = result.trace_logs;
+                    return out;
+                }
+
+                let mut out = AgentOutput::failure("PlanParseError", &format!("Failed to parse plan: {} (Raw: {})", e, clean_reply));
+                out.trace_logs = result.trace_logs;
+                out
+            }
         }
     }
 

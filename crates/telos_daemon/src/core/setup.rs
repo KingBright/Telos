@@ -80,19 +80,16 @@ pub async fn build_tool_registry(
         // Register global health tracking — fires in InstrumentedToolExecutor::call()
         telos_tooling::set_tool_health_registry(wrapped_registry.clone());
         
-        let create_rhai = telos_tooling::native::CreateRhaiTool::new(wrapped_registry.clone());
-        let list_rhai = telos_tooling::native::ListRhaiTools::new(config.tools_dir.clone());
+        let rhai_studio = telos_tooling::native::RhaiToolStudio::new(wrapped_registry.clone());
         let discover_tools = telos_tooling::native::DiscoverTools::new(wrapped_registry.clone());
         let attach_note = telos_tooling::native::AttachToolNote::new(wrapped_registry.clone());
         let mutate_tool = MutateTool::new(wrapped_registry.clone(), gateway.clone(), config.tools_dir.clone());
-        let manage_tools = telos_tooling::native::ManageToolsTool::new(wrapped_registry.clone());
+        
         if let Ok(guard) = tool_registry.try_read() {
-            guard.register_tool(telos_tooling::native::CreateRhaiTool::schema(), Some(std::sync::Arc::new(create_rhai)));
-            guard.register_tool(telos_tooling::native::ListRhaiTools::schema(), Some(std::sync::Arc::new(list_rhai)));
+            guard.register_tool(telos_tooling::native::RhaiToolStudio::schema(), Some(std::sync::Arc::new(rhai_studio)));
             guard.register_tool(telos_tooling::native::DiscoverTools::schema(), Some(std::sync::Arc::new(discover_tools)));
             guard.register_tool(telos_tooling::native::AttachToolNote::schema(), Some(std::sync::Arc::new(attach_note)));
             guard.register_tool(MutateTool::schema(), Some(std::sync::Arc::new(mutate_tool)));
-            guard.register_tool(telos_tooling::native::ManageToolsTool::schema(), Some(std::sync::Arc::new(manage_tools)));
 
             // Mission Scheduling Tools
             guard.register_tool(

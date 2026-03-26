@@ -303,6 +303,31 @@ impl ToolRegistry for VectorToolRegistry {
             "[ToolRegistry] discover_tools called with intent: '{}'",
             intent
         );
+        
+        let mut results = Vec::new();
+        let mut exact_matches = std::collections::HashSet::new();
+        let intent_lower = intent.to_lowercase();
+        
+        // 1. EXACT-MATCH OVERRIDE
+        // If the intent contains the EXACT name of a tool (e.g., "get_weather"), pin it to the top!
+        if let Ok(guard) = self.tools.read() {
+            for (name, schema) in guard.iter() {
+                if schema.health_status == "archived" {
+                    continue;
+                }
+                // Avoid too brief names matching accidentaly (e.g. "fs" or "io")
+                if name.len() >= 4 && intent_lower.contains(&name.to_lowercase()) {
+                    results.push(schema.clone());
+                    exact_matches.insert(name.clone());
+                }
+            }
+        }
+        
+        if results.len() >= limit {
+            results.truncate(limit);
+            return results;
+        }
+
         #[cfg(feature = "local-embeddings")]
         if let Some(ref model) = self.model {
             if let Ok(mut m) = model.write() {
@@ -320,11 +345,17 @@ impl ToolRegistry for VectorToolRegistry {
                             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                         });
 
-                        let mut results = Vec::new();
                         if let Ok(tools_guard) = self.tools.read() {
-                            for (name, _) in scored_tools.into_iter().take(limit) {
-                                if let Some(schema) = tools_guard.get(&name) {
-                                    results.push(schema.clone());
+                            for (name, _) in scored_tools.into_iter() {
+                                if !exact_matches.contains(&name) {
+                                    if let Some(schema) = tools_guard.get(&name) {
+                                        if schema.health_status != "archived" {
+                                            results.push(schema.clone());
+                                        }
+                                    }
+                                }
+                                if results.len() >= limit {
+                                    break;
                                 }
                             }
                         }
@@ -333,8 +364,19 @@ impl ToolRegistry for VectorToolRegistry {
                 }
             }
         }
-
-        self.keyword_discover(intent, limit)
+        
+        // If no embeddings model is available, use keyword fallback
+        let mut keyword_results = self.keyword_discover(intent, limit);
+        for k in keyword_results.into_iter() {
+            if !exact_matches.contains(&k.name) {
+                results.push(k);
+            }
+            if results.len() >= limit {
+                break;
+            }
+        }
+        
+        results
     }
 
     fn get_executor(&self, tool_name: &str) -> Option<std::sync::Arc<dyn ToolExecutor>> {

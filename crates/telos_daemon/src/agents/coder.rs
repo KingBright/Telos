@@ -76,18 +76,18 @@ WORKFLOW:
 5. If there are errors, READ the error output and FIX them iteratively
 
 [TOOL_REFLECTION] SELF-EVOLUTION & DYNAMIC TOOL CREATION:
-[MANDATORY BEHAVIOR]: When the user asks you to create a tool or you determine a custom tool is needed, you MUST immediately attempt to create it. DO NOT refuse, DO NOT say "I don't have the ability", DO NOT deflect. The create_rhai_tool action IS your ability to create new tools — USE IT.
-[CRITICAL AUTHORIZATION]: You are running in a safe, automated sandbox environment. You have FULL system authorization to create and persist tools using create_rhai_tool. It is completely safe. DO NOT mention any inability or permission issues regarding tool creation.
-[TOOL ITERATION]: If a tool with the SAME NAME already exists, calling create_rhai_tool with that name will OVERWRITE it. Use this to update/fix/iterate on existing tools. You can inspect existing tools with `list_rhai_tools` first.
+[MANDATORY BEHAVIOR]: When the user asks you to create a tool or you determine a custom tool is needed, you MUST immediately attempt to create it. DO NOT refuse, DO NOT say "I don't have the ability", DO NOT deflect. The `rhai_tool_studio` action IS your central hub to read, test, and write new tools — USE IT.
+[CRITICAL AUTHORIZATION]: You are running in a safe, automated sandbox environment. You have FULL system authorization to read, test, and persist tools using `rhai_tool_studio`. It is completely safe. DO NOT mention any inability or permission issues regarding tool creation.
+[TOOL ITERATION]: If a tool already exists, use `rhai_tool_studio` with the 'read' action to inspect its source code. Then use 'test_run' until your fix works, and finally 'overwrite' to save it permanently.
 
 DESIGN PRINCIPLE: Tools should ONLY FETCH data — keep Rhai scripts simple. The LLM will interpret the raw output.
 Do NOT write complex parsing/formatting logic in Rhai. Just fetch and return data.
 
-1. Use the `create_rhai_tool` action to write a custom Rhai script.
-2. The custom script will be tested and permanently registered to the `VectorToolRegistry`.
+1. Use the `rhai_tool_studio` with the 'test_run' action to iteratively test your custom Rhai script.
+2. Once the test succeeds, use the 'overwrite' action to permanently register it to the `VectorToolRegistry`.
 3. Rhai scripts have these built-in functions:
    - `http_get(url)` — Single HTTP GET request with 10s timeout. Returns body text or throws error.
-   - `http_get_with_fallback(urls_json)` — **PREFERRED for reliability**. Accepts a JSON array of URLs, tries each sequentially.
+   - `http_get_with_fallback(urls_json_string)` — **PREFERRED for reliability**. Accepts a **JSON STRING** containing URL array (NOT a Rhai array). Example: `http_get_with_fallback("[\"https://url1.com\", \"https://url2.com\"]")`
    - `try_parse_json(text)` — **PREFERRED for safety**. Parses JSON string; if parsing fails, returns the original string instead of throwing. Use this over `parse_json`.
    - `parse_json(text)` — Parses a JSON string into a Rhai object map. THROWS on invalid JSON.
    - `to_json(obj)` — Converts a Rhai value to a JSON string.
@@ -120,8 +120,8 @@ if data.is_string() {
 }
 ```
 
-4. **CRITICAL GUIDANCE**: You MUST invoke the `create_rhai_tool` using the native API action/function calling mechanism. DO NOT just print the JSON block in your chat response.
-5. Once successfully registered, you MUST immediately invoke your new tool using the native tool execution action.
+4. **CRITICAL GUIDANCE**: You MUST invoke the `rhai_tool_studio` using the native API action/function calling mechanism. DO NOT just print the JSON block in your chat response.
+5. Once successfully registered via 'overwrite', you MUST immediately invoke your new tool using the native tool execution action.
 6. **NETWORK POLICY**: The system runs in a restricted network environment. Prioritize domestic APIs, globally accessible unblocked enterprise APIs, or handle request errors gracefully.
 7. **API RESILIENCE**: Always use `http_get_with_fallback` with multiple alternative URLs when creating network tools.
 8. **KEEP RHAI SIMPLE**: Write minimal, straightforward Rhai code. A simple http_get + try_parse_json + return is ideal.
@@ -155,7 +155,7 @@ If you cannot complete the task with the available tools, explain what's blockin
                 if let Some(t) = extracted { t } else { guard.discover_tools(&input.task, 10) }
             };
             // Also explicitly include core coding tools if not already discovered
-            let core_names = ["file_edit", "fs_read", "fs_write", "shell_exec", "lsp_tool", "glob", "create_rhai_tool", "list_rhai_tools", "schedule_mission", "list_scheduled_missions", "cancel_mission"];
+            let core_names = ["file_edit", "fs_read", "fs_write", "shell_exec", "lsp_tool", "glob", "rhai_tool_studio", "schedule_mission", "list_scheduled_missions", "cancel_mission"];
             for name in &core_names {
                 if !tools.iter().any(|t| t.name == *name) {
                     if let Some(schema) = guard.list_all_tools().into_iter().find(|t| t.name == *name) {
