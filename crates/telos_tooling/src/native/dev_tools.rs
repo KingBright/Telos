@@ -1143,7 +1143,8 @@ impl RhaiToolStudio {
             \n\
             RHAI SYNTAX REFERENCE:\n\
             ▸ STRINGS: Double quotes `\"hello\"`. Backtick interpolation: `` `hello ${name}` ``\n\
-            ▸ MAP ACCESS: MUST use bracket: `map[\"key\"]`\n\
+            ▸ MAP ACCESS: MUST use bracket: `map[\"key\"]`. To check if key exists: `\"key\" in map` or `map.contains(\"key\")`. DO NOT USE `map.keys().contains()`.\n\
+            ▸ CONTROL FLOW: You MUST use `{}` braces for ALL `if`, `for`, `while` statements. Example: `if x == 1 { return x; }`. DO NOT USE PYTHON SYNTAX!\n\
             ▸ HTTP: `http_get_with_fallback([\"url1\"])` -> returns string. `try_parse_json(text)` -> parses JSON safely.\n\
             ▸ RETURN: Last expression without semicolon is returned.\n\
             ".into(),
@@ -1240,7 +1241,11 @@ impl ToolExecutor for RhaiToolStudio {
                                 "try_parse_json": "try_parse_json(string) -> Dynamic. Safe JSON parse: returns parsed object on success, original string on failure.",
                                 "to_json": "to_json(value) -> String. Converts Rhai value back to JSON string."
                             },
-                            "hint": "IMPORTANT: http_get_with_fallback takes a JSON-encoded string array, NOT a Rhai array. Use: http_get_with_fallback(\"[\\\"url\\\"]\")"
+                            "hint": if error_msg.contains("Syntax error") || error_msg.contains("Expecting '{'") {
+                                "CRITICAL SYNTAX ERROR: Rhai STRICTLY REQUIRES `{}` braces for all `if`, `for`, and `while` blocks. E.g., `if condition { return true; }`. DO NOT use Python/Ruby style syntax."
+                            } else {
+                                "IMPORTANT: http_get_with_fallback takes a JSON-encoded string array, NOT a Rhai array. Use: http_get_with_fallback(\"[\\\"url\\\"]\")"
+                            }
                         });
                         Ok(serde_json::to_vec_pretty(&out).unwrap())
                     }
