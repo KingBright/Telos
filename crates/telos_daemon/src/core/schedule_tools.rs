@@ -24,7 +24,7 @@ impl ScheduleMissionTool {
     pub fn schema() -> ToolSchema {
         ToolSchema {
             name: "schedule_mission".into(),
-            description: "Schedules a recurring autonomous mission. You MUST verify you have the capability (tools/workflows) to execute the instruction BEFORE scheduling it, ideally by performing a dry run. The instruction will be executed completely independently by the system in the future.".into(),
+            description: "Schedules a recurring autonomous Telos/Agent mission in the internal database. Use this WHENEVER the user asks to 'schedule a task', 'create a cron job', or '定时任务'. NEVER use OS-level crontab or launchctl to schedule tasks unless explicitly requested. You MUST verify you have the capability (tools/workflows) to execute the instruction BEFORE scheduling it, ideally by performing a dry run.".into(),
             parameters_schema: JsonSchema {
                 raw_schema: serde_json::json!({
                     "type": "object",
@@ -105,7 +105,7 @@ impl ListScheduledMissionsTool {
     pub fn schema() -> ToolSchema {
         ToolSchema {
             name: "list_scheduled_missions".into(),
-            description: "Lists all currently active scheduled autonomous missions. Use this to check what the agent defaults to doing in the background.".into(),
+            description: "Lists all currently active scheduled autonomous Agent/Telos missions in the internal database. Use this WHENEVER the user asks to check 'my scheduled tasks', 'cron tasks', or '定时任务'. NEVER use shell execution to scan macOS launchd/crontab or system services unless the user explicitly requests OS-level background processes.".into(),
             parameters_schema: JsonSchema {
                 raw_schema: serde_json::json!({
                     "type": "object",

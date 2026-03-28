@@ -210,10 +210,20 @@ impl TelosConfig {
         
         let old_db_default = format!("{}/.telos_memory.redb", home_str);
         
-        if config.db_path == old_db_default || config.db_path.is_empty() {
-            config.db_path = new_db_path.to_string_lossy().into_owned();
+        let mut final_db_path = config.db_path.clone();
+        if final_db_path == old_db_default || final_db_path.is_empty() {
+            final_db_path = new_db_path.to_string_lossy().into_owned();
             needs_save = true;
         }
+
+        // --- TEST ENVIRONMENT ISOLATION ---
+        if std::env::var("TELOS_ENV").unwrap_or_default() == "test" {
+             let mut test_db = Self::telos_home();
+             test_db.push("test_memory.redb");
+             final_db_path = test_db.to_string_lossy().into_owned();
+             needs_save = false; // Never save test DB to config
+        }
+        config.db_path = final_db_path;
 
         // Physically move the legacy database file if it exists and the new one doesn't
         if old_db_path.exists() && !new_db_path.exists() {

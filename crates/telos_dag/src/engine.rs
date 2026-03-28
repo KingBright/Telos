@@ -53,6 +53,11 @@ impl LoopState {
         if self.score_history.len() < 2 {
             return false;
         }
+        // Never stagnate if the score is exactly 0.0 (indicates consistent compiler/validator failure).
+        // Let the loop exhaust its max_iterations so escalation mechanisms like TechLead can intercept.
+        if current_score <= 0.01 {
+            return false;
+        }
         let recent: Vec<f32> = self.score_history.iter().rev().take(2).copied().collect();
         let max_diff = recent.iter()
             .map(|s| (s - current_score).abs())
@@ -441,6 +446,9 @@ impl ExecutionEngine for TokioExecutionEngine {
 
             // Corrective loop states: keyed by Critic node ID
             let mut loop_states: HashMap<String, LoopState> = HashMap::new();
+            
+            // Timeout tasks for human approval nodes
+            let mut timeout_handles: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
             while completed_nodes < total_nodes {
                 // 0. Cancellation check
@@ -562,7 +570,44 @@ impl ExecutionEngine for TokioExecutionEngine {
                         };
 
                         futures.push(async move {
-                            let output = node.execute(agent_input, registry).instrument(node_span).await;
+                            let node_span_clone = node_span.clone();
+                            
+                            // Supervisor layer: catch panics from node.execute
+                            use futures::FutureExt;
+                            let exec_future = node.execute(agent_input, registry).instrument(node_span_clone);
+                            
+                            let output = match std::panic::AssertUnwindSafe(exec_future).catch_unwind().await {
+                                Ok(out) => out,
+                                Err(err) => {
+                                    let msg = if let Some(s) = err.downcast_ref::<&'static str>() {
+                                        s.to_string()
+                                    } else if let Some(s) = err.downcast_ref::<&String>() {
+                                        s.to_string()
+                                    } else if let Some(s) = err.downcast_ref::<String>() {
+                                        s.clone()
+                                    } else {
+                                        "Unknown panic during node execution".to_string()
+                                    };
+                                    
+                                    tracing::error!("[DAG Engine] 🚨 FATAL: Node panicked! Captured by Supervisor. Error: {}", msg);
+                                    
+                                    telos_core::AgentOutput {
+                                        success: false,
+                                        output: None,
+                                        needs_help: None,
+                                        sub_graph: None,
+                                        trace_logs: vec![],
+                                        error: Some(telos_core::AgentErrorDetail {
+                                            error_type: "WorkerPanic".to_string(),
+                                            message: format!("Node abruptly panicked: {}", msg),
+                                            technical_detail: None,
+                                            severity: telos_core::ErrorSeverity::Fatal,
+                                            layer: telos_core::ErrorLayer::Dag,
+                                            retry_suggested: false,
+                                        }),
+                                    }
+                                }
+                            };
                             (id_clone, output, node, node_start_time)
                         });
                         active_tasks += 1;
@@ -570,6 +615,8 @@ impl ExecutionEngine for TokioExecutionEngine {
                 }
 
                 if active_tasks == 0 && ready_queue.is_empty() && waiting_for_input_count == 0 {
+                    error!("[DAG Engine] 💀 Deadlock detected! Active tasks: 0, Ready: 0, Waiting: 0. Remaining nodes: {}", total_nodes - completed_nodes);
+                    fatal_error_encountered = true;
                     break;
                 }
 
@@ -625,6 +672,28 @@ impl ExecutionEngine for TokioExecutionEngine {
                                         info.progress = progress;
                                         info.running_nodes.retain(|n| n != &node_id);
                                     }
+                                }
+
+                                // Spawn a 120s timeout auto-wakeup task.
+                                // If the user responds before timeout, the wakeup is
+                                // safely ignored (node will no longer be WaitingForInput).
+                                {
+                                    let timeout_wakeup_tx = self.wakeup_tx.clone();
+                                    let timeout_graph_id = graph_id.clone();
+                                    let timeout_node_id = node_id.clone();
+                                    let handle = tokio::spawn(async move {
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+                                        let _ = timeout_wakeup_tx.send((
+                                            timeout_graph_id.clone(),
+                                            timeout_node_id.clone(),
+                                            "[Auto-Approved: Timeout]".to_string(),
+                                        ));
+                                        tracing::info!(
+                                            "[DAG Engine] ⏱️ Timeout auto-wakeup sent for node \"{}\" in graph \"{}\"",
+                                            timeout_node_id, timeout_graph_id
+                                        );
+                                    });
+                                    timeout_handles.insert(node_id.clone(), handle);
                                 }
                                 continue;
                             }
@@ -815,13 +884,32 @@ impl ExecutionEngine for TokioExecutionEngine {
                                         graph.node_statuses.insert(actor_id.clone(), NodeStatus::Pending);
                                         // Also reset Critic so it can run again after Actor
                                         graph.node_statuses.insert(node_id.clone(), NodeStatus::Pending);
+                                        
+                                        // CRITICAL: We must increment the Critic's in_degrees by 1 because the Actor is going to run again.
+                                        // When the Actor completes, it will decrement this back to 0 and push the Critic to the ready queue.
+                                        if let Some(deg) = in_degrees.get_mut(&node_id) {
+                                            *deg += 1;
+                                        }
+
                                         ready_queue.push(actor_id);
 
                                         // Don't count as completed — loop continues
                                         continue;
                                     } else {
                                         // Exit loop — replace output with best Actor output
-                                        let best = loop_state.take_best_output();
+                                        let mut best = loop_state.take_best_output();
+                                        
+                                        // If loop exited due to stagnation or max iterations (i.e. not satisfied), 
+                                        // explicitly fail the output to trigger downstream pruning and Macro Reset.
+                                        if !should_exit {
+                                            best.success = false;
+                                            best.error = Some(telos_core::AgentErrorDetail::permanent(
+                                                "LoopExhausted",
+                                                "Worker failed to satisfy Critic within the corrective loop limits.",
+                                                telos_core::ErrorLayer::Dag,
+                                            ));
+                                        }
+
                                         // Store the best Actor output as the Critic node's result
                                         // so downstream nodes see the Actor's work, not the Critic's eval
                                         graph.node_results.insert(node_id.clone(), best.clone());
@@ -829,7 +917,9 @@ impl ExecutionEngine for TokioExecutionEngine {
                                     }
                                 }
                                 // === End Corrective Loop ===
+                            }
 
+                            if output.success {
                                 graph.node_statuses.insert(node_id.clone(), NodeStatus::Completed);
                                 info!("[DAG Engine] ✓ Node \"{}\" completed in {}ms", node_id, execution_time_ms);
 
@@ -951,13 +1041,21 @@ impl ExecutionEngine for TokioExecutionEngine {
                             if let Some(status) = graph.node_statuses.get_mut(&wake_node_id) {
                                 if *status == NodeStatus::WaitingForInput {
                                     *status = NodeStatus::Pending;
+                                    
+                                    // Cancel pending timeout if it exists
+                                    if let Some(handle) = timeout_handles.remove(&wake_node_id) {
+                                        handle.abort();
+                                    }
+
                                     if waiting_for_input_count > 0 {
                                         waiting_for_input_count -= 1;
                                     }
                                     
                                     // Inject the user instruction into the node's task metadata
                                     if let Some(metadata) = graph.node_metadata.get_mut(&wake_node_id) {
-                                        metadata.prompt_preview.push_str(&format!("\n\n[Human Intervention / Expert Help]:\n{}", instruction));
+                                        let intervention = format!("\n\n[Human Intervention / Expert Help]:\n{}", instruction);
+                                        metadata.prompt_preview.push_str(&intervention);
+                                        metadata.full_task.push_str(&intervention);
                                     }
                                     
                                     ready_queue.push(wake_node_id.clone());
@@ -987,7 +1085,9 @@ impl ExecutionEngine for TokioExecutionEngine {
             }
 
             // 确定最终状态
-            if final_state == TaskFinalState::Unknown {
+            if fatal_error_encountered {
+                final_state = TaskFinalState::FatalError;
+            } else if final_state == TaskFinalState::Unknown {
                 if completed_nodes == total_nodes && failed_nodes == 0 {
                     final_state = TaskFinalState::Success;
                 } else if failed_nodes == 0 {

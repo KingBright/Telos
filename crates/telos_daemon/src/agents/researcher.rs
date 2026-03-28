@@ -97,11 +97,7 @@ Browsing specific sites / Complex research:
   ]
 }}
 
-REQUIRED JSON STRUCTURE:
-{{
-  "nodes": [ {{ "id": "node_1", "agent_type": "search_worker", "task": "descriptive search intent — keywords: kw1, kw2", "schema_payload": "{{\"mode\":\"direct or deep\"}}" }} ],
-  "edges": [ {{ "from": "node_1", "to": "node_2", "dep_type": "Data" }} ]
-}}"#)
+You MUST use the provided `submit_subgraph_plan` tool to submit your final research plan. Do not output anything else."#)
             .build();
 
         let mut messages = vec![
@@ -115,6 +111,42 @@ REQUIRED JSON STRUCTURE:
         }
         messages.push(Message { role: "user".to_string(), content: format!("Task: {}\n\nCRITICAL CONSTRAINT: You MUST output ONLY a valid JSON object matching the requested schema. DO NOT output any other conversational text or formatting. If you cannot provide a JSON plan, still output a valid JSON containing a tool or summary node.", input.task) });
 
+        let subgraph_tool = telos_model_gateway::ToolDefinition {
+            name: "submit_subgraph_plan".to_string(),
+            description: "Submit the generated SubGraph plan".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "agent_type": { "type": "string" },
+                                "task": { "type": "string" },
+                                "schema_payload": { "type": "string" }
+                            },
+                            "required": ["id", "agent_type", "task", "schema_payload"]
+                        }
+                    },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": { "type": "string" },
+                                "to": { "type": "string" },
+                                "dep_type": { "type": "string" }
+                            },
+                            "required": ["from", "to", "dep_type"]
+                        }
+                    }
+                },
+                "required": ["nodes", "edges"]
+            })
+        };
+
         let req = LlmRequest {
             session_id: format!("research_{}", input.node_id),
             messages,
@@ -123,7 +155,7 @@ REQUIRED JSON STRUCTURE:
                 strong_reasoning: true,
             },
             budget_limit: 4000,
-            tools: None,
+            tools: Some(vec![subgraph_tool]),
         };
 
         match self.gateway.generate(req.clone()).await {
@@ -132,16 +164,13 @@ REQUIRED JSON STRUCTURE:
                     request: serde_json::to_value(&req).unwrap_or_else(|_| serde_json::json!({})),
                     response: serde_json::to_value(&res).unwrap_or_else(|_| serde_json::json!({})),
                 };
-                let content = res.content.trim();
-                
-                // Robust JSON extraction
-                let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
-                    if e > s { &content[s..=e] } else { content }
+                let raw_content = if let Some(tc) = res.tool_calls.first() {
+                    tc.arguments.clone()
                 } else {
-                    content
+                    res.content.clone()
                 };
 
-                let clean_reply = json_str
+                let clean_reply = raw_content.trim()
                     .trim_start_matches("```json")
                     .trim_start_matches("```")
                     .trim_end_matches("```")

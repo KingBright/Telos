@@ -1,11 +1,10 @@
 use crate::agents::{
     async_trait, AgentInput, AgentOutput, Arc, ExecutableNode, GatewayManager, SystemRegistry,
 };
-use telos_model_gateway::{Capability, LlmRequest, Message, ModelGateway};
 use telos_memory::engine::RedbGraphStore;
+use telos_model_gateway::{Capability, LlmRequest, Message, ModelGateway};
 use telos_tooling::ToolRegistry;
 use tracing::info;
-
 
 pub struct RouterAgent {
     pub gateway: Arc<GatewayManager>,
@@ -15,13 +14,31 @@ pub struct RouterAgent {
 }
 
 impl RouterAgent {
-    pub fn new(gateway: Arc<GatewayManager>, persona_name: String, persona_trait: String, tool_registry: Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>) -> Self {
-        Self { gateway, persona_name, persona_trait, tool_registry }
+    pub fn new(
+        gateway: Arc<GatewayManager>,
+        persona_name: String,
+        persona_trait: String,
+        tool_registry: Arc<tokio::sync::RwLock<telos_tooling::retrieval::VectorToolRegistry>>,
+    ) -> Self {
+        Self {
+            gateway,
+            persona_name,
+            persona_trait,
+            tool_registry,
+        }
     }
 
-    pub async fn evaluate(&self, original_task: &str, expert_output: &str, _registry: &dyn SystemRegistry) -> AgentOutput {
+    pub async fn evaluate(
+        &self,
+        original_task: &str,
+        expert_output: &str,
+        _registry: &dyn SystemRegistry,
+    ) -> AgentOutput {
         let env_context = if let Some(ctx) = _registry.get_system_context() {
-            format!("[ENVIRONMENT CONTEXT]\nLocal Time: {}\nPhysical Location: {}\n\n", ctx.current_time, ctx.location)
+            format!(
+                "[ENVIRONMENT CONTEXT]\nLocal Time: {}\nPhysical Location: {}\n\n",
+                ctx.current_time, ctx.location
+            )
         } else {
             String::new()
         };
@@ -32,12 +49,19 @@ impl RouterAgent {
             if let Ok(mem_os) = mem_any.clone().downcast::<RedbGraphStore>() {
                 let profile_text = telos_memory::build_and_format_profile(&*mem_os).await;
                 if !profile_text.is_empty() {
-                    memory_context_for_qa = format!("[USER MEMORY CONTEXT — verified stored data]\n{}\n", profile_text);
+                    memory_context_for_qa = format!(
+                        "[USER MEMORY CONTEXT — verified stored data]\n{}\n",
+                        profile_text
+                    );
                 }
             }
         }
 
-        let system_prompt = format!("{}{}{}", env_context, memory_context_for_qa, r#"You are the Telos Master Router acting as a strict Quality Assurance supervisor.
+        let system_prompt = format!(
+            "{}{}{}",
+            env_context,
+            memory_context_for_qa,
+            r#"You are the Telos Master Router acting as a strict Quality Assurance supervisor.
 Your job is to evaluate whether the Expert Agent's final output fully satisfies the User's original request.
 
 IMPORTANT SYSTEM CAPABILITY: This AI system HAS persistent memory storage. The Expert Agent can store and retrieve user preferences, past interactions, and personal information using memory tools. If the Expert references user preferences or past interactions, verify against the [USER MEMORY CONTEXT] provided above rather than assuming hallucination. If no memory context is provided but the Expert claims to remember something, check if the claim is plausible given the conversation flow.
@@ -144,42 +168,85 @@ Expert: "抱歉，我无法获取相关信息。"
   "is_relevant": true,
   "is_clarification": false,
   "is_acceptable": false,
+  "is_acceptable": false,
   "critique": "The output simply states inability without any actual content. Retry with different search queries."
-}"#);
+}
 
-        let request = LlmRequest {
-            session_id: "router_eval".to_string(),
-            messages: vec![
-                Message { role: "system".to_string(), content: system_prompt.to_string() },
-                Message { role: "user".to_string(), content: format!("User Request:\n{}\n\nExpert Output:\n{}", original_task, expert_output) },
-            ],
-            required_capabilities: Capability {
-                requires_vision: false,
-                strong_reasoning: true,
-            },
-            budget_limit: 1000,
-            tools: None,
-        };
+You MUST use the provided `submit_qa_verdict` tool to submit your evaluation. Do not output raw text or code blocks."#
+        );
+
+            let qa_tool = telos_model_gateway::ToolDefinition {
+                name: "submit_qa_verdict".to_string(),
+                description: "Submit the quality assurance evaluation for the expert's output".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "contains_answer": { "type": "boolean" },
+                        "is_relevant": { "type": "boolean" },
+                        "is_clarification": { "type": "boolean" },
+                        "is_acceptable": { "type": "boolean" },
+                        "critique": { "type": "string" }
+                    },
+                    "required": ["contains_answer", "is_relevant", "is_clarification", "is_acceptable", "critique"]
+                }),
+            };
+
+            let request = LlmRequest {
+                session_id: "router_eval".to_string(),
+                messages: vec![
+                    Message {
+                        role: "system".to_string(),
+                        content: system_prompt.to_string(),
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: format!(
+                            "User Request:\n{}\n\nExpert Output:\n{}",
+                            original_task, expert_output
+                        ),
+                    },
+                ],
+                required_capabilities: Capability {
+                    requires_vision: false,
+                    strong_reasoning: true,
+                },
+                budget_limit: 1000,
+                tools: Some(vec![qa_tool]),
+            };
 
         match self.gateway.generate(request.clone()).await {
             Ok(res) => {
                 let trace = telos_core::TraceLog::LlmCall {
-                    request: serde_json::to_value(&request).unwrap_or_else(|_| serde_json::json!({})),
+                    request: serde_json::to_value(&request)
+                        .unwrap_or_else(|_| serde_json::json!({})),
                     response: serde_json::to_value(&res).unwrap_or_else(|_| serde_json::json!({})),
                 };
-                let content = res.content.trim();
-                let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
-                    if e > s { &content[s..=e] } else { content }
+                let raw_content = if let Some(tc) = res.tool_calls.first() {
+                    tc.arguments.clone()
                 } else {
-                    content
+                    res.content.clone()
                 };
-                let clean_reply = json_str.trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+
+                let clean_reply = raw_content.trim()
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim();
 
                 if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(clean_reply) {
                     // Enforce grounding constraint: is_acceptable requires contains_answer
-                    let contains_answer = json.get("contains_answer").and_then(|v| v.as_bool()).unwrap_or(true); // default true for backward compat
-                    let is_relevant = json.get("is_relevant").and_then(|v| v.as_bool()).unwrap_or(true);
-                    let is_acceptable = json.get("is_acceptable").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let contains_answer = json
+                        .get("contains_answer")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true); // default true for backward compat
+                    let is_relevant = json
+                        .get("is_relevant")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let is_acceptable = json
+                        .get("is_acceptable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
 
                     // Log grounding inconsistencies but trust LLM judgment (LLM is protagonist)
                     if !contains_answer && is_acceptable {
@@ -189,26 +256,41 @@ Expert: "抱歉，我无法获取相关信息。"
                         tracing::warn!("[Router QA] ⚠️ Grounding note: LLM accepted despite is_relevant=false. Trusting LLM judgment.");
                     }
 
-                    let final_is_acceptable = json.get("is_acceptable").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let final_is_acceptable = json
+                        .get("is_acceptable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     if final_is_acceptable {
-                        crate::METRICS.qa_passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::METRICS
+                            .qa_passes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     } else {
-                        crate::METRICS.qa_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::METRICS
+                            .qa_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    crate::core::metrics_store::record(crate::core::metrics_store::MetricEvent::QaResult {
-                        timestamp_ms: crate::core::metrics_store::now_ms(),
-                        task_id: "router_eval".to_string(),
-                        passed: final_is_acceptable,
-                    });
+                    crate::core::metrics_store::record(
+                        crate::core::metrics_store::MetricEvent::QaResult {
+                            timestamp_ms: crate::core::metrics_store::now_ms(),
+                            task_id: "router_eval".to_string(),
+                            passed: final_is_acceptable,
+                        },
+                    );
 
                     if json.get("is_acceptable").is_some() || json.get("route").is_some() {
                         return AgentOutput::success(json).with_trace(trace);
                     }
                 }
-                
-                AgentOutput::failure("EvalError", &format!("Failed to parse router evaluation as JSON: {}", content)).with_trace(trace)
+
+                AgentOutput::failure(
+                    "EvalError",
+                    &format!("Failed to parse router evaluation as JSON: {}", raw_content),
+                )
+                .with_trace(trace)
             }
-            Err(e) => AgentOutput::failure("LLMError", &format!("Router failed to evaluate: {:?}", e)),
+            Err(e) => {
+                AgentOutput::failure("LLMError", &format!("Router failed to evaluate: {:?}", e))
+            }
         }
     }
 }
@@ -217,11 +299,14 @@ Expert: "抱歉，我无法获取相关信息。"
 impl ExecutableNode for RouterAgent {
     async fn execute(&self, input: AgentInput, _registry: &dyn SystemRegistry) -> AgentOutput {
         let env_context = if let Some(ctx) = _registry.get_system_context() {
-            format!("[ENVIRONMENT CONTEXT]\nLocal Time: {}\nPhysical Location: {}\n\n", ctx.current_time, ctx.location)
+            format!(
+                "[ENVIRONMENT CONTEXT]\nLocal Time: {}\nPhysical Location: {}\n\n",
+                ctx.current_time, ctx.location
+            )
         } else {
             String::new()
         };
-        
+
         // Dynamically query user profile and interaction memory
         let mut user_profile_context = String::new();
         if let Some(mem_any) = _registry.get_memory_os() {
@@ -232,7 +317,7 @@ impl ExecutableNode for RouterAgent {
                 }
             }
         }
-        
+
         let mut mem_context = input.memory_context.clone().unwrap_or_default();
         if !mem_context.is_empty() {
             mem_context = format!("[RETRIEVED MEMORY CONTEXT]\n{}\n\n", mem_context);
@@ -241,22 +326,26 @@ impl ExecutableNode for RouterAgent {
         // ==========================================
         // Progressive Exposure: Router Auto-Discovery
         // ==========================================
-        // Before routing the task, the Router natively discovers which custom tools 
+        // Before routing the task, the Router natively discovers which custom tools
         // match the user's intent. This saves the Expert Agent from having to blind-search.
         let registry_guard = self.tool_registry.read().await;
         let mut discovered_tools = registry_guard.discover_tools(&input.task, 5); // top_k=5 for router hint
         let all_tools_schema = registry_guard.list_all_tools();
         drop(registry_guard);
-        
+
         let mut custom_tools_context = String::new();
         if !discovered_tools.is_empty() {
-            let tools_str = discovered_tools.iter()
+            let tools_str = discovered_tools
+                .iter()
                 .map(|t| format!("- `{}`: {}", t.name, t.description))
                 .collect::<Vec<_>>()
                 .join("\n");
-            
+
             custom_tools_context = format!("[AVAILABLE CUSTOM TOOLS]\nThe following custom tools were auto-discovered based on the user's request. If any of these can fulfill the request, YOU MUST ROUTE TO `general_expert` because ONLY `general_expert` can call these custom tools.\n{}\n\n", tools_str);
-            info!("[Router Auto-Discovery] Found {} potential tools for intent", discovered_tools.len());
+            info!(
+                "[Router Auto-Discovery] Found {} potential tools for intent",
+                discovered_tools.len()
+            );
         }
         // Build conversation history as a reference block for the system prompt
         // CRITICAL: History goes into the system prompt as context, NOT as actual
@@ -265,9 +354,11 @@ impl ExecutableNode for RouterAgent {
         let mut conversation_history_block = String::new();
         if !input.conversation_history.is_empty() {
             conversation_history_block.push_str("[CONVERSATION HISTORY]\n");
-            conversation_history_block.push_str("The following are past exchanges in this session. Use them to:\n");
+            conversation_history_block
+                .push_str("The following are past exchanges in this session. Use them to:\n");
             conversation_history_block.push_str("- Understand references like \"再搜一次\" (search again), \"上面那个\" (the one above)\n");
-            conversation_history_block.push_str("- Resolve pronouns and context (\"it\", \"that\", \"those\")\n");
+            conversation_history_block
+                .push_str("- Resolve pronouns and context (\"it\", \"that\", \"those\")\n");
             conversation_history_block.push_str("- Answer questions the user asks about these past exchanges (e.g., \"what did we just talk about?\", \"what port did you use?\")\n");
             conversation_history_block.push_str("NOTE: Answer the user's CURRENT question. Do not spontaneously re-answer a past question unless the user asks you to.\n\n");
             for msg in &input.conversation_history {
@@ -276,7 +367,8 @@ impl ExecutableNode for RouterAgent {
                     "assistant" => "Assistant",
                     _ => "System",
                 };
-                conversation_history_block.push_str(&format!("[{}]: {}\n", role_label, msg.content));
+                conversation_history_block
+                    .push_str(&format!("[{}]: {}\n", role_label, msg.content));
             }
             conversation_history_block.push_str("\n[END OF CONVERSATION HISTORY]\n\n");
         }
@@ -285,7 +377,10 @@ impl ExecutableNode for RouterAgent {
         if let Some(mem_any) = _registry.get_memory_os() {
             if let Ok(mem_os) = mem_any.clone().downcast::<RedbGraphStore>() {
                 use telos_memory::integration::MemoryIntegration;
-                if let Ok(strategies) = mem_os.retrieve_procedural_memories(input.task.clone()).await {
+                if let Ok(strategies) = mem_os
+                    .retrieve_procedural_memories(input.task.clone())
+                    .await
+                {
                     if !strategies.is_empty() {
                         learned_strategies_context.push_str(&format!("[LEARNED STRATEGIES & WORKFLOW TEMPLATES]\nConsult these past successful strategies to guide your routing and direct reply decisions.\n{}\n\n", strategies.join("\n- ")));
                         // Auto-expose required tools from templates
@@ -295,8 +390,13 @@ impl ExecutableNode for RouterAgent {
                                     for t in tools_str.split(',') {
                                         let t = t.trim();
                                         if !t.is_empty() {
-                                            if !discovered_tools.iter().any(|existing| existing.name == t) {
-                                                if let Some(schema) = all_tools_schema.iter().find(|s| s.name == t) {
+                                            if !discovered_tools
+                                                .iter()
+                                                .any(|existing| existing.name == t)
+                                            {
+                                                if let Some(schema) =
+                                                    all_tools_schema.iter().find(|s| s.name == t)
+                                                {
                                                     discovered_tools.push(schema.clone());
                                                 }
                                             }
@@ -313,7 +413,16 @@ impl ExecutableNode for RouterAgent {
         // Build persona from SOUL.md (loaded at daemon startup)
         let soul_content = crate::agents::prompt_builder::get_soul();
         let persona_intro = format!("Your name is {}. Your personality traits: {}.\n\n[IDENTITY & VALUES]\n{}\n\nYou are the user's private AI assistant. Behind the scenes, you may delegate tasks to specialized internal modules, but the user should feel they are talking to ONE unified assistant.\n\n", self.persona_name, self.persona_trait, soul_content);
-        let system_prompt = format!("{}{}{}{}{}{}{}{}", env_context, user_profile_context, mem_context, learned_strategies_context, custom_tools_context, conversation_history_block, persona_intro, r#"Available Experts:
+        let system_prompt = format!(
+            "{}{}{}{}{}{}{}{}",
+            env_context,
+            user_profile_context,
+            mem_context,
+            learned_strategies_context,
+            custom_tools_context,
+            conversation_history_block,
+            persona_intro,
+            r#"Available Experts:
 - "software_expert": For tasks requiring writing, modifying, or executing programming code, or software architecture.
 - "research_expert": For tasks requiring deep, iterative information gathering via search engines (e.g., current events, fact-checking, real-time data).
 - "qa_expert": For tasks heavily focused on writing tests, finding edge cases, or breaking code.
@@ -331,7 +440,7 @@ STATUS=SUCCESS means the operation completed and took effect permanently.
 STATUS=FAILURE means the operation failed — error details follow.
 
 CRITICAL RULES:
-1. You MUST output a strictly valid JSON object.
+1. You MUST use the provided `submit_routing_decision` tool to submit your routing choice.
 2. DO NOT INCLUDE ANY CONVERSATIONAL TEXT. DO NOT BE "HELPFUL" BY REFUSING OR ASKING QUESTIONS. 
 3. "direct_reply" is for ANY task you can answer COMPLETELY and ACCURATELY using only your own knowledge and reasoning — no external tools needed. Use it when ALL of the following are true:
    a) The task does NOT need external data (no web search, no file access, no API calls)
@@ -343,9 +452,9 @@ CRITICAL RULES:
       - Code explanation, concept clarification, knowledge Q&A
       - General planning based on common knowledge
    d) If the task requires ANY external/real-time data or tool use, ALWAYS route to an expert.
-   Output EXACTLY ONE key: "direct_reply" containing your COMPLETE answer to the user's CURRENT request ONLY (with reasoning steps if applicable), in your Persona. NEVER re-answer previous conversation turns.
-4. Check the [CONVERSATION HISTORY] block provided above BEFORE querying memory. If the history already contains the answer (e.g., recent context), use "direct_reply" immediately. If you need older historical facts NOT in the history, you may query your vector memory database by outputting EXACTLY TWO keys: "tool": "memory_read" and "query": "<search text>".
-5. For all other actionable tasks, output EXACTLY THREE keys: "route" to pick the best expert, "reason" for the choice, and "enriched_task". The "enriched_task" MUST be a rewritten version of the user's prompt where you resolve any missing context (e.g. "search again") using the [CONVERSATION HISTORY]. If no rewrite is needed, simply output the user's original task.
+   Output your COMPLETELY ANSWERED reply in the "direct_reply" field. NEVER re-answer previous conversation turns.
+4. Check the [CONVERSATION HISTORY] block provided above BEFORE querying memory. If the history already contains the answer (e.g., recent context), use "direct_reply" immediately. If you need older historical facts NOT in the history, you may query your vector memory database by providing EXACTLY TWO values: "tool": "memory_read" and "query": "<search text>".
+5. For all other actionable tasks, submit EXACTLY THREE values: "route" to pick the best expert, "reason" for the choice, and "enriched_task". The "enriched_task" MUST be a rewritten version of the user's prompt where you resolve any missing context (e.g. "search again") using the [CONVERSATION HISTORY]. If no rewrite is needed, simply output the user's original task.
 6. CHOOSE "research_expert" FOR ANY QUERY REQUIRING REAL-TIME OR EXTERNAL DATA.
 7. IF THE REQUEST IS UNCLEAR OR BROAD (but not chitchat), PICK "general_expert". NEVER REFUSE.
 
@@ -355,6 +464,11 @@ ROUTING DISTINCTION FOR CODING TASKS:
 - "Modify an existing file in a project" → software_expert (needs file I/O tools)
 - "Build a complete multi-file application" → software_expert (needs file system)
 - "Debug a specific file or codebase" → software_expert (needs file access + shell)
+
+ROUTING DISTINCTION FOR PROJECT TASKS (BMAD Architecture):
+- "Create a new project", "规划一个项目", "新建项目", or any request to initialize a fully managed software/general project → route to "product" 
+- "Update project contract", "修改项目设定" → route to "bmad_architect"
+- The "product" agent is the entry point for the Meta-Driven AI Compiler. ALWAYS use it when the user explicitly mentions creating or managing a "project".
 
 CRITICAL — TOOL CREATION ROUTING:
 - When the user asks to \"制作工具/创建工具/make a tool/create a tool/build a tool\" or describes functionality they want as a PERSISTENT TOOL, you MUST route to \"general_expert\". Do NOT use \"direct_reply\" to just give code — the general_expert has a special `rhai_tool_studio` capability that can register real, reusable tools inside the system that persist across sessions.
@@ -449,7 +563,8 @@ User: "计算 25 的平方根加上 150 的 15%"
 User: "什么是快速排序算法？"
 {
   "direct_reply": "快速排序（Quicksort）是一种高效的分治排序算法..."
-}"#);
+}"#
+        );
 
         // Build context from dependencies
         let deps_context = if !input.dependencies.is_empty() {
@@ -481,9 +596,26 @@ User: "什么是快速排序算法？"
             },
             Message {
                 role: "user".to_string(),
-                content: format!("{}\n\nVERY IMPORTANT: Your final response MUST be a single valid JSON object. Do not output markdown code blocks (unless inside a string value), and do not output explanations outside the JSON.", full_task),
+                content: format!("{}\n\nVERY IMPORTANT: You MUST use the `submit_routing_decision` tool to respond.", full_task),
             },
         ];
+
+        let route_tool = telos_model_gateway::ToolDefinition {
+            name: "submit_routing_decision".to_string(),
+            description: "Submit your routing decision, direct reply, or tool invocation.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "direct_reply": { "type": "string", "description": "Used only if you can answer completely and accurately without using tools (e.g. math, chitchat)." },
+                    "route": { "type": "string", "enum": ["software_expert", "research_expert", "qa_expert", "general_expert", "product", "bmad_architect"] },
+                    "reason": { "type": "string", "description": "Why you chose this route." },
+                    "enriched_task": { "type": "string", "description": "The user's prompt rewritten to resolve missing context." },
+                    "tool": { "type": "string", "enum": ["memory_read", "memory_write"] },
+                    "query": { "type": "string", "description": "Search query if tool is memory_read." },
+                    "content": { "type": "string", "description": "Content to store if tool is memory_write." }
+                }
+            })
+        };
 
         let request = LlmRequest {
             session_id: format!("router_{}", input.node_id),
@@ -493,40 +625,40 @@ User: "什么是快速排序算法？"
                 strong_reasoning: true, // We need good reasoning for routing
             },
             budget_limit: 1000,
-            tools: None,
+            tools: Some(vec![route_tool]),
         };
 
         match self.gateway.generate(request.clone()).await {
             Ok(res) => {
                 let trace = telos_core::TraceLog::LlmCall {
-                    request: serde_json::to_value(&request).unwrap_or_else(|_| serde_json::json!({})),
+                    request: serde_json::to_value(&request)
+                        .unwrap_or_else(|_| serde_json::json!({})),
                     response: serde_json::to_value(&res).unwrap_or_else(|_| serde_json::json!({})),
                 };
                 let content = res.content.trim();
-                
-                // Try to find the first '{' and last '}' to extract a JSON block
-                let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
-                    if e > s {
-                        &content[s..=e]
-                    } else {
-                        content
-                    }
+                let raw_content = if let Some(tc) = res.tool_calls.first() {
+                    tc.arguments.clone()
                 } else {
-                    content
+                    res.content.clone()
                 };
 
-                let clean_reply = json_str
+                let clean_reply = raw_content
+                    .trim()
                     .trim_start_matches("```json")
                     .trim_start_matches("```")
                     .trim_end_matches("```")
                     .trim();
 
                 if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(clean_reply) {
-                    if json.get("route").is_some() || json.get("direct_reply").is_some() || json.get("tool").is_some() {
+                    if json.get("route").is_some()
+                        || json.get("direct_reply").is_some()
+                        || json.get("tool").is_some()
+                    {
                         // Pass along the auto-discovered tools to the returned JSON
                         // so the execution engine or downstream worker receives them explicitly!
                         if !discovered_tools.is_empty() {
-                            json["auto_discovered_tools"] = serde_json::to_value(&discovered_tools).unwrap_or(serde_json::json!([]));
+                            json["auto_discovered_tools"] = serde_json::to_value(&discovered_tools)
+                                .unwrap_or(serde_json::json!([]));
                         }
                         return AgentOutput::success(json).with_trace(trace);
                     }
@@ -550,7 +682,8 @@ User: "什么是快速排序算法？"
                         );
                         return AgentOutput::success(serde_json::json!({
                             "direct_reply": content
-                        })).with_trace(trace);
+                        }))
+                        .with_trace(trace);
                     }
 
                     // Non-substantive / error-like content: fall back to general_expert
@@ -566,7 +699,8 @@ User: "什么是快速排序算法？"
                         "Failed to parse router output as valid JSON: {}",
                         res.content
                     ),
-                ).with_trace(trace)
+                )
+                .with_trace(trace)
             }
             Err(e) => AgentOutput::failure(
                 "LLMError",

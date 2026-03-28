@@ -199,11 +199,24 @@ pub fn spawn_background_tasks(
                                      1. Keep the same general structure but adjust the failing parts\n\
                                      2. Add error handling or fallback nodes where failures occurred\n\
                                      3. If a node type consistently fails, replace it with an alternative approach\n\
-                                     4. Output ONLY the [Description] line and the [TemplateJSON] block\n\n\
-                                     Format:\n[Description] <new adapted description>\n[TemplateJSON]\n<adapted JSON>",
+                                     4. You MUST use the provided `submit_workflow_variant` tool to submit the result.\n\
+                                     DO NOT output anything else.",
                                     failure_count, original_template
                                 );
                                 
+                                let variant_tool = telos_model_gateway::ToolDefinition {
+                                    name: "submit_workflow_variant".to_string(),
+                                    description: "Submit the generated adapted workflow template".to_string(),
+                                    parameters: serde_json::json!({
+                                        "type": "object",
+                                        "properties": {
+                                            "description": { "type": "string", "description": "A short description of the variant" },
+                                            "template_json": { "type": "string", "description": "The adapted workflow template as a JSON string" }
+                                        },
+                                        "required": ["description", "template_json"]
+                                    })
+                                };
+
                                 let req = telos_model_gateway::LlmRequest {
                                     session_id: format!("diverge_{}", trace_id),
                                     messages: vec![
@@ -221,38 +234,44 @@ pub fn spawn_background_tasks(
                                         strong_reasoning: true,
                                     },
                                     budget_limit: 2000,
-                                    tools: None,
+                                    tools: Some(vec![variant_tool]),
                                 };
                                 
                                 match registry_worker.gateway.generate(req).await {
                                     Ok(res) => {
-                                        let content = res.content.trim()
+                                        let raw_content = if let Some(tc) = res.tool_calls.first() {
+                                            tc.arguments.clone()
+                                        } else {
+                                            res.content.clone()
+                                        };
+
+                                        let content = raw_content.trim()
                                             .trim_start_matches("```json").trim_start_matches("```")
                                             .trim_end_matches("```").trim();
                                         
-                                        // Parse out [Description] and [TemplateJSON]
-                                        let desc = content.lines()
-                                            .find(|l: &&str| l.starts_with("[Description] "))
-                                            .map(|l: &str| l.trim_start_matches("[Description] ").to_string())
-                                            .unwrap_or_else(|| format!("Variant of: {}", wf_id.chars().take(60).collect::<String>()));
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+                                            let desc = json.get("description")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string())
+                                                .unwrap_or_else(|| format!("Variant of: {}", wf_id.chars().take(60).collect::<String>()));
+                                            
+                                            let template_json = json.get("template_json")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string())
+                                                .unwrap_or_default();
                                         
-                                        let template_json = if let Some(pos) = content.find("[TemplateJSON]") {
-                                            content[pos + "[TemplateJSON]".len()..].trim().to_string()
-                                        } else {
-                                            content.to_string()
-                                        };
-                                        
-                                        if !template_json.is_empty() {
-                                            let variant_desc = format!("[Variant] {} (diverged from failures)", desc);
-                                            match registry_worker.memory_os.store_workflow_template(
-                                                variant_desc.clone(), template_json, Vec::new()
-                                            ).await {
-                                                Ok(()) => {
-                                                    info!("[Daemon] 🧬 Species divergence complete — new variant stored: {}", 
-                                                        variant_desc.chars().take(80).collect::<String>());
-                                                }
-                                                Err(e) => {
-                                                    warn!("[Daemon] ⚠️ Failed to store diverged variant: {}", e);
+                                            if !template_json.is_empty() {
+                                                let variant_desc = format!("[Variant] {} (diverged from failures)", desc);
+                                                match registry_worker.memory_os.store_workflow_template(
+                                                    variant_desc.clone(), template_json, Vec::new()
+                                                ).await {
+                                                    Ok(()) => {
+                                                        info!("[Daemon] 🧬 Species divergence complete — new variant stored: {}", 
+                                                            variant_desc.chars().take(80).collect::<String>());
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[Daemon] ⚠️ Failed to store diverged variant: {}", e);
+                                                    }
                                                 }
                                             }
                                         }

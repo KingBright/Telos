@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct RunRequest {
     pub payload: String,
     pub project_id: Option<String>,
+    pub session_id: Option<String>,
     pub trace_id: Option<String>,
 }
 

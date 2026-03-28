@@ -90,6 +90,15 @@ mkdir -p "$LOG_DIR"
 mkdir -p "$WORKSPACE_DIR"
 mkdir -p "$WEB_DIR"
 
+if [ "$1" = "--test" ]; then
+    export TELOS_ENV="test"
+    echo "⚠️  DEPLOYING IN TEST MODE (TELOS_ENV=test) ⚠️"
+    echo "The daemon will use test_memory.redb for isolation."
+else
+    export TELOS_ENV="prod"
+    echo "Deploying in standard PRODUCTION mode."
+fi
+
 echo "Deploying Telemetry Web Assets to $WEB_DIR..."
 if [ -d "$(pwd)/crates/telos_web/static" ]; then
     cp -r "$(pwd)/crates/telos_web/static/"* "$WEB_DIR/"
@@ -126,6 +135,8 @@ if [ "$OS" = "Darwin" ]; then
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin</string>
+        <key>TELOS_ENV</key>
+        <string>$TELOS_ENV</string>
     </dict>
 </dict>
 </plist>
@@ -141,6 +152,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=$WORKSPACE_DIR
+Environment="TELOS_ENV=$TELOS_ENV"
 ExecStart=$HOME/.cargo/bin/telos_daemon
 Restart=always
 

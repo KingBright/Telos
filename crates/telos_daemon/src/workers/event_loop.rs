@@ -155,8 +155,16 @@ pub async fn run_event_loop(
 
                     let context_manager_spawn = context_manager.clone();
                     let active_tasks_spawn = active_tasks_loop.clone();
+                    let wakeup_tx = execution_engine.get_wakeup_tx();
+                    let wakeup_map_bg = wakeup_map_bg.clone();
                     tokio::spawn(async move {
                         let task_start_time = Instant::now();
+                        
+                        {
+                            let mut lock = wakeup_map_bg.lock().await;
+                            lock.insert(trace_id.clone().to_string(), wakeup_tx);
+                        }
+
                         debug!(
                             "[Daemon] Received UserInput: {} (trace: {})",
                             payload, trace_id
@@ -1132,35 +1140,131 @@ pub async fn run_event_loop(
                                 graph.conversation_history = conversation_history_vec.clone();
                                 let mut terminal_nodes = vec![];
 
-                                // Instantiate the specific expert dynamically.
-                                let expert_node: Box<dyn ExecutableNode> = match expert_route {
-                                    "software_expert" => Box::new(agents::architect::ArchitectAgent::new(gateway_clone.clone())) as Box<dyn ExecutableNode>,
-                                    "research_expert" => Box::new(agents::researcher::DeepResearchAgent::new(gateway_clone.clone(), tool_registry.clone())) as Box<dyn ExecutableNode>,
-                                    "qa_expert" => Box::new(agents::tester::TestingAgent::new(gateway_clone.clone())) as Box<dyn ExecutableNode>,
-                                    _ => Box::new(agents::general::GeneralAgent::new(
-                                        gateway_clone.clone(),
-                                        tool_registry.clone(),
-                                        config.tools_dir.clone(),
-                                    )) as Box<dyn ExecutableNode>,
-                                };
+                                if expert_route == "product" {
+                                    // --- BMAD MULTI-STAGE PIPELINE ---
+                                    // Detect whether user wants to skip approval gates
+                                    // Check both original payload (before Router enrichment) and enriched
+                                    let skip_approval = {
+                                        let lower = payload.to_lowercase();
+                                        let lower_enriched = enriched_payload.to_lowercase();
+                                        let has_skip = |s: &str| {
+                                            s.contains("直接执行") || s.contains("不用确认") || s.contains("不需要确认")
+                                                || s.contains("跳过审批") || s.contains("just do it") || s.contains("skip approval")
+                                                || s.contains("直接开始") || s.contains("no approval")
+                                        };
+                                        has_skip(&lower) || has_skip(&lower_enriched)
+                                    };
+                                    let approval_schema = if skip_approval {
+                                        Some(r#"{"skip_approval":"true"}"#.to_string())
+                                    } else {
+                                        None
+                                    };
 
-                                graph.add_node_with_metadata(
-                                    "expert_execution".to_string(),
-                                    expert_node,
-                                    NodeMetadata {
-                                        task_type: expert_route.to_string(),
-                                        prompt_preview: truncate_for_preview(&enriched_payload, 100),
-                                        full_task: enriched_payload.clone(),
-                                        tool_name: None,
-                                        schema_payload: route_data.get("auto_discovered_tools").map(|v| v.to_string()),
-                                    },
-                                );
+                                    info!("[Daemon] 🏗️ Building BMAD pipeline (skip_approval={})", skip_approval);
+
+                                    // L1: ProductAgent
+                                    graph.add_node_with_metadata(
+                                        "product_agent".to_string(),
+                                        Box::new(agents::bmad::ProductAgent { gateway: gateway_clone.clone() }),
+                                        NodeMetadata {
+                                            task_type: "product".to_string(),
+                                            prompt_preview: truncate_for_preview(&enriched_payload, 100),
+                                            full_task: enriched_payload.clone(),
+                                            tool_name: None,
+                                            schema_payload: None,
+                                        },
+                                    );
+
+                                    // HITL Gate 1 (between Product and Architect)
+                                    graph.add_node_with_metadata(
+                                        "approval_l1".to_string(),
+                                        Box::new(agents::bmad::SmartApprovalNode),
+                                        NodeMetadata {
+                                            task_type: "smart_approval".to_string(),
+                                            prompt_preview: "Review L1 Product Features".to_string(),
+                                            full_task: "Review the generated product features before proceeding to architecture design.".to_string(),
+                                            tool_name: None,
+                                            schema_payload: approval_schema.clone(),
+                                        },
+                                    );
+                                    let _ = graph.add_edge("product_agent", "approval_l1");
+
+                                    // L2: BmadArchitectAgent
+                                    graph.add_node_with_metadata(
+                                        "bmad_architect".to_string(),
+                                        Box::new(agents::bmad::BmadArchitectAgent { gateway: gateway_clone.clone() }),
+                                        NodeMetadata {
+                                            task_type: "bmad_architect".to_string(),
+                                            prompt_preview: "Generate TechModules and Contracts from approved features".to_string(),
+                                            full_task: enriched_payload.clone(),
+                                            tool_name: None,
+                                            schema_payload: None,
+                                        },
+                                    );
+                                    let _ = graph.add_edge("approval_l1", "bmad_architect");
+
+                                    // HITL Gate 2 (between Architect and ScrumMaster)
+                                    graph.add_node_with_metadata(
+                                        "approval_l2".to_string(),
+                                        Box::new(agents::bmad::SmartApprovalNode),
+                                        NodeMetadata {
+                                            task_type: "smart_approval".to_string(),
+                                            prompt_preview: "Review L2 Architecture Blueprint".to_string(),
+                                            full_task: "Review the generated architecture modules and contracts before task decomposition.".to_string(),
+                                            tool_name: None,
+                                            schema_payload: approval_schema.clone(),
+                                        },
+                                    );
+                                    let _ = graph.add_edge("bmad_architect", "approval_l2");
+
+                                    // L3: ScrumMasterAgent (emits SubGraph with Workers)
+                                    graph.add_node_with_metadata(
+                                        "scrum_master".to_string(),
+                                        Box::new(agents::bmad::ScrumMasterAgent { gateway: gateway_clone.clone() }),
+                                        NodeMetadata {
+                                            task_type: "scrum_master".to_string(),
+                                            prompt_preview: "Decompose architecture into DevTasks".to_string(),
+                                            full_task: enriched_payload.clone(),
+                                            tool_name: None,
+                                            schema_payload: None,
+                                        },
+                                    );
+                                    let _ = graph.add_edge("approval_l2", "scrum_master");
+
+                                    terminal_nodes.push("scrum_master".to_string());
+                                } else {
+                                    // --- STANDARD SINGLE-NODE EXPERT ---
+                                    let expert_node: Box<dyn ExecutableNode> = match expert_route {
+                                        "bmad_architect" => Box::new(agents::bmad::BmadArchitectAgent { gateway: gateway_clone.clone() }) as Box<dyn ExecutableNode>,
+                                        "scrum_master" => Box::new(agents::bmad::ScrumMasterAgent { gateway: gateway_clone.clone() }) as Box<dyn ExecutableNode>,
+                                        "software_expert" => Box::new(agents::architect::ArchitectAgent::new(gateway_clone.clone())) as Box<dyn ExecutableNode>,
+                                        "research_expert" => Box::new(agents::researcher::DeepResearchAgent::new(gateway_clone.clone(), tool_registry.clone())) as Box<dyn ExecutableNode>,
+                                        "qa_expert" => Box::new(agents::tester::TestingAgent::new(gateway_clone.clone())) as Box<dyn ExecutableNode>,
+                                        _ => Box::new(agents::general::GeneralAgent::new(
+                                            gateway_clone.clone(),
+                                            tool_registry.clone(),
+                                            config.tools_dir.clone(),
+                                        )) as Box<dyn ExecutableNode>,
+                                    };
+
+                                    graph.add_node_with_metadata(
+                                        "expert_execution".to_string(),
+                                        expert_node,
+                                        NodeMetadata {
+                                            task_type: expert_route.to_string(),
+                                            prompt_preview: truncate_for_preview(&enriched_payload, 100),
+                                            full_task: enriched_payload.clone(),
+                                            tool_name: None,
+                                            schema_payload: route_data.get("auto_discovered_tools").map(|v| v.to_string()),
+                                        },
+                                    );
+                                    terminal_nodes.push("expert_execution".to_string());
+                                }
+
                                 graph.current_state = GraphState {
                                     is_running: true,
                                     completed: false,
                                 };
-                                terminal_nodes.push("expert_execution".to_string());
-
 
                                 // Build context using the context manager with memory integration
                                 let session_history: Vec<telos_context::LogEntry> = {
@@ -1200,8 +1304,10 @@ pub async fn run_event_loop(
                                     actual_ctx.precise_facts.len()
                                 );
 
+                                // Use longer timeout for multi-stage BMAD pipeline (includes approval waits and many worker nodes)
+                                let timeout_secs = if expert_route == "product" { 3600 } else { 180 };
                                 let graph_result = tokio::time::timeout(
-                                    std::time::Duration::from_secs(180),
+                                    std::time::Duration::from_secs(timeout_secs),
                                     execution_engine.run_graph(
                                         &mut graph,
                                         &actual_ctx,
@@ -1211,11 +1317,11 @@ pub async fn run_event_loop(
                                 ).await;
 
                                 if graph_result.is_err() {
-                                    tracing::warn!("[Daemon] DAG execution timed out after 180s (single attempt {}/{})", attempt, MAX_ATTEMPTS);
+                                    tracing::warn!("[Daemon] DAG execution timed out after {}s (single attempt {}/{})", timeout_secs, attempt, MAX_ATTEMPTS);
                                     broker_bg.publish_feedback(AgentFeedback::Output {
                                         task_id: trace_id.to_string(),
                                         session_id: session_id.clone(),
-                                        content: format!("⚠️ Execution attempt {}/{} timed out after 180s", attempt, MAX_ATTEMPTS),
+                                        content: format!("⚠️ Execution attempt {}/{} timed out after {}s", attempt, MAX_ATTEMPTS, timeout_secs),
                                         is_final: false,
                                         silent: false,
                                     });
@@ -1280,7 +1386,83 @@ pub async fn run_event_loop(
                                     final_results.join("\n")
                                 };
 
-                                let task_success = failed_nodes == 0;
+                                let mut task_success = failed_nodes == 0;
+
+                                // --- L2 HOTFIX SUBGRAPH (TECH LEAD) ---
+                                // If the only failure or the primary failure was the IntegrationTester, 
+                                // we intercept it and spawn a localized 3-iteration TechLead rescue loop
+                                // to patch the code without destroying the architecture via Macro Rollback.
+                                if !task_success && failed_node_ids.iter().any(|id| id.contains("integration_tester")) {
+                                    tracing::warn!("[Daemon] 🛠️ IntegrationTester failed. Summoning L1.5 TechLead for Workspace Hotfix...");
+                                    
+                                    let mut stderr = String::new();
+                                    if let Some(res) = graph.node_results.get("integration_tester") {
+                                        if let Some(err) = &res.error {
+                                            stderr = err.message.clone();
+                                        }
+                                    }
+                                    
+                                    let mut project_name = String::new();
+                                    if let Some(res) = graph.node_results.get("product_agent") {
+                                        if let Some(out) = &res.output {
+                                            if let Some(name) = out.get("project_name").and_then(|v| v.as_str()) {
+                                                project_name = name.to_string();
+                                            }
+                                        }
+                                    }
+                                    
+                                    if !project_name.is_empty() {
+                                        let base_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+                                            .join(".telos/projects")
+                                            .join(&project_name);
+                                            
+                                        let tech_lead = agents::bmad::tech_lead::TechLeadAgent { gateway: gateway_clone.clone() };
+                                        let mut tech_lead_success = false;
+                                        
+                                        for tl_iter in 1..=3 {
+                                            tracing::info!("[Daemon] 🛠️ TechLead Hotfix Iteration {}/3...", tl_iter);
+                                            let git_diff = std::process::Command::new("git").arg("diff").arg("HEAD").current_dir(&base_dir).output()
+                                                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                                                .unwrap_or_default();
+                                                
+                                            match tech_lead.review_and_patch_workspace(&base_dir, &stderr, &git_diff).await {
+                                                Ok(patched_files) => {
+                                                    tracing::info!("[Daemon] 🛠️ TechLead patched {} file(s). Running cargo check...", patched_files.len());
+                                                    let check = std::process::Command::new("cargo").arg("check").current_dir(&base_dir).output().unwrap();
+                                                    
+                                                    if check.status.success() {
+                                                        tracing::info!("[Daemon] 🛠️✅ TechLead Hotfix SUCCESS! The codebase compiles!");
+                                                        tech_lead_success = true;
+                                                        break;
+                                                    } else {
+                                                        stderr = String::from_utf8_lossy(&check.stderr).to_string();
+                                                        tracing::warn!("[Daemon] 🛠️❌ TechLead patch failed compiler check. Retrying...");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("[Daemon] 🛠️❌ TechLead encountered gateway error: {}", e);
+                                                }
+                                            }
+                                        }
+                                        
+                                        if tech_lead_success {
+                                            // Rescue the DAG!
+                                            task_success = true;
+                                            if failed_nodes > 0 {
+                                                failed_nodes -= 1;
+                                            }
+                                            failed_node_ids.retain(|id| !id.contains("integration_tester"));
+                                            
+                                            let _ = std::process::Command::new("git").arg("add").arg(".").current_dir(&base_dir).output();
+                                            let _ = std::process::Command::new("git").args(["commit", "-m", "fix: TechLead L1.5 surgical patch"])
+                                                .current_dir(&base_dir).output();
+                                                
+                                            tracing::info!("[Daemon] 🛠️✅ Successfully rescued DAG from IntegrationFailure!");
+                                        } else {
+                                            tracing::error!("[Daemon] 🛠️❌ TechLead failed to rescue the workspace after 3 iterations. Falling back to Macro Rollback.");
+                                        }
+                                    }
+                                }
 
                                 // Build summary message
                                 let summary = if task_success {
@@ -1404,10 +1586,37 @@ pub async fn run_event_loop(
                                             break;
                                         } else {
                                             debug!("[Daemon] Router rejected the output. Critique: {}", critique);
+                                            
+                                            // --- HFE LEVEL 2 ROLLBACK (Surgical Reversion) ---
+                                            // If the route was product-driven construction, a failed attempt means
+                                            // the workspace is now polluted with syntax errors or structural dead-ends.
+                                            // We surgically rollback to the last successful IntegrationTester snapshot (Green Build).
+                                            if expert_route == "product" {
+                                                let mut project_name = String::new();
+                                                if let Some(res) = graph.node_results.get("product_agent") {
+                                                    if let Some(out) = &res.output {
+                                                        if let Some(name) = out.get("project_name").and_then(|v| v.as_str()) {
+                                                            project_name = name.to_string();
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                if !project_name.is_empty() {
+                                                    let base_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+                                                        .join(".telos/projects")
+                                                        .join(&project_name);
+                                                    if base_dir.exists() {
+                                                        let _ = std::process::Command::new("git").arg("reset").arg("--hard").arg("HEAD").current_dir(&base_dir).output();
+                                                        let _ = std::process::Command::new("git").arg("clean").arg("-fd").current_dir(&base_dir).output();
+                                                        tracing::warn!("[Daemon] ⚠️ HFE L2 Rollback: Surgically rolled back project {} to last Green Build before attempt {}", project_name, attempt + 1);
+                                                    }
+                                                }
+                                            }
+
                                             broker_bg.publish_feedback(AgentFeedback::Output {
                                                 task_id: trace_id.to_string(),
                                                 session_id: session_id.clone(),
-                                                content: format!("🔄 Router QA rejected output.\nCritique: {}", critique),
+                                                content: format!("🔄 QA Validation Failed. Executing Hierarchical Replanning.\nCritique: {}", critique),
                                                 is_final: false,
                                                 silent: false,
                                             });
@@ -1417,10 +1626,11 @@ pub async fn run_event_loop(
                                                 "Task:\n{}\n\n[PERSONA CONTEXT]\n{}\n\n\
                                                  [PREVIOUS ATTEMPT DATA — DO NOT RE-SEARCH]\n\
                                                  The following data was already gathered. Reuse valid data; only search for MISSING pieces.\n{}\n\n\
-                                                 [QA CRITIQUE]\n{}\n\n\
+                                                 [QA CRITIQUE / COMPILER ERRORS]\n{}\n\n\
                                                  [SYSTEM DIRECTIVE]\n\
-                                                 Refine your approach based on the critique. Reuse valid data from above.\n\
-                                                 Only re-search if the data was genuinely wrong or missing.\n\
+                                                 1. The workspace has been surgically rolled back to the last Green Build.\n\
+                                                 2. The previous Structural DevTasks resulted in a massive dead-end (see Compiler Errors).\n\
+                                                 3. RE-PLAN the architectural implementation carefully to avoid repeating the flaw.\n\
                                                  Execute IMMEDIATELY without asking for permission.",
                                                 payload, agents::prompt_builder::get_soul(),
                                                 prev_results_truncated, critique
@@ -1575,6 +1785,52 @@ pub async fn run_event_loop(
                                 }
                             }
 
+                            // --- PROJECT MILESTONE SQUASH & MERGE (Version Rhythm) ---
+                            if loop_qa_accepted && expert_route == "product" {
+                                let mut project_name = String::new();
+                                if let Some(step) = loop_final_trace_steps.iter().find(|s| s.node_id == "product_agent") {
+                                    if let Some(ref out_str) = step.output_data {
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(out_str) {
+                                            if let Some(name) = json.get("project_name").and_then(|v| v.as_str()) {
+                                                project_name = name.to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                if !project_name.is_empty() {
+                                    let base_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+                                        .join(".telos/projects")
+                                        .join(&project_name);
+                                    
+                                    tokio::spawn(async move {
+                                        // Parse the .telos_project.toml version
+                                        let toml_path = base_dir.join(".telos_project.toml");
+                                        let mut version = "0.1.0".to_string();
+                                        if let Ok(content) = std::fs::read_to_string(&toml_path) {
+                                            for line in content.lines() {
+                                                if line.starts_with("version =") {
+                                                    version = line.split('=').nth(1).unwrap_or("\"0.1.0\"").trim().trim_matches('"').to_string();
+                                                }
+                                            }
+                                            // Update overall state machine
+                                            let new_content = content.replace("status = \"designing\"", "status = \"done\"")
+                                                                     .replace("status = \"planning\"", "status = \"done\"");
+                                            let _ = std::fs::write(&toml_path, new_content);
+                                        }
+                                        
+                                        // Finalize the Version Release on Main branch
+                                        let branch_name = format!("ai/wip-v{}", version);
+                                        let _ = std::process::Command::new("git").arg("checkout").arg("main").current_dir(&base_dir).output();
+                                        let _ = std::process::Command::new("git").args(["merge", "--squash", &branch_name]).current_dir(&base_dir).output();
+                                        let commit_msg = format!("feat(release): Version {} Complete Milestone", version);
+                                        let _ = std::process::Command::new("git").args(["commit", "-m", &commit_msg]).current_dir(&base_dir).output();
+                                        
+                                        tracing::info!("[Daemon] 🚀 Version Rhythm: Successfully squashed and merged {} into main for project {}!", branch_name, project_name);
+                                    });
+                                }
+                            }
+
                             let trace = telos_evolution::ExecutionTrace {
                                 task_id: trace_id.to_string(),
                                 steps: loop_final_trace_steps,
@@ -1593,6 +1849,10 @@ pub async fn run_event_loop(
                             {
                                 let mut w = active_tasks_spawn.write().await;
                                 w.remove(&trace_id.clone().to_string());
+                            }
+                            {
+                                let mut lock = wakeup_map_bg.lock().await;
+                                lock.remove(&trace_id.clone().to_string());
                             }
                             }
                         });
@@ -1613,11 +1873,18 @@ pub async fn run_event_loop(
                             let _ = tx.send((task_id.clone(), node, instruction));
                         }
                     } else {
-                        // Default to first waiting node if we can't be sure, but usually targeted.
-                        debug!(
-                            "[Daemon] Warning: Targeted intervention missing node_id for task {}",
-                            task_id
-                        );
+                        // No specific node_id provided — broadcast "approve" as a generic
+                        // wakeup targeting the first waiting approval node.
+                        // The wakeup_rx handler in the DAG engine will only act on nodes
+                        // that are currently in WaitingForInput status.
+                        let lock = wakeup_map_bg.lock().await;
+                        if let Some(tx) = lock.get(&task_id) {
+                            // Try common approval node names
+                            for candidate in &["approval_l1", "approval_l2", "human_review_l1", "human_review_l2"] {
+                                let _ = tx.send((task_id.clone(), candidate.to_string(), instruction.clone()));
+                            }
+                            debug!("[Daemon] Broadcast wakeup to all candidate approval nodes for task {}", task_id);
+                        }
                     }
                 }
                 AgentEvent::UserApproval {

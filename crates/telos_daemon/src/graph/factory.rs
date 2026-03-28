@@ -45,6 +45,23 @@ impl telos_dag::engine::NodeFactory for DaemonNodeFactory {
                 self.gateway.clone(),
                 self.tool_registry.clone(),
             )) as Box<dyn ExecutableNode>),
+            "product" => Some(Box::new(crate::agents::bmad::product::ProductAgent {
+                gateway: self.gateway.clone(),
+            }) as Box<dyn ExecutableNode>),
+            "bmad_architect" => Some(Box::new(crate::agents::bmad::architect::BmadArchitectAgent {
+                gateway: self.gateway.clone(),
+            }) as Box<dyn ExecutableNode>),
+            "scrum_master" => Some(Box::new(crate::agents::bmad::scrum_master::ScrumMasterAgent {
+                gateway: self.gateway.clone(),
+            }) as Box<dyn ExecutableNode>),
+            "worker" => Some(Box::new(crate::agents::bmad::worker::WorkerAgent {
+                gateway: self.gateway.clone(),
+            }) as Box<dyn ExecutableNode>),
+            "human_approval" | "smart_approval" => Some(Box::new(crate::agents::bmad::approval::SmartApprovalNode) as Box<dyn ExecutableNode>),
+            "harness_validator" => Some(Box::new(crate::agents::bmad::harness::HarnessValidatorNode {
+                gateway: self.gateway.clone(),
+            }) as Box<dyn ExecutableNode>),
+            "integration_tester" => Some(Box::new(crate::agents::bmad::integration::IntegrationTesterNode) as Box<dyn ExecutableNode>),
             _ => None,
         }
     }

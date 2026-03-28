@@ -71,7 +71,7 @@ impl RedbGraphStore {
         // Initialize Embedding Model
         let model = std::panic::catch_unwind(|| {
             fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
-                fastembed::EmbeddingModel::AllMiniLML6V2,
+                fastembed::EmbeddingModel::MultilingualE5Small,
             ).with_cache_dir(
                 dirs::home_dir().map(|h| h.join(".telos").join("models")).unwrap_or_else(|| std::path::PathBuf::from(".fastembed_cache"))
             ))
@@ -230,9 +230,9 @@ impl MemoryOS for RedbGraphStore {
                         tracing::info!(
                             "[MemoryOS] 🔗 Version chain: v{} '{}' updates v{} '{}'",
                             entry.version,
-                            &entry.content[..entry.content.len().min(30)],
+                            entry.content.chars().take(30).collect::<String>(),
                             conflict.existing.version,
-                            &conflict.existing.content[..conflict.existing.content.len().min(30)],
+                            conflict.existing.content.chars().take(30).collect::<String>(),
                         );
                     } else if old_conf >= 0.4 && new_conf >= 0.4 {
                         // Both facts are valid → complementary/extending relationship
@@ -248,8 +248,8 @@ impl MemoryOS for RedbGraphStore {
 
                         tracing::info!(
                             "[MemoryOS] 🔗 Extends: '{}' enriches '{}'",
-                            &entry.content[..entry.content.len().min(30)],
-                            &conflict.existing.content[..conflict.existing.content.len().min(30)],
+                            entry.content.chars().take(30).collect::<String>(),
+                            conflict.existing.content.chars().take(30).collect::<String>(),
                         );
                     }
 
@@ -266,8 +266,8 @@ impl MemoryOS for RedbGraphStore {
 
                     tracing::info!(
                         "[MemoryOS] ⚡ Conflict detected: '{}' vs '{}' (sim={:.2}). New={:.1}, Old={:.1}",
-                        &entry.content[..entry.content.len().min(40)],
-                        &conflict.existing.content[..conflict.existing.content.len().min(40)],
+                        entry.content.chars().take(40).collect::<String>(),
+                        conflict.existing.content.chars().take(40).collect::<String>(),
                         conflict.similarity,
                         new_conf,
                         old_conf,
@@ -313,6 +313,31 @@ impl MemoryOS for RedbGraphStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        // === SMART FAST-PATH FOR RELATED-TO (OUTGOING) ===
+        use crate::types::EdgeDirection;
+        if let MemoryQuery::RelatedTo { target_id, relation, direction } = &effective_query {
+            if *direction == EdgeDirection::Outgoing {
+                let mut fast_results = Vec::new();
+                if let Some(value) = table.get(target_id.as_str()).map_err(|e| e.to_string())? {
+                    let target_entry: MemoryEntry = serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+                    for (rel_id, rel_type) in target_entry.memory_relations {
+                        if relation.as_ref().map_or(true, |r| r == &rel_type) {
+                            if let Some(rel_value) = table.get(rel_id.as_str()).map_err(|e| e.to_string())? {
+                                let mut rel_entry: MemoryEntry = serde_json::from_str(rel_value.value()).map_err(|e| e.to_string())?;
+                                if rel_entry.is_retrievable() {
+                                    fast_results.push(rel_entry);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !fast_results.is_empty() {
+                    self.touch_entries(&fast_results).await;
+                }
+                return Ok(fast_results);
+            }
+        }
 
         let mut results = Vec::new();
 
@@ -363,6 +388,21 @@ impl MemoryOS for RedbGraphStore {
                          }
                     } else {
                         false
+                    }
+                },
+                MemoryQuery::RelatedTo { target_id, relation, direction } => {
+                    use crate::types::EdgeDirection;
+                    match direction {
+                        EdgeDirection::Outgoing => false, // Handled strictly by fast-path earlier
+                        EdgeDirection::Incoming | EdgeDirection::Both => {
+                            // Because fast-path returns early for Outgoing, 
+                            // Both will currently only scan for Incoming. We can refine Both later if needed.
+                            if let Some(rel) = entry.memory_relations.get(target_id) {
+                                relation.as_ref().map_or(true, |r| r == rel)
+                            } else {
+                                false
+                            }
+                        }
                     }
                 },
                 _ => false, // SemanticSearch and VectorSearchWithHistory already converted

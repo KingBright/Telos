@@ -9,6 +9,7 @@ pub mod reviewer;
 pub mod router;
 pub mod search_worker;
 pub mod tester;
+pub mod bmad;
 
 // Re-export common dependencies that agents might need
 pub use async_trait::async_trait;

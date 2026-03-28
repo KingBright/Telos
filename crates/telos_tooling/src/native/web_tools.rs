@@ -115,112 +115,72 @@ impl WebSearchTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read response: {:?}", e)))
     }
 
-    /// 使用 DuckDuckGo 搜索 — CSS selector + fallback
+    /// 使用 DuckDuckGo Lite 搜索 — 纯 POST 防封锁模式
     async fn search_duckduckgo(query: &str, client: &reqwest::Client) -> Result<Vec<SearchResult>, ToolError> {
-        let encoded_query = urlencoding::encode(query);
+        let search_url = "https://lite.duckduckgo.com/lite/";
+        let body_content = format!("q={}", urlencoding::encode(query));
 
-        // Try HTML endpoint first, then lite endpoint
-        let urls = [
-            format!("https://html.duckduckgo.com/html/?q={}", encoded_query),
-            format!("https://lite.duckduckgo.com/lite/?q={}", encoded_query),
-        ];
+        let html = client.post(search_url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8")
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body_content)
+            .send()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("DuckDuckGo request failed: {:?}", e)))?
+            .text()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("DuckDuckGo failed to read body: {:?}", e)))?;
 
-        for search_url in &urls {
-            let html = match Self::fetch_html(client, search_url, "en-US,en;q=0.9,zh-CN;q=0.8").await {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-
-            // Check for bot detection
-            if html.contains("bots use DuckDuckGo") || html.contains("blocked") {
-                warn!("[WebSearch] DuckDuckGo bot detection triggered on {}", search_url);
-                continue;
-            }
-
-            let document = scraper::Html::parse_document(&html);
-
-            // Strategy 1: CSS selectors
-            let result_selectors = [".result", "div.result", "div[class*=\"result\"]", "tr"];
-            let mut results = Vec::new();
-
-            for sel_str in &result_selectors {
-                if let Ok(result_sel) = scraper::Selector::parse(sel_str) {
-                    let title_sel = scraper::Selector::parse(".result__a, h2 a, a.result-snippet, a[class*=\"title\"]").unwrap();
-                    let snippet_sel = scraper::Selector::parse(".result__snippet, .result-snippet, td.result-snippet, div[class*=\"snippet\"]").unwrap();
-                    let url_sel = scraper::Selector::parse(".result__url").unwrap();
-
-                    for result in document.select(&result_sel).take(10) {
-                        let title = result.select(&title_sel).next()
-                            .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
-                            .unwrap_or_default();
-                        let url = result.select(&title_sel).next()
-                            .and_then(|e| e.value().attr("href"))
-                            .map(|href| {
-                                if let Some(pos) = href.find("uddg=") {
-                                    urlencoding::decode(&href[pos + 5..]).unwrap_or_default().to_string()
-                                } else if href.starts_with("http") {
-                                    href.to_string()
-                                } else {
-                                    result.select(&url_sel).next()
-                                        .map(|e| {
-                                            let u = e.text().collect::<String>().trim().to_string();
-                                            if !u.starts_with("http") { format!("https://{}", u) } else { u }
-                                        })
-                                        .unwrap_or_default()
-                                }
-                            })
-                            .unwrap_or_default();
-                        let mut snippet = result.select(&snippet_sel).next()
-                            .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
-                            .unwrap_or_default();
-                            
-                        if snippet.is_empty() {
-                            let full_text = SearchResult::clean_text(&result.text().collect::<String>());
-                            if full_text.len() > title.len() {
-                                let mut stripped = full_text.replace(&title, "");
-                                // DDG adds URLs to text sometimes
-                                if let Some(url_idx) = stripped.find("http") {
-                                    stripped = stripped[..url_idx].to_string();
-                                }
-                                snippet = stripped.trim().to_string();
-                            }
-                        }
-
-                        if !title.is_empty() && (!snippet.is_empty() || !url.is_empty()) {
-                            results.push(SearchResult { title, url, snippet });
-                        }
-                    }
-                    if !results.is_empty() {
-                        return Ok(results);
-                    }
-                }
-            }
-
-            // Strategy 2: Fallback — old line-based string matching (for HTML structure changes)
-            debug!("[WebSearch] DDG CSS selectors found nothing, trying string fallback. HTML len={}", html.len());
-            let mut fallback_results = Vec::new();
-            for line in html.split('\n') {
-                if line.contains("result__snippet") || line.contains("result-snippet") || line.contains("class=\"snippet\"") || line.contains("class=\"result-link\"") || line.contains("class=\"link-text\"") {
-                    let text = line.replace("<b>", "").replace("</b>", "").replace("<a", "").replace("</a>", "");
-                    let clean: String = text
-                        .split('>')
-                        .map(|s| s.split('<').next().unwrap_or(""))
-                        .collect::<Vec<&str>>()
-                        .join("")
-                        .trim().to_string();
-                    if !clean.is_empty() && clean.len() > 10 {
-                        fallback_results.push(SearchResult { title: String::new(), url: String::new(), snippet: clean });
-                    }
-                }
-            }
-            if !fallback_results.is_empty() {
-                info!("[WebSearch] DDG fallback parser found {} results", fallback_results.len());
-                return Ok(fallback_results);
-            }
-
-            debug!("[WebSearch] DDG no results from '{}'. HTML preview: {}", search_url, &html.chars().take(300).collect::<String>());
+        if html.contains("bots use DuckDuckGo") || html.contains("blocked") {
+            warn!("[WebSearch] DuckDuckGo bot detection triggered.");
+            return Ok(vec![]);
         }
-        Ok(vec![])
+
+        let document = scraper::Html::parse_document(&html);
+        let mut results = Vec::new();
+        
+        let result_tr_sel = scraper::Selector::parse("tr").unwrap();
+        let link_sel = scraper::Selector::parse("a.result-link, a.result-url").unwrap();
+        let snippet_sel = scraper::Selector::parse("td.result-snippet").unwrap();
+
+        let mut current_title = String::new();
+        let mut current_url = String::new();
+
+        for tr in document.select(&result_tr_sel) {
+            if let Some(link) = tr.select(&link_sel).next() {
+                current_title = SearchResult::clean_text(&link.text().collect::<String>());
+                let href = link.value().attr("href").unwrap_or("").to_string();
+                
+                // DDG Lite URLs 经常包含 uddg= 参数代理，将其解开拿到直链
+                current_url = if let Some(pos) = href.find("uddg=") {
+                    urlencoding::decode(&href[pos + 5..]).unwrap_or_default().split('&').next().unwrap_or_default().to_string()
+                } else {
+                    href
+                };
+            } else if let Some(snippet_td) = tr.select(&snippet_sel).next() {
+                let snippet = SearchResult::clean_text(&snippet_td.text().collect::<String>());
+                
+                if !current_title.is_empty() && (!snippet.is_empty() || !current_url.is_empty()) {
+                    results.push(SearchResult { 
+                        title: current_title.clone(), 
+                        url: current_url.clone(), 
+                        snippet 
+                    });
+                    current_title.clear();
+                    current_url.clear();
+                }
+            }
+        }
+
+        if !results.is_empty() {
+            info!("[WebSearch] DDG Lite POST parser found {} results", results.len());
+        } else {
+            debug!("[WebSearch] DDG Lite no results. HTML len={}", html.len());
+        }
+
+        Ok(results)
     }
 
     /// 使用 Bing 搜索 — CSS selector + fallback
@@ -424,46 +384,7 @@ impl WebSearchTool {
         Ok(results)
     }
 
-    /// 使用 Google 搜索（需要代理，反爬严格，作为备选）
-    async fn search_google(query: &str, client: &reqwest::Client) -> Result<Vec<SearchResult>, ToolError> {
-        let encoded_query = urlencoding::encode(query);
-        let search_url = format!("https://www.google.com/search?q={}&hl=zh-CN", encoded_query);
-        let html = Self::fetch_html(client, &search_url, "zh-CN,zh;q=0.9,en;q=0.8").await?;
 
-        let document = scraper::Html::parse_document(&html);
-        // Google's structure: div.g contains h3 (title link) and div.VwiC3b (snippet)
-        let result_sel = scraper::Selector::parse("div.g").unwrap();
-        let title_sel = scraper::Selector::parse("h3").unwrap();
-        let link_sel = scraper::Selector::parse("a[href]").unwrap();
-        let snippet_sel = scraper::Selector::parse("div.VwiC3b, span.st").unwrap();
-
-        let mut results = Vec::new();
-        for result in document.select(&result_sel).take(10) {
-            let title = result.select(&title_sel).next()
-                .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
-                .unwrap_or_default();
-            let url = result.select(&link_sel).next()
-                .and_then(|e| e.value().attr("href"))
-                .map(|h| {
-                    // Google sometimes wraps URLs like /url?q=<actual>&sa=...
-                    if h.starts_with("/url?q=") {
-                        h[7..].split('&').next().unwrap_or(h)
-                            .to_string()
-                    } else {
-                        h.to_string()
-                    }
-                })
-                .unwrap_or_default();
-            let snippet = result.select(&snippet_sel).next()
-                .map(|e| SearchResult::clean_text(&e.text().collect::<String>()))
-                .unwrap_or_default();
-
-            if !title.is_empty() && url.starts_with("http") {
-                results.push(SearchResult { title, url, snippet });
-            }
-        }
-        Ok(results)
-    }
 
     /// 使用 Serper API 搜索 (serper.dev) — 直接返回结构化 JSON
     async fn search_serper(query: &str) -> Result<Vec<SearchResult>, ToolError> {
@@ -594,19 +515,22 @@ impl ToolExecutor for WebSearchTool {
                 tokio::time::sleep(sleep_time).await;
             }
 
-            // 1. Baidu News — for real-time events, weather, news (Best for Chinese events)
-            try_engine!("Baidu News", search_baidu_news, &direct_client);
-            
-            // 2. Baidu (Web) — fallback for general knowledge
-            try_engine!("Baidu", search_baidu, &direct_client);
-
-            // 3. Bing CN — fast, but sometimes returns off-topic SEO results
-            try_engine!("Bing CN", search_bing, &direct_client);
-            
-            // 4. DuckDuckGo — ONLY through proxy (blocked in China without proxy)
+            // 首先尝试 DuckDuckGo Lite POST (因为最稳定, 但需要走代理池或者直连如果环境允许)
             if let Some(ref pc) = proxy_client {
                 try_engine!("DuckDuckGo", search_duckduckgo, pc);
+            } else {
+                // 如果没有配置代理，也直接用 direct_client 试一把 DDG
+                try_engine!("DuckDuckGo", search_duckduckgo, &direct_client);
             }
+
+            // 备用兜底：Baidu News — 仍保留，用以抓取最新百度国内新闻结构
+            try_engine!("Baidu News", search_baidu_news, &direct_client);
+            
+            // 备用兜底：Baidu (Web) — 作为最后方案
+            try_engine!("Baidu", search_baidu, &direct_client);
+
+            // 备用兜底：Bing CN
+            try_engine!("Bing CN", search_bing, &direct_client);
         }
 
         if last_error_msg.is_empty() {

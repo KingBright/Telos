@@ -209,8 +209,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = crate::api::routes::build_router(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8321").await?;
-    info!("Telos Daemon listening on ws://0.0.0.0:8321/api/v1/stream");
+    let default_port = "8321".to_string();
+    let port = std::env::var("TELOS_PORT").unwrap_or(default_port);
+    let bind_addr = format!("0.0.0.0:{}", port);
+    debug!("Binding API server to {}", bind_addr);
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    info!("Telos Daemon listening on ws://{}/api/v1/stream", bind_addr);
+    info!("Telos Daemon API accessible at http://{}/api/v1/run", bind_addr);
 
     let axum_server = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;

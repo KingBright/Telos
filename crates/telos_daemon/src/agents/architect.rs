@@ -121,15 +121,7 @@ Rules for planning:
 5. Provide `schema_payload`, which must be a string containing a valid JSON object with the strict parameters required by that specific worker type. (e.g. "{\"instructions\": \"...\"}")
 6. Define `edges` where `from` node must complete before `to` node starts. Use `dep_type` as "Data" or "Control".
 
-Output exactly a JSON object matching this schema:
-{
-  "nodes": [ { "id": "...", "agent_type": "...", "task": "...", "schema_payload": "..." } ],
-  "edges": [ { "from": "...", "to": "...", "dep_type": "Data" } ],
-  "adopted_templates": ["description of adopted template 1", ...]
-}
-NOTE: "adopted_templates" is an array of template descriptions you actually adopted. If no templates were relevant, use an empty array [].
-CRITICAL FORMAT REQUIREMENT: 
-Your total response MUST be a single valid JSON object exactly matching the schema. DO NOT output any markdown (no ```json ... ```), NO conversational text, NO apologies, NO thinking process. ONLY JSON."#);
+You MUST use the provided `submit_subgraph_plan` tool to submit your final plan. DO NOT output any markdown, conversational text, apologies, or thinking process. Only use the tool."#);
 
         let mut messages = vec![
             Message { role: "system".to_string(), content: system_prompt },
@@ -145,6 +137,47 @@ Your total response MUST be a single valid JSON object exactly matching the sche
             content: format!("User Task:\n{}{}\n\nPlease generate the SubGraph plan.", input.task, deps_context),
         });
 
+        let subgraph_tool = telos_model_gateway::ToolDefinition {
+            name: "submit_subgraph_plan".to_string(),
+            description: "Submit the generated SubGraph plan".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "agent_type": { "type": "string" },
+                                "task": { "type": "string" },
+                                "schema_payload": { "type": "string" }
+                            },
+                            "required": ["id", "agent_type", "task", "schema_payload"]
+                        }
+                    },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": { "type": "string" },
+                                "to": { "type": "string" },
+                                "dep_type": { "type": "string" }
+                            },
+                            "required": ["from", "to", "dep_type"]
+                        }
+                    },
+                    "adopted_templates": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Descriptions of adopted templates. Empty if none."
+                    }
+                },
+                "required": ["nodes", "edges"]
+            })
+        };
+
         let req = LlmRequest {
             session_id: format!("architect_{}", input.node_id),
             messages,
@@ -153,7 +186,7 @@ Your total response MUST be a single valid JSON object exactly matching the sche
                 strong_reasoning: true, // Architect prefers strong reasoning for planning MAD
             },
             budget_limit: 128_000,
-            tools: None,
+            tools: Some(vec![subgraph_tool]),
         };
 
         match self.gateway.generate(req.clone()).await {
@@ -162,16 +195,13 @@ Your total response MUST be a single valid JSON object exactly matching the sche
                     request: serde_json::to_value(&req).unwrap_or_else(|_| serde_json::json!({})),
                     response: serde_json::to_value(&res).unwrap_or_else(|_| serde_json::json!({})),
                 };
-                let content = res.content.trim();
-                
-                // Robust JSON extraction
-                let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
-                    if e > s { &content[s..=e] } else { content }
+                let raw_content = if let Some(tc) = res.tool_calls.first() {
+                    tc.arguments.clone()
                 } else {
-                    content
+                    res.content.clone()
                 };
 
-                let clean_json = json_str
+                let clean_json = raw_content.trim()
                     .trim_start_matches("```json")
                     .trim_start_matches("```")
                     .trim_end_matches("```")

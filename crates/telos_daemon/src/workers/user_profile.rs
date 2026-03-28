@@ -101,13 +101,9 @@ RULES:
 - Do NOT extract transient requests (e.g., "user asked about weather")
 - QUESTION/RECALL GUARD: Do NOT extract facts from questions or recall requests. If the user is ASKING whether the system remembers something (e.g., "你还记得我喜欢什么颜色吗？", "我之前说过什么？", "你知道我的名字吗？"), this is a QUERY not a DECLARATION. Do NOT store the content of such questions as facts. Only extract facts from DECLARATIVE statements where the user explicitly provides new information.
 - If NO new user information is found, return an empty array
+- If NO new user information is found, return an empty array
 
-Output ONLY a valid JSON object:
-{{"facts": [
-  {{"content": "[Communication] User prefers Chinese language responses", "fact_type": "static"}},
-  {{"content": "[Technical] User is working on Telos memory upgrade", "fact_type": "dynamic"}},
-  {{"content": "[Environment] User has a meeting at 3pm tomorrow", "fact_type": "dynamic", "forget_after": "2026-03-25T15:00:00+08:00"}}
-]}}
+You MUST use the provided `store_user_facts` tool to submit the result. Do not output anything else.
 
 Conversation:
 {}
@@ -115,20 +111,49 @@ Conversation:
         conversation
     );
 
+    let tool_def = telos_model_gateway::ToolDefinition {
+        name: "store_user_facts".to_string(),
+        description: "Submit the extracted user facts".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "facts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string" },
+                            "fact_type": { "type": "string", "enum": ["static", "dynamic"] },
+                            "forget_after": { "type": "string", "description": "Optional ISO 8601 timestamp" }
+                        },
+                        "required": ["content", "fact_type"]
+                    }
+                }
+            },
+            "required": ["facts"]
+        }),
+    };
+
     let request = LlmRequest {
         session_id: "profile_extraction".to_string(),
         messages: vec![
-            Message { role: "system".into(), content: "You are a precise information extraction system. Output only valid JSON.".into() },
+            Message { role: "system".into(), content: "You are a precise information extraction system.".into() },
             Message { role: "user".into(), content: extraction_prompt },
         ],
         required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
         budget_limit: 1000,
-        tools: None,
+        tools: Some(vec![tool_def]),
     };
 
     let llm_result = gateway.generate(request).await;
     let response_text = match llm_result {
-        Ok(r) => r.content,
+        Ok(r) => {
+            if let Some(tc) = r.tool_calls.first() {
+                tc.arguments.clone()
+            } else {
+                r.content
+            }
+        },
         Err(e) => {
             debug!("[UserProfile] LLM extraction failed: {:?}", e);
             return;

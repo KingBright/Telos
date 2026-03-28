@@ -4,6 +4,15 @@ description: LLM Agent Evaluation and Optimization Workflow
 
 # LLM Agent 测试-评估-优化 工作流指示
 
+### **1. Setup & Environment Preparation (CRITICAL)**
+Before initiating any evaluations, you MUST ensure the daemon is running in a fully isolated test environment to prevent polluting the user's primary database vector space.
+
+*   **Action:** Deploy the system into **test mode**.
+    *   Command: `cd /Users/jinliang/Workspace/Telos && ./install.sh --test`
+    *   *Note:* This provisions a secondary database (`test_memory.redb`) and ensures 100% data isolation. Do **NOT** run evaluations without passing the `--test` flag.
+
+### **2. Automated Headless Trial Phase**
+
 由于系统的核心控制权和计算节点由大模型（LLM）构成，传统的单元测试和自动化脚本只能捕获崩溃和类型错误，无法有效衡量系统在“常识推理”、“工具选择”、“计划分解层级”以及“最后一公里触达”等维度的软性智能表现。
 
 因此，在每次架构、Prompt、工具集或核心组件发生重大更新后，必须严格遵守以下人工（或 AI Agent亲自）驱动的主观评估与优化工作流。

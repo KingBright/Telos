@@ -19,6 +19,12 @@ pub enum MemoryType {
     /// Recent/temporary user context (project work, debugging, etc.)
     UserProfileDynamic,
     InteractionEvent,
+    
+    // === Meta-Graph Types (Project Harness) ===
+    MetaFeature,   // Maps to core::meta_graph::ProductFeature
+    MetaModule,    // Maps to core::meta_graph::TechModule
+    MetaContract,  // Maps to core::meta_graph::Contract
+    MetaTask,      // Maps to core::meta_graph::DevTask
 }
 
 /// Relationship types between memories (inspired by Supermemory's graph model).
@@ -30,6 +36,21 @@ pub enum MemoryRelation {
     Extends,
     /// System inferred a new fact from patterns (reconsolidation)
     Derives,
+    
+    // === Strict Structural Edges (Project Harness) ===
+    /// Module Implements Feature, or Module Implements Contract
+    Implements,
+    /// Task DependsOn Contract, Module DependsOn Module
+    DependsOn,
+    /// Code TestedBy Contract Mock
+    TestedBy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum EdgeDirection {
+    Incoming,
+    Outgoing,
+    Both,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +62,12 @@ pub enum MemoryQuery {
     TimeRange { start: u64, end: u64 },
     /// Like VectorSearch but also returns the version history chain
     VectorSearchWithHistory { query: Vec<f32>, top_k: usize },
+    /// Graph traversal query to find related nodes
+    RelatedTo { 
+        target_id: String, 
+        relation: Option<MemoryRelation>,
+        direction: EdgeDirection,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

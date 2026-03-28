@@ -25,7 +25,7 @@ impl VectorToolRegistry {
             let model_result = std::panic::catch_unwind(|| {
                 let cache_dir = dirs::home_dir().map(|h| h.join(".telos").join("models")).unwrap_or_else(|| std::path::PathBuf::from(".fastembed_cache"));
                 fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
-                    fastembed::EmbeddingModel::AllMiniLML6V2,
+                    fastembed::EmbeddingModel::MultilingualE5Small,
                 ).with_cache_dir(cache_dir))
             });
 
@@ -282,6 +282,14 @@ impl VectorToolRegistry {
         if is_ephemeral { return; }
         
         let meta_path = self.plugins_dir.join(format!("{}.json", schema.name));
+        let rhai_path = self.plugins_dir.join(format!("{}.rhai", schema.name));
+
+        // Do not generate JSON dumps for hardcoded Native tools.
+        // If the tool lacks a dynamic .rhai script AND didn't originally have a .json file, skip persistence.
+        if !rhai_path.exists() && !meta_path.exists() {
+            return;
+        }
+
         if let Ok(meta_json) = serde_json::to_string_pretty(schema) {
             let _ = std::fs::write(&meta_path, meta_json);
         }

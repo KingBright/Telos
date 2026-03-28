@@ -44,7 +44,7 @@ Rules:
 
 Search Intent: "{}"
 
-Output ONLY a JSON object: {{ "queries": ["query1", "query2", ...] }}"#,
+You MUST use the provided `submit_search_queries` tool to submit the result. Do not output anything else."#,
             intent
         );
         
@@ -61,22 +61,41 @@ Output ONLY a JSON object: {{ "queries": ["query1", "query2", ...] }}"#,
         
         messages.push(Message { role: "user".to_string(), content: prompt });
 
+        let query_tool = telos_model_gateway::ToolDefinition {
+            name: "submit_search_queries".to_string(),
+            description: "Submit the generated search queries".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "queries": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["queries"]
+            })
+        };
+
         let req = LlmRequest {
             session_id: "search_worker_keygen".to_string(),
             messages,
             required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: 500,
-            tools: None,
+            tools: Some(vec![query_tool]),
         };
 
         match self.gateway.generate(req).await {
             Ok(res) => {
-                let content = res.content.trim();
-                let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
-                    if e > s { &content[s..=e] } else { content }
-                } else { content };
+                let raw_content = if let Some(tc) = res.tool_calls.first() {
+                    tc.arguments.clone()
+                } else {
+                    res.content.clone()
+                };
 
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let content = raw_content.trim()
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim();
+
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
                     if let Some(queries) = json.get("queries").and_then(|v| v.as_array()) {
                         let result: Vec<String> = queries.iter()
                             .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -204,13 +223,24 @@ Evaluate:
 2. Extract ONLY the relevant, useful information (discard ads, SEO filler, navigation text, unrelated content).
 3. Preserve factual details, statistics, dates, and source attributions.
 
-Output JSON:
-{{
-  "has_useful_content": true/false,
-  "relevant_extract": "extracted useful content here (or empty string if nothing useful)"
-}}"#,
+3. Preserve factual details, statistics, dates, and source attributions.
+
+You MUST use the provided `submit_quality_assessment` tool to submit your evaluation. Do not output anything else."#,
             intent, truncated
         );
+
+        let assess_tool = telos_model_gateway::ToolDefinition {
+            name: "submit_quality_assessment".to_string(),
+            description: "Submit the quality assessment of the search results".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "has_useful_content": { "type": "boolean" },
+                    "relevant_extract": { "type": "string", "description": "Extracted useful content, or empty if nothing useful" }
+                },
+                "required": ["has_useful_content", "relevant_extract"]
+            })
+        };
 
         let req = LlmRequest {
             session_id: "search_worker_batch_assess".to_string(),
@@ -220,17 +250,24 @@ Output JSON:
             ],
             required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: 1500,
-            tools: None,
+            tools: Some(vec![assess_tool]),
         };
 
         match self.gateway.generate(req).await {
             Ok(res) => {
-                let content = res.content.trim();
-                let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
-                    if e > s { &content[s..=e] } else { content }
-                } else { content };
+                let raw_content = if let Some(tc) = res.tool_calls.first() {
+                    tc.arguments.clone()
+                } else {
+                    res.content.clone()
+                };
 
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let content = raw_content.trim()
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim();
+
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
                     let useful = json.get("has_useful_content").and_then(|v| v.as_bool()).unwrap_or(false);
                     let extract = json.get("relevant_extract").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     return (useful, extract);
@@ -277,7 +314,7 @@ Generate 3-5 NEW search queries that address the corrections above.
 Do NOT repeat queries from the previous iteration.
 Focus on what was MISSING or WRONG according to the diagnosis.
 
-Output ONLY a JSON object: {{ "queries": ["query1", "query2", ...] }}"#,
+You MUST use the provided `submit_search_queries` tool to submit the result. Do not output anything else."#,
             intent,
             correction.iteration,
             correction.satisfaction_score,
@@ -299,22 +336,41 @@ Output ONLY a JSON object: {{ "queries": ["query1", "query2", ...] }}"#,
         
         messages.push(Message { role: "user".to_string(), content: prompt });
 
+        let query_tool = telos_model_gateway::ToolDefinition {
+            name: "submit_search_queries".to_string(),
+            description: "Submit the generated search queries".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "queries": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["queries"]
+            })
+        };
+
         let req = LlmRequest {
             session_id: "search_worker_corrected_keygen".to_string(),
             messages,
             required_capabilities: Capability { requires_vision: false, strong_reasoning: false },
             budget_limit: 500,
-            tools: None,
+            tools: Some(vec![query_tool]),
         };
 
         match self.gateway.generate(req).await {
             Ok(res) => {
-                let content = res.content.trim();
-                let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
-                    if e > s { &content[s..=e] } else { content }
-                } else { content };
+                let raw_content = if let Some(tc) = res.tool_calls.first() {
+                    tc.arguments.clone()
+                } else {
+                    res.content.clone()
+                };
 
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let content = raw_content.trim()
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim();
+
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
                     if let Some(queries) = json.get("queries").and_then(|v| v.as_array()) {
                         let result: Vec<String> = queries.iter()
                             .filter_map(|v| v.as_str().map(|s| s.to_string()))

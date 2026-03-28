@@ -195,6 +195,11 @@ REQUIRED JSON STRUCTURE:
         let hybrid_task_prompt = format!("Task: {}\n\nCRITICAL HYBRID PLANNING CONSTRAINT: 
 You are a PLANNER. You can use the provided tools (like `rhai_tool_studio` or `web_search`) synchronously RIGHT NOW via the standard tool calling API. ALWAYS use tool calls to execute tools, NEVER output raw tool JSON directly in your text response.
 If you can resolve the user's request immediately using synchronous tools (e.g., verifying a web scrape and writing a script via `rhai_tool_studio`), DO IT first. 
+
+[CRITICAL INSTRUCTION FOR SYNCHRONOUS COMPLETION]:
+If the tools provide the data the user requested, YOU MUST EXPLICITLY RE-STATE ALL EXACT DATA, NUMBERS, AND METRICS from the tool outputs in your conversational text response *BEFORE* the [FINAL_ANSWER] token. 
+DO NOT simply paraphrase or summarize (e.g., do not just say 'City A is warmer than City B'). You MUST output the EXACT temperatures, conditions, and raw facts retrieved! This is the ONLY way the user will see the data.
+
 Once your investigation or synchronous actions are complete, you MUST end your turn by outputting a final valid JSON `AgentSubGraph` block inside the [FINAL_ANSWER] token. 
 If your synchronous actions successfully finished the entire user request and no further pipeline nodes are needed, return an empty graph:
 [FINAL_ANSWER]

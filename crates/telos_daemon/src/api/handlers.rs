@@ -49,7 +49,7 @@ use crate::core::metrics::*;
         for entry in &entries {
             match entry.memory_type {
                 telos_memory::MemoryType::Episodic | telos_memory::MemoryType::InteractionEvent | telos_memory::MemoryType::UserProfileStatic | telos_memory::MemoryType::UserProfileDynamic => { episodic += 1; }
-                telos_memory::MemoryType::Semantic => { semantic += 1; }
+                telos_memory::MemoryType::Semantic | telos_memory::MemoryType::MetaFeature | telos_memory::MemoryType::MetaModule | telos_memory::MemoryType::MetaContract | telos_memory::MemoryType::MetaTask => { semantic += 1; }
                 telos_memory::MemoryType::Procedural => { procedural += 1; }
             }
         }
@@ -101,10 +101,12 @@ use crate::core::metrics::*;
     Json(req): Json<RunRequest>,
 ) -> Json<RunResponse> {
     let trace_id = req.trace_id.and_then(|id| Uuid::parse_str(&id).ok()).unwrap_or_else(Uuid::new_v4);
+    let session_id_str = req.session_id.clone().unwrap_or_else(|| "default".to_string());
+
     let _ = state
         .broker
         .publish_event(AgentEvent::UserInput {
-            session_id: "default".into(),
+            session_id: session_id_str,
             payload: req.payload,
             trace_id,
             project_id: req.project_id,
@@ -126,10 +128,12 @@ use crate::core::metrics::*;
     // Subscribe *before* dispatching to avoid race conditions
     let mut rx = state.broker.subscribe_feedback();
     
+    let session_id_str = req.session_id.clone().unwrap_or_else(|| "default".to_string());
+    
     let _ = state
         .broker
         .publish_event(AgentEvent::UserInput {
-            session_id: "default".into(),
+            session_id: session_id_str.clone(),
             payload: req.payload,
             trace_id,
             project_id: req.project_id,

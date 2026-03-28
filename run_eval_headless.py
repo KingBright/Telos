@@ -19,9 +19,10 @@ import requests, json, time, os, uuid, sys, re
 
 API = "http://127.0.0.1:8321/api/v1/run_sync"
 BASE_URL = "http://127.0.0.1:8321"
-ITER = 35
+ITER = 37
 TRACES_DIR = "test_traces"
 os.makedirs(TRACES_DIR, exist_ok=True)
+
 
 # ─── Test Cases ───────────────────────────────────────────────────────
 test_cases = [
@@ -581,3 +582,4 @@ if __name__ == "__main__":
 
     print(f"\n✅ Complete. Summary: {agg_path}")
     sys.exit(0 if failed == 0 else 1)
+

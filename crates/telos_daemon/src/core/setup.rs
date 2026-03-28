@@ -61,6 +61,10 @@ pub async fn build_tool_registry(
     tool_registry.register_tool(telos_tooling::native::ToolRegisterTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::ToolRegisterTool)));
     tool_registry.register_tool(telos_tooling::native::MemoryRecallTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::MemoryRecallTool)));
     tool_registry.register_tool(telos_tooling::native::MemoryStoreTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::MemoryStoreTool)));
+    tool_registry.register_tool(telos_tooling::native::ProjectCreateTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::ProjectCreateTool)));
+    tool_registry.register_tool(telos_tooling::native::ProjectMetaReadTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::ProjectMetaReadTool)));
+    tool_registry.register_tool(telos_tooling::native::ProjectMetaWriteTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::ProjectMetaWriteTool)));
+    tool_registry.register_tool(telos_tooling::native::ProjectIterateTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::ProjectIterateTool)));
     tool_registry.register_tool(telos_tooling::native::FileEditTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::FileEditTool)));
     tool_registry.register_tool(telos_tooling::native::GlobTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::GlobTool)));
     tool_registry.register_tool(telos_tooling::native::GrepTool::schema(), Some(std::sync::Arc::new(telos_tooling::native::GrepTool)));

@@ -11,3 +11,4 @@ crates/telos_tooling/.fastembed_cache/
 test_*.*
 analyze_traces.py
 __pycache__
+ref

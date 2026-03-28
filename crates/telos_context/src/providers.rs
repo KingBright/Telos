@@ -468,7 +468,10 @@ pub struct LocalEmbeddingProvider {
 impl LocalEmbeddingProvider {
     pub fn new() -> Result<Self, ProviderError> {
         // InitTextEmbedding defaults to BGE-small-en-v1.5 or similar highly efficient models
-        let model = fastembed::TextEmbedding::try_new(Default::default()).map_err(|e| {
+        let cache_dir = dirs::home_dir().map(|h| h.join(".telos").join("models")).unwrap_or_else(|| std::path::PathBuf::from(".fastembed_cache"));
+        let model = fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
+            fastembed::EmbeddingModel::MultilingualE5Small,
+        ).with_cache_dir(cache_dir)).map_err(|e| {
             ProviderError::new(
                 format!("Failed to initialize local embedding model: {}", e),
                 ProviderErrorKind::Other,
